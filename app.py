@@ -5,12 +5,55 @@ import hashlib
 import psycopg2
 from decimal import Decimal
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, session, url_for
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-me")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+LOGIN_PAGE = """
+<!doctype html><meta charset=utf-8><title>Sign in</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#f5f5f3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+  .box{background:#fff;border:1px solid #e3e2dd;border-radius:12px;padding:32px;width:300px}
+  h1{font-size:18px;margin:0 0 16px}
+  input{width:100%;padding:10px;border:1px solid #d8d7d2;border-radius:8px;box-sizing:border-box;font-size:14px}
+  button{width:100%;margin-top:12px;padding:10px;background:#2b2b29;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px}
+  .err{color:#b3471f;font-size:13px;margin-top:10px}
+</style>
+<div class=box>
+  <h1>Reconciliation Tool</h1>
+  <form method=post>
+    <input type=password name=password placeholder=Password autofocus>
+    <button type=submit>Sign in</button>
+    {% if error %}<div class=err>{{ error }}</div>{% endif %}
+  </form>
+</div>
+"""
+
+@app.before_request
+def require_login():
+    if request.endpoint in ("login", "static"):
+        return
+    if not session.get("authed"):
+        return redirect(url_for("login"))
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if APP_PASSWORD and request.form.get("password") == APP_PASSWORD:
+            session["authed"] = True
+            return redirect(url_for("home"))
+        return render_template_string(LOGIN_PAGE, error="Incorrect password")
+    return render_template_string(LOGIN_PAGE, error=None)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ---------- helpers ----------
