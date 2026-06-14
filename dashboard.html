@@ -1,0 +1,21 @@
+<!doctype html><meta charset=utf-8><title>Reconciliation Dashboard</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f3;color:#2b2b29;padding:32px;max-width:960px;margin:auto}
+h1{font-size:24px;margin:0}.sub{color:#73726c;margin:4px 0 24px}
+.cards{display:flex;gap:12px;margin-bottom:28px;flex-wrap:wrap}
+.card{flex:1;min-width:150px;background:#fff;border:1px solid #e3e2dd;border-radius:10px;padding:16px}
+.label{font-size:12px;color:#73726c;text-transform:uppercase;letter-spacing:.04em}.val{font-size:26px;font-weight:600;margin-top:6px}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e2dd;border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid #efeeea;font-size:14px}
+th{background:#faf9f7;color:#73726c;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+tr:last-child td{border-bottom:none}.a{text-align:right;font-variant-numeric:tabular-nums}</style>
+<h1>Reconciliation Dashboard</h1>
+<div class=sub>All accounts · generated 2026-06-14 21:18 EAT</div>
+<div class=cards>
+<div class=card><div class=label>Accounts</div><div class=val>4</div></div>
+<div class=card><div class=label>Reconciled</div><div class=val>2</div></div>
+<div class=card><div class=label>Signed off</div><div class=val>0</div></div>
+<div class=card><div class=label>Open exceptions</div><div class=val style="color:#b3471f">4</div></div>
+</div>
+<table><tr><th>Account</th><th>Type</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr>
+<tr><td><b>Checking</b></td><td>bank</td><td><span style="background:#fbf0dd;color:#9a6a16;padding:3px 10px;border-radius:20px;font-size:12px">Reconciled · open</span></td><td>2026-01-02 → 2026-05-21</td><td>33 exact, 1 fuzzy, 1 batched</td><td>2</td><td class=a style='color:#73726c'>145.75 · explained</td></tr><tr><td><b>Savings</b></td><td>bank</td><td><span style="background:#eeede9;color:#73726c;padding:3px 10px;border-radius:20px;font-size:12px">Not reconciled</span></td><td>—</td><td>—</td><td>—</td><td class=a>—</td></tr><tr><td><b>Mastercard</b></td><td>credit card</td><td><span style="background:#fbf0dd;color:#9a6a16;padding:3px 10px;border-radius:20px;font-size:12px">Reconciled · open</span></td><td>2026-03-14 → 2026-06-12</td><td>15 exact, 1 fuzzy</td><td>2</td><td class=a style='color:#73726c'>-19.01 · explained</td></tr><tr><td><b>Visa</b></td><td>credit card</td><td><span style="background:#eeede9;color:#73726c;padding:3px 10px;border-radius:20px;font-size:12px">Not reconciled</span></td><td>—</td><td>—</td><td>—</td><td class=a>—</td></tr>
+</table>

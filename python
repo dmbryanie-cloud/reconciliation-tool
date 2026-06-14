@@ -1,0 +1,33 @@
+import os
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+
+# These are read from Replit "Secrets" — never typed into the code or chat.
+ACCESS_TOKEN = os.environ["QBO_ACCESS_TOKEN"]
+REALM_ID = os.environ["QBO_REALM_ID"]
+
+# Sandbox API address. (The live one is different; we use sandbox for testing.)
+BASE = "https://sandbox-quickbooks.api.intuit.com"
+
+# Ask QuickBooks for the list of accounts, using its own query language.
+query = "SELECT * FROM Account MAXRESULTS 100"
+url = f"{BASE}/v3/company/{REALM_ID}/query?query=" + urllib.parse.quote(query)
+
+req = urllib.request.Request(url)
+req.add_header("Authorization", f"Bearer {ACCESS_TOKEN}")
+req.add_header("Accept", "application/json")
+
+try:
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+    accounts = data.get("QueryResponse", {}).get("Account", [])
+    print(f"Connected! Found {len(accounts)} accounts:\n")
+    for a in accounts:
+        print(f"- {a.get('Name')}  |  type: {a.get('AccountType')}  |  balance: {a.get('CurrentBalance')}")
+except urllib.error.HTTPError as e:
+    print(f"HTTP error {e.code}:")
+    print(e.read().decode())
+except Exception as e:
+    print(f"Something went wrong: {e}")

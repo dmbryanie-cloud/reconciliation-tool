@@ -1,0 +1,17 @@
+<!doctype html><meta charset=utf-8><title>Reconciliation</title>
+<style>body{font-family:system-ui,sans-serif;background:#f5f5f3;color:#2b2b29;padding:32px;max-width:880px;margin:auto}
+h1{font-size:22px;margin:0}.sub{color:#73726c;margin:4px 0 24px}
+.cards{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}.card{flex:1;min-width:140px;background:#fff;border:1px solid #e3e2dd;border-radius:10px;padding:16px}
+.label{font-size:12px;color:#73726c;text-transform:uppercase}.val{font-size:24px;font-weight:600;margin-top:6px}.bad{color:#b3471f}.ok{color:#3a7d44}
+h2{font-size:15px;margin:24px 0 8px}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e2dd;border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid #efeeea;font-size:14px}th{background:#faf9f7;color:#73726c;font-size:12px;text-transform:uppercase}
+.a{text-align:right;font-variant-numeric:tabular-nums}.tag{font-size:11px;padding:2px 8px;border-radius:20px}.tag.exact{background:#e7f1e9;color:#3a7d44}.tag.fuzzy{background:#fbf0dd;color:#9a6a16}.exc th{background:#fcefe9;color:#b3471f}</style>
+<h1>Reconciliation — Checking</h1><div class=sub>Statement period 2026-05-16 to 2026-05-22</div>
+<div class=cards>
+<div class=card><div class=label>Exact matches</div><div class=val>8</div></div>
+<div class=card><div class=label>Discrepancies</div><div class=val>0</div></div>
+<div class=card><div class=label>Exceptions</div><div class=val>2</div></div>
+<div class=card><div class=label>Difference</div><div class="val bad">-230.75</div></div></div>
+<h2>Matched (8)</h2><table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr><tr><td>2026-05-16</td><td>Squeaky Kleen Car Wash</td><td><span class='tag exact'>exact</span></td><td class=a>-19.99</td><td class=a>-19.99</td></tr><tr><td>2026-05-17</td><td>Chin's Gas and Oil</td><td><span class='tag exact'>exact</span></td><td class=a>-63.15</td><td class=a>-63.15</td></tr><tr><td>2026-05-17</td><td>Customer Deposit</td><td><span class='tag exact'>exact</span></td><td class=a>408.00</td><td class=a>408.00</td></tr><tr><td>2026-05-17</td><td>Tania's Nursery</td><td><span class='tag exact'>exact</span></td><td class=a>-46.98</td><td class=a>-46.98</td></tr><tr><td>2026-05-18</td><td>Hicks Hardware</td><td><span class='tag exact'>exact</span></td><td class=a>-228.75</td><td class=a>-228.75</td></tr><tr><td>2026-05-18</td><td>Pam Seitz</td><td><span class='tag exact'>exact</span></td><td class=a>-75.00</td><td class=a>-75.00</td></tr><tr><td>2026-05-18</td><td>Customer Deposit</td><td><span class='tag exact'>exact</span></td><td class=a>868.15</td><td class=a>868.15</td></tr><tr><td>2026-05-21</td><td>Tania's Nursery</td><td><span class='tag exact'>exact</span></td><td class=a>-23.50</td><td class=a>-23.50</td></tr></table>
+<h2>On statement, not in books (1)</h2><table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr><tr><td>2026-05-22</td><td>Monthly Bank Service Fee</td><td class=a>-12.00</td></tr></table>
+<h2>In books, not on statement (1)</h2><table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr><tr><td>2026-05-16</td><td></td><td class=a>218.75</td></tr></table>

@@ -1,0 +1,40 @@
+txns = [
+  ("20260516", "DEBIT",  "-19.99",  "0001", "Squeaky Kleen Car Wash"),
+  ("20260517", "DEBIT",  "-63.15",  "0002", "Chin's Gas and Oil"),
+  ("20260517", "CREDIT", "408.00",  "0003", "Customer Deposit"),
+  ("20260517", "DEBIT",  "-46.98",  "0004", "Tania's Nursery"),
+  ("20260518", "DEBIT",  "-228.75", "0005", "Hicks Hardware"),
+  ("20260518", "DEBIT",  "-75.00",  "0006", "Pam Seitz"),
+  ("20260518", "CREDIT", "868.15",  "0007", "Customer Deposit"),
+  ("20260521", "DEBIT",  "-23.50",  "0008", "Tania's Nursery"),
+  ("20260522", "DEBIT",  "-12.00",  "0009", "Monthly Bank Service Fee"),
+]
+
+rows = ""
+for dt, ttype, amt, fitid, name in txns:
+  rows += (f"<STMTTRN><TRNTYPE>{ttype}<DTPOSTED>{dt}120000<TRNAMT>{amt}"
+           f"<FITID>{fitid}<NAME>{name}</STMTTRN>\n")
+
+ofx = f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1><SONRS><STATUS><CODE>0<SEVERITY>INFO</STATUS><DTSERVER>20260522120000<LANGUAGE>ENG</SONRS></SIGNONMSGSRSV1>
+<BANKMSGSRSV1><STMTTRNRS><TRNUID>1<STATUS><CODE>0<SEVERITY>INFO</STATUS>
+<STMTRS><CURDEF>USD<BANKACCTFROM><BANKID>123456789<ACCTID>CHK001<ACCTTYPE>CHECKING</BANKACCTFROM>
+<BANKTRANLIST><DTSTART>20260516<DTEND>20260522
+{rows}</BANKTRANLIST>
+<LEDGERBAL><BALAMT>806.78<DTASOF>20260522120000</LEDGERBAL>
+</STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
+"""
+
+with open("bank_statement.ofx", "w") as f:
+  f.write(ofx)
+print("Wrote bank_statement.ofx")
