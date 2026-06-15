@@ -301,7 +301,9 @@ h1{font-size:22px;margin:0 0 4px}.sub{color:#73726c;margin:4px 0 24px;font-size:
 .label{font-size:12px;color:#73726c;text-transform:uppercase;letter-spacing:.04em}.val{font-size:24px;font-weight:600;margin-top:6px}
 .upload{background:#fff;border:1px solid #e3e2dd;border-radius:10px;padding:16px;margin-bottom:24px}
 .upload button{background:#2b2b29;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e2dd;border-radius:10px;overflow:hidden}
+.btn-go{background:#3a7d44;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
+.btn-sm{background:#fff;border:1px solid #d8d7d2;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e2dd;border-radius:10px;overflow:hidden;margin-bottom:24px}
 th,td{text-align:left;padding:11px 14px;border-bottom:1px solid #efeeea;font-size:14px;white-space:nowrap}
 th{background:#faf9f7;color:#73726c;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
 tr:last-child td{border-bottom:none}.a{text-align:right;font-variant-numeric:tabular-nums}
@@ -652,6 +654,24 @@ DETAIL_TEMPLATE = (
 <div class=card><div class=label>Exceptions</div><div class=val>{{ on_stmt|length + in_books|length }}</div></div>
 <div class=card><div class=label>Difference</div><div class=val style="color:{{ '#3a7d44' if diff==0 else ('#73726c' if (on_stmt|length + in_books|length)>0 else '#b3471f') }}">{{ "%.2f"|format(diff) }}</div></div>
 </div>
+<div style="margin-bottom:24px">
+{% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
+{% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
+</div>
+{% if reviewable %}
+<h2 style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
+<table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
+{% for r in reviewable %}<tr>
+<td><span class="tag {{ 'fuzzy' if r.type=='fuzzy' else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else 'batched' }}</span></td>
+<td>{% for d,a,w in r.sls %}{{ d }} · {{ "%.2f"|format(a) }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ "%.2f"|format(r.delta) }}</span>{% endif %}</td>
+<td>{% for d,a,w in r.bts %}{{ d }} · {{ "%.2f"|format(a) }} · {{ w }}<br>{% endfor %}</td>
+<td>{% if r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
+<td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}">
+{% if r.status=='rejected' %}<input type=hidden name=status value=confirmed><button type=submit class=btn-sm>Restore</button>
+{% else %}<input type=hidden name=status value=rejected><button type=submit class=btn-sm>Reject</button>{% endif %}
+</form></td>
+</tr>{% endfor %}</table>
+{% endif %}
 <h2 style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
@@ -669,13 +689,13 @@ DETAIL_TEMPLATE = (
 
 def compute_detail(cur, acct_uuid):
     cur.execute(
-        "SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;",
+        "SELECT statement_id, period_start, period_end, signed_off_at FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;",
         (acct_uuid,),
     )
     s = cur.fetchone()
     if not s:
         return {"has_results": False}
-    sid, ps, pe = s
+    sid, ps, pe, signed = s
     cur.execute(
         "SELECT line_id, posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE statement_id=%s ORDER BY posted_date;",
         (sid,),
@@ -691,7 +711,7 @@ def compute_detail(cur, acct_uuid):
                    coalesce(sl.counterparty, sl.description,''), bt.amount FROM match m
                    JOIN match_statement_line msl ON msl.match_id=m.match_id JOIN statement_line sl ON sl.line_id=msl.line_id
                    JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
-                   WHERE m.statement_id=%s AND m.match_type IN ('exact','fuzzy') ORDER BY sl.posted_date;""",
+                   WHERE m.statement_id=%s AND m.match_type IN ('exact','fuzzy') AND m.status<>'rejected' ORDER BY sl.posted_date;""",
         (sid,),
     )
     matched = cur.fetchall()
@@ -700,6 +720,34 @@ def compute_detail(cur, acct_uuid):
         (sid,),
     )
     n_m2o = cur.fetchone()[0]
+    # The uncertain matches a human should eyeball: fuzzy (amount discrepancies) and batched.
+    reviewable = []
+    cur.execute(
+        "SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s AND match_type IN ('fuzzy','many_to_one') ORDER BY match_type;",
+        (sid,),
+    )
+    rmatches = cur.fetchall()
+    for mid, mtype, status, delta in rmatches:
+        cur.execute(
+            "SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'') FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=%s;",
+            (mid,),
+        )
+        sls = cur.fetchall()
+        cur.execute(
+            "SELECT bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'') FROM match_book_txn mbt JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=%s;",
+            (mid,),
+        )
+        bts = cur.fetchall()
+        reviewable.append(
+            {
+                "id": mid,
+                "type": mtype,
+                "status": status,
+                "delta": delta,
+                "sls": sls,
+                "bts": bts,
+            }
+        )
     cur.execute(
         "SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';",
         (sid,),
@@ -716,10 +764,12 @@ def compute_detail(cur, acct_uuid):
         "has_results": True,
         "p_start": ps,
         "p_end": pe,
+        "signed_off": signed.strftime("%Y-%m-%d") if signed else None,
         "n_exact": sum(1 for m in matched if m[0] == "exact"),
         "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"),
         "n_m2o": n_m2o,
         "matched": matched,
+        "reviewable": reviewable,
         "on_stmt": [l for l in lines if l[0] not in ml],
         "in_books": [t for t in txns if t[0] not in mt],
         "diff": st - bt_,
@@ -753,6 +803,44 @@ def upload(name):
         run_matcher(sid)
     except Exception as e:
         return f"Could not process file: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+    return redirect(url_for("detail", name=name))
+
+
+@app.route("/account/<name>/review/<int:match_id>", methods=["POST"])
+def review_match(name, match_id):
+    new_status = request.form.get("status")
+    if new_status in ("confirmed", "rejected"):
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE match SET status=%s WHERE match_id=%s;", (new_status, match_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    return redirect(url_for("detail", name=name))
+
+
+@app.route("/account/<name>/signoff", methods=["POST"])
+def signoff(name):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            "SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;",
+            (row[0],),
+        )
+        srow = cur.fetchone()
+        if srow:
+            cur.execute(
+                "UPDATE statement SET signed_off_at=now(), signed_off_by='you' WHERE statement_id=%s;",
+                (srow[0],),
+            )
+            conn.commit()
+    cur.close()
+    conn.close()
     return redirect(url_for("detail", name=name))
 
 
