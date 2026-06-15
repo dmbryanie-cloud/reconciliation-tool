@@ -1101,7 +1101,7 @@ def writeback(name, line_id):
         acct_id, label = _resolve_account(chosen, expense_accts)
         if not acct_id:
             return f"No expense account found to categorize under. <br><a href='{url_for('detail', name=name)}'>Back</a>"
-        create_purchase(
+        result = create_purchase(
             token,
             acct_qbo,
             acct_id,
@@ -1109,17 +1109,32 @@ def writeback(name, line_id):
             str(d),
             f"Reconciliation write-back: {who}",
         )
+        new_id = (result.get("Purchase") or {}).get("Id")
         sug = suggest_category(build_memory(), who)[0]
         if chosen and chosen != (sug or ""):
             record_correction(who, label)
-        sync_from_quickbooks()
+        # Insert the just-created expense straight into the books (fast — no full re-sync),
+        # then re-match so the statement line resolves immediately.
         conn = get_conn()
         cur = conn.cursor()
+        if new_id:
+            cur.execute(
+                """
+                INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
+                                      posted_date, amount, currency, description, counterparty,
+                                      reference, category, cleared_status, last_modified)
+                VALUES (%s,%s,%s,'Purchase',%s,%s,'USD',%s,%s,NULL,%s,'unknown',now())
+                ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
+                  amount=EXCLUDED.amount, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
+            """,
+                (ORG_ID, acct_uuid, new_id, d, -abs(amount), who, who, label),
+            )
         cur.execute(
             "SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;",
             (acct_uuid,),
         )
         srow = cur.fetchone()
+        conn.commit()
         cur.close()
         conn.close()
         if srow:
