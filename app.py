@@ -540,7 +540,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>{{ na
 </div>
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
-<form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px"><button type=submit class=btn-sm>Undo sign-off</button></form>
+<form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterwards.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
 {% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
 </div>
 {% if reviewable %}
