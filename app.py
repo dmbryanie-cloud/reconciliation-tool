@@ -210,11 +210,14 @@ QBO_HANDLERS = {
 def sync_from_quickbooks():
     token = qbo_token()
     cache = {}
+    diag = [f"realm={QBO_REALM_ID}"]
     for etype in QBO_HANDLERS:
         try:
             cache[etype] = qbo_query(etype, token)
-        except urllib.error.HTTPError:
+            diag.append(f"{etype}={len(cache[etype])}")
+        except urllib.error.HTTPError as e:
             cache[etype] = []
+            diag.append(f"{etype}=ERR{e.code}")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
@@ -261,10 +264,8 @@ def sync_from_quickbooks():
                     },
                 )
                 total += 1
-    conn.commit()
-    cur.close()
-    conn.close()
-    return total
+    conn.commit(); cur.close(); conn.close()
+    return total, " · ".join(diag)
 
 
 def get_conn():
@@ -756,8 +757,8 @@ def upload(name):
 @app.route("/sync", methods=["POST"])
 def sync():
     try:
-        n = sync_from_quickbooks()
-        session["sync_msg"] = f"Synced {n} transactions from QuickBooks."
+        n, diag = sync_from_quickbooks()
+        session["sync_msg"] = f"Synced {n}. Diagnostics — {diag}"
     except Exception as e:
         session["sync_msg"] = f"Sync failed: {e}"
     return redirect(url_for("dashboard"))
