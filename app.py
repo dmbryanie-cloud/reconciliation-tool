@@ -23,17 +23,45 @@ import json, base64, urllib.request, urllib.parse, urllib.error
 QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
 QBO_BASE = "https://sandbox-quickbooks.api.intuit.com"
 
-def qbo_token():
+def _refresh_with(refresh_token):
     cid = os.environ["QBO_CLIENT_ID"]; secret = os.environ["QBO_CLIENT_SECRET"]
-    refresh = os.environ["QBO_REFRESH_TOKEN"]
     auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
-    data = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh}).encode()
+    data = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode()
     req = urllib.request.Request("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer", data=data, method="POST")
     req.add_header("Authorization", f"Basic {auth}")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("Accept", "application/json")
     with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["access_token"]
+        return json.loads(resp.read())
+
+def _get_stored_refresh():
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS qbo_auth (id int PRIMARY KEY, refresh_token text, updated_at timestamptz DEFAULT now());")
+    conn.commit()
+    cur.execute("SELECT refresh_token FROM qbo_auth WHERE id=1;")
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return row[0] if row and row[0] else None
+
+def _store_refresh(token):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""INSERT INTO qbo_auth (id, refresh_token, updated_at) VALUES (1,%s,now())
+                   ON CONFLICT (id) DO UPDATE SET refresh_token=EXCLUDED.refresh_token, updated_at=now();""", (token,))
+    conn.commit(); cur.close(); conn.close()
+
+def qbo_token():
+    # Try the stored (latest) token first; fall back to the env token if it's stale.
+    candidates = [t for t in (_get_stored_refresh(), os.environ.get("QBO_REFRESH_TOKEN", "")) if t]
+    last_err = None
+    for rt in candidates:
+        try:
+            result = _refresh_with(rt)
+            _store_refresh(result.get("refresh_token", rt))   # persist whatever QBO returns
+            return result["access_token"]
+        except urllib.error.HTTPError as e:
+            last_err = e
+            continue
+    raise last_err or RuntimeError("No QuickBooks refresh token available")
 
 def qbo_query(entity, token):
     q = f"SELECT * FROM {entity} MAXRESULTS 1000"
