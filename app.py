@@ -3,7 +3,10 @@ import io
 import csv
 import hashlib
 import itertools
+import re
 import psycopg2
+from collections import Counter
+from difflib import SequenceMatcher
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template_string, request, redirect, session, url_for
@@ -272,6 +275,194 @@ def sync_from_quickbooks():
 
 def get_conn():
     return psycopg2.connect(DB_URL)
+
+
+# ---------------- learned categorization (memory) ----------------
+_STOPWORDS = {
+    "and",
+    "the",
+    "of",
+    "inc",
+    "llc",
+    "ltd",
+    "co",
+    "corp",
+    "company",
+    "services",
+    "service",
+    "pos",
+    "debit",
+    "purchase",
+    "payment",
+    "card",
+    "visa",
+    "ach",
+    "ppd",
+    "tst",
+}
+
+
+def _normalize(name):
+    if not name:
+        return ""
+    s = re.sub(r"[^a-z0-9 ]", " ", name.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _mtokens(name):
+    return [
+        t
+        for t in _normalize(name).split()
+        if len(t) > 1 and not t.isdigit() and t not in _STOPWORDS
+    ]
+
+
+def _tok_match(a, b):
+    return a == b or (
+        len(a) >= 3 and len(b) >= 3 and (a.startswith(b) or b.startswith(a))
+    )
+
+
+def _coverage(known, inn):
+    if not known:
+        return 0.0
+    return sum(1 for k in known if any(_tok_match(k, i) for i in inn)) / len(known)
+
+
+def ensure_corrections_table():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS payee_correction (
+        id serial PRIMARY KEY, org_id uuid NOT NULL, payee text NOT NULL,
+        category text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());""")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def record_correction(payee, category):
+    ensure_corrections_table()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO payee_correction (org_id, payee, category) VALUES (%s,%s,%s);",
+        (ORG_ID, payee, category),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def build_memory():
+    ensure_corrections_table()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""SELECT lower(trim(counterparty)), category FROM book_txn
+                   WHERE category IS NOT NULL AND counterparty IS NOT NULL AND trim(counterparty)<>'';""")
+    hist_rows = cur.fetchall()
+    cur.execute(
+        "SELECT lower(trim(payee)), category FROM payee_correction ORDER BY created_at;"
+    )
+    corr_rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    byp = {}
+    for p, c in hist_rows:
+        byp.setdefault(p, Counter())[c] += 1
+    history = {}
+    for p, counts in byp.items():
+        total = sum(counts.values())
+        bc, bn = counts.most_common(1)[0]
+        history[p] = (bc, bn / total, total)
+    corrections = {}
+    for p, c in corr_rows:
+        corrections[p] = c
+    return {"history": history, "corrections": corrections}
+
+
+def _best_match(keys, payee):
+    in_toks, in_norm = _mtokens(payee), _normalize(payee)
+    best_key, best = None, 0.0
+    for key in keys:
+        kt = _mtokens(key)
+        if not kt:
+            continue
+        score = max(
+            _coverage(kt, in_toks),
+            SequenceMatcher(None, in_norm, _normalize(key)).ratio(),
+        )
+        if score > best:
+            best_key, best = key, score
+    return best_key, best
+
+
+def suggest_category(memory, payee, threshold=0.6):
+    if not payee:
+        return None, 0.0, None, 0.0, None
+    key = payee.strip().lower()
+    corr, hist = memory["corrections"], memory["history"]
+    if key in corr:
+        return corr[key], 1.0, key, 1.0, "your correction"
+    bk, score = _best_match(corr.keys(), payee)
+    if bk and score >= threshold:
+        return corr[bk], 1.0, bk, score, "your correction"
+    if key in hist:
+        c, conf, _ = hist[key]
+        return c, conf, key, 1.0, "history"
+    bk, score = _best_match(hist.keys(), payee)
+    if bk and score >= threshold:
+        c, conf, _ = hist[bk]
+        return c, conf, bk, score, "history"
+    return None, 0.0, None, 0.0, None
+
+
+def _expense_accounts(token):
+    return [a for a in qbo_query("Account", token) if a.get("AccountType") == "Expense"]
+
+
+def _resolve_account(category, expense_accts):
+    by_name = {a["Name"]: a["Id"] for a in expense_accts}
+    by_fqn = {a.get("FullyQualifiedName", a["Name"]): a["Id"] for a in expense_accts}
+    default = next(
+        (
+            a
+            for a in expense_accts
+            if "office" in a["Name"].lower() or "misc" in a["Name"].lower()
+        ),
+        expense_accts[0] if expense_accts else None,
+    )
+    if category and category in by_fqn:
+        return by_fqn[category], category
+    if category and category in by_name:
+        return by_name[category], category
+    if category:
+        leaf = category.split(":")[-1]
+        if leaf in by_name:
+            return by_name[leaf], leaf
+    return (default["Id"], default["Name"]) if default else (None, None)
+
+
+def create_purchase(token, paid_from_qbo, expense_id, amount_abs, txn_date, note):
+    body = {
+        "AccountRef": {"value": paid_from_qbo},
+        "PaymentType": "Cash",
+        "TxnDate": txn_date,
+        "PrivateNote": note,
+        "Line": [
+            {
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "Amount": amount_abs,
+                "AccountBasedExpenseLineDetail": {"AccountRef": {"value": expense_id}},
+            }
+        ],
+    }
+    url = f"{QBO_BASE}/v3/company/{QBO_REALM_ID}/purchase"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
 
 
 # Make sure sign-off columns exist (runs once at startup)
@@ -651,8 +842,8 @@ DETAIL_TEMPLATE = (
 <div class=card><div class=label>Exact</div><div class=val>{{ n_exact }}</div></div>
 <div class=card><div class=label>Discrepancies</div><div class=val>{{ n_fuzzy }}</div></div>
 <div class=card><div class=label>Batched</div><div class=val>{{ n_m2o }}</div></div>
-<div class=card><div class=label>Exceptions</div><div class=val>{{ on_stmt|length + in_books|length }}</div></div>
-<div class=card><div class=label>Difference</div><div class=val style="color:{{ '#3a7d44' if diff==0 else ('#73726c' if (on_stmt|length + in_books|length)>0 else '#b3471f') }}">{{ "%.2f"|format(diff) }}</div></div>
+<div class=card><div class=label>Exceptions</div><div class=val>{{ writebacks|length + on_stmt|length + in_books|length }}</div></div>
+<div class=card><div class=label>Difference</div><div class=val style="color:{{ '#3a7d44' if diff==0 else ('#73726c' if (writebacks|length + on_stmt|length + in_books|length)>0 else '#b3471f') }}">{{ "%.2f"|format(diff) }}</div></div>
 </div>
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
@@ -677,6 +868,20 @@ DETAIL_TEMPLATE = (
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta != 0 %} · off {{ "%.2f"|format(delta) }}{% endif %}</span></td>
 <td class=a>{{ "%.2f"|format(samt) }}</td><td class=a>{{ "%.2f"|format(bamt) }}</td></tr>{% endfor %}</table>
+{% if writebacks %}
+<h2 style="font-size:15px">Unrecorded expenses — add to QuickBooks ({{ writebacks|length }})</h2>
+<table><tr><th>Date</th><th>Payee</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
+{% for w in writebacks %}<tr>
+<td>{{ w.date }}</td>
+<td>{{ w.who }}{% if w.matched and w.matched != w.who.strip().lower() %}<br><span style="color:#73726c;font-size:12px">recognized '{{ w.matched }}' {{ "%.0f"|format(w.score*100) }}%</span>{% endif %}</td>
+<td class=a>{{ "%.2f"|format(w.amount) }}</td>
+<td><form method=post action="{{ url_for('writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+<input type=text name=category value="{{ w.cat or '' }}" placeholder="category" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
+<button type=submit class=btn-sm>Create</button>
+{% if w.source %}<span style="color:#73726c;font-size:12px">via {{ w.source }}{% if w.conf %} · {{ "%.0f"|format(w.conf*100) }}%{% endif %}</span>{% endif %}
+</form></td>
+</tr>{% endfor %}</table>
+{% endif %}
 <h2 style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ "%.2f"|format(a) }}</td></tr>{% endfor %}</table>
@@ -760,6 +965,26 @@ def compute_detail(cur, acct_uuid):
     mt = {r[0] for r in cur.fetchall()}
     st = sum((l[2] for l in lines), Decimal(0))
     bt_ = sum((t[2] for t in txns), Decimal(0))
+    mem = build_memory()
+    writebacks, on_stmt_in = [], []
+    for lid, dd, a, who in [l for l in lines if l[0] not in ml]:
+        if a < 0:
+            cat, conf, matched_p, score, source = suggest_category(mem, who)
+            writebacks.append(
+                {
+                    "line_id": lid,
+                    "date": dd,
+                    "amount": a,
+                    "who": who,
+                    "cat": cat,
+                    "conf": conf,
+                    "matched": matched_p,
+                    "score": score,
+                    "source": source,
+                }
+            )
+        else:
+            on_stmt_in.append((lid, dd, a, who))
     return {
         "has_results": True,
         "p_start": ps,
@@ -770,7 +995,8 @@ def compute_detail(cur, acct_uuid):
         "n_m2o": n_m2o,
         "matched": matched,
         "reviewable": reviewable,
-        "on_stmt": [l for l in lines if l[0] not in ml],
+        "writebacks": writebacks,
+        "on_stmt": on_stmt_in,
         "in_books": [t for t in txns if t[0] not in mt],
         "diff": st - bt_,
     }
@@ -841,6 +1067,71 @@ def signoff(name):
             conn.commit()
     cur.close()
     conn.close()
+    return redirect(url_for("detail", name=name))
+
+
+@app.route("/account/<name>/writeback/<line_id>", methods=["POST"])
+def writeback(name, line_id):
+    chosen = (request.form.get("category") or "").strip()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT account_id, source_account_id FROM account WHERE name=%s LIMIT 1;",
+        (name,),
+    )
+    arow = cur.fetchone()
+    if not arow:
+        cur.close()
+        conn.close()
+        return "Unknown account", 404
+    acct_uuid, acct_qbo = arow
+    cur.execute(
+        "SELECT posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE line_id=%s;",
+        (line_id,),
+    )
+    lrow = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not lrow:
+        return redirect(url_for("detail", name=name))
+    d, amount, who = lrow
+    try:
+        token = qbo_token()
+        expense_accts = _expense_accounts(token)
+        acct_id, label = _resolve_account(chosen, expense_accts)
+        if not acct_id:
+            return f"No expense account found to categorize under. <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        create_purchase(
+            token,
+            acct_qbo,
+            acct_id,
+            float(abs(amount)),
+            str(d),
+            f"Reconciliation write-back: {who}",
+        )
+        sug = suggest_category(build_memory(), who)[0]
+        if chosen and chosen != (sug or ""):
+            record_correction(who, label)
+        sync_from_quickbooks()
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;",
+            (acct_uuid,),
+        )
+        srow = cur.fetchone()
+        cur.close()
+        conn.close()
+        if srow:
+            run_matcher(srow[0])
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode()[:300]
+        except Exception:
+            body = ""
+        return f"QuickBooks rejected it (HTTP {e.code}): {body} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+    except Exception as e:
+        return f"Write-back failed: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
