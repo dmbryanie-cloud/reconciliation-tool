@@ -806,7 +806,7 @@ def upload(name):
     return redirect(url_for("detail", name=name))
 
 
-@app.route("/account/<name>/review/<int:match_id>", methods=["POST"])
+@app.route("/account/<name>/review/<match_id>", methods=["POST"])
 def review_match(name, match_id):
     new_status = request.form.get("status")
     if new_status in ("confirmed", "rejected"):
