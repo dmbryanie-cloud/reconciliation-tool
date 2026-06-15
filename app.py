@@ -264,7 +264,9 @@ def sync_from_quickbooks():
                     },
                 )
                 total += 1
-    conn.commit(); cur.close(); conn.close()
+    conn.commit()
+    cur.close()
+    conn.close()
     return total, " · ".join(diag)
 
 
@@ -758,7 +760,7 @@ def upload(name):
 def sync():
     try:
         n, diag = sync_from_quickbooks()
-        session["sync_msg"] = f"Synced {n}. Diagnostics — {diag}"
+        session["sync_msg"] = f"Synced {n} transactions from QuickBooks."
     except Exception as e:
         session["sync_msg"] = f"Sync failed: {e}"
     return redirect(url_for("dashboard"))
