@@ -18,6 +18,128 @@ EAT = timezone(timedelta(hours=3))
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+# ---------------- QuickBooks sync ----------------
+import json, base64, urllib.request, urllib.parse, urllib.error
+QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
+QBO_BASE = "https://sandbox-quickbooks.api.intuit.com"
+
+def qbo_token():
+    cid = os.environ["QBO_CLIENT_ID"]; secret = os.environ["QBO_CLIENT_SECRET"]
+    refresh = os.environ["QBO_REFRESH_TOKEN"]
+    auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
+    data = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh}).encode()
+    req = urllib.request.Request("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer", data=data, method="POST")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())["access_token"]
+
+def qbo_query(entity, token):
+    q = f"SELECT * FROM {entity} MAXRESULTS 1000"
+    url = f"{QBO_BASE}/v3/company/{QBO_REALM_ID}/query?query=" + urllib.parse.quote(q)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read()).get("QueryResponse", {}).get(entity, [])
+
+def _D(x): return Decimal(str(x or 0))
+
+def _h_purchase(e, acct, atype):
+    if e.get("AccountRef", {}).get("value") != acct: return None
+    amt = _D(e.get("TotalAmt")); is_credit = e.get("Credit", False)
+    signed = (-amt if is_credit else amt) if atype == "credit_card" else (amt if is_credit else -amt)
+    cat = None
+    for ln in e.get("Line", []):
+        det = ln.get("AccountBasedExpenseLineDetail")
+        if det: cat = det.get("AccountRef", {}).get("name"); break
+    return signed, e.get("EntityRef", {}).get("name"), e.get("PrivateNote"), cat
+
+def _h_deposit(e, acct, atype):
+    if e.get("DepositToAccountRef", {}).get("value") != acct: return None
+    cat = None
+    for ln in e.get("Line", []):
+        det = ln.get("DepositLineDetail")
+        if det: cat = det.get("AccountRef", {}).get("name"); break
+    return _D(e.get("TotalAmt")), None, e.get("PrivateNote"), cat
+
+def _h_transfer(e, acct, atype):
+    if e.get("ToAccountRef", {}).get("value") == acct:
+        return _D(e.get("Amount")), "Transfer in", e.get("PrivateNote"), e.get("FromAccountRef", {}).get("name")
+    if e.get("FromAccountRef", {}).get("value") == acct:
+        return -_D(e.get("Amount")), "Transfer out", e.get("PrivateNote"), e.get("ToAccountRef", {}).get("name")
+    return None
+
+def _h_billpayment(e, acct, atype):
+    amt = _D(e.get("TotalAmt"))
+    if e.get("CheckPayment", {}).get("BankAccountRef", {}).get("value") == acct:
+        return -amt, e.get("VendorRef", {}).get("name"), e.get("PrivateNote"), None
+    if e.get("CreditCardPayment", {}).get("CCAccountRef", {}).get("value") == acct:
+        return amt, e.get("VendorRef", {}).get("name"), e.get("PrivateNote"), None
+    return None
+
+def _h_payment(e, acct, atype):
+    if e.get("DepositToAccountRef", {}).get("value") != acct: return None
+    return _D(e.get("TotalAmt")), e.get("CustomerRef", {}).get("name"), e.get("PrivateNote"), None
+
+def _h_journalentry(e, acct, atype):
+    net, hit, cat = Decimal(0), False, None
+    for ln in e.get("Line", []):
+        det = ln.get("JournalEntryLineDetail")
+        if not det: continue
+        if det.get("AccountRef", {}).get("value") == acct:
+            amt = _D(ln.get("Amount"))
+            want = "Credit" if atype == "credit_card" else "Debit"
+            net += amt if det.get("PostingType") == want else -amt
+            hit = True
+        elif cat is None:
+            cat = det.get("AccountRef", {}).get("name")
+    return (net, "Journal entry", e.get("PrivateNote"), cat) if hit else None
+
+QBO_HANDLERS = {"Purchase": _h_purchase, "Deposit": _h_deposit, "Transfer": _h_transfer,
+                "BillPayment": _h_billpayment, "Payment": _h_payment, "JournalEntry": _h_journalentry}
+
+def sync_from_quickbooks():
+    token = qbo_token()
+    cache = {}
+    for etype in QBO_HANDLERS:
+        try:
+            cache[etype] = qbo_query(etype, token)
+        except urllib.error.HTTPError:
+            cache[etype] = []
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
+    conn.commit()
+    cur.execute("SELECT account_id, source_account_id, name, type FROM account ORDER BY type, name;")
+    accounts = cur.fetchall()
+    total = 0
+    for acct_uuid, acct_qbo, name, atype in accounts:
+        for etype, handler in QBO_HANDLERS.items():
+            for e in cache[etype]:
+                try:
+                    res = handler(e, acct_qbo, atype)
+                except Exception:
+                    continue
+                if not res: continue
+                amount, cp, desc, cat = res
+                cur.execute("""
+                    INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
+                                          posted_date, amount, currency, description, counterparty,
+                                          reference, category, cleared_status, last_modified)
+                    VALUES (%(org)s,%(acct)s,%(sid)s,%(stype)s,%(date)s,%(amt)s,%(cur)s,%(desc)s,%(cp)s,%(ref)s,%(cat)s,'unknown',%(lm)s)
+                    ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
+                      posted_date=EXCLUDED.posted_date, amount=EXCLUDED.amount, currency=EXCLUDED.currency,
+                      description=EXCLUDED.description, counterparty=EXCLUDED.counterparty,
+                      reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
+                """, {"org": ORG_ID, "acct": acct_uuid, "sid": e.get("Id"), "stype": etype,
+                      "date": e.get("TxnDate"), "amt": amount,
+                      "cur": e.get("CurrencyRef", {}).get("value", "USD"),
+                      "desc": desc, "cp": cp, "ref": e.get("DocNumber"), "cat": cat,
+                      "lm": e.get("MetaData", {}).get("LastUpdatedTime")})
+                total += 1
+    conn.commit(); cur.close(); conn.close()
+    return total
 
 
 def get_conn():
@@ -220,6 +342,9 @@ def account_summary(cur, acct_uuid, name, atype):
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>Dashboard</title>""" + CSS + """</head><body>
 <div class=nav><span class=brand>Reconciliation Tool</span><a href="{{ url_for('logout') }}">Sign out</a></div>
 <div class=wrap><h1>All accounts</h1><div class=sub>generated {{ now }} EAT</div>
+<form method=post action="{{ url_for('sync') }}" style="margin-bottom:20px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing… (a few seconds)';b.disabled=true;">
+<button type=submit style="background:#2b2b29;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px">Sync from QuickBooks</button></form>
+{% if sync_msg %}<div class=sub style="color:#3a7d44;margin-top:-8px">{{ sync_msg }}</div>{% endif %}
 <div class=cards>
 <div class=card><div class=label>Accounts</div><div class=val>{{ rows|length }}</div></div>
 <div class=card><div class=label>Reconciled</div><div class=val>{{ n_recon }}</div></div>
@@ -250,8 +375,9 @@ def dashboard():
     n_recon = sum(1 for r in rows if r["status"] != "none")
     n_signed = sum(1 for r in rows if r["status"] == "signed")
     tot_exc = sum(r.get("exc", 0) for r in rows)
+    sync_msg = session.pop("sync_msg", None)
     return render_template_string(DASH_TEMPLATE, rows=rows, n_recon=n_recon, n_signed=n_signed,
-                                  tot_exc=tot_exc, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
+                                  tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>{{ name }}</title>""" + CSS + """</head><body>
@@ -335,6 +461,16 @@ def upload(name):
     except Exception as e:
         return f"Could not process file: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
+
+
+@app.route("/sync", methods=["POST"])
+def sync():
+    try:
+        n = sync_from_quickbooks()
+        session["sync_msg"] = f"Synced {n} transactions from QuickBooks."
+    except Exception as e:
+        session["sync_msg"] = f"Sync failed: {e}"
+    return redirect(url_for("dashboard"))
 
 
 if __name__ == "__main__":
