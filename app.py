@@ -469,6 +469,82 @@ def ingest_file(text, filename, account_name):
     return _save_statement(rows, account_name, "ofx" if is_ofx else "csv")
 
 
+def parse_books_csv(text):
+    # QuickBooks exports often have title/blank rows above the real header; find the header line.
+    lines = text.splitlines()
+    start = 0
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if ("date" in low) and ("amount" in low or "debit" in low or "credit" in low or "memo" in low or "name" in low):
+            start = i; break
+    reader = csv.DictReader(io.StringIO("\n".join(lines[start:])))
+    fns = reader.fieldnames or []
+    dk = find_key(fns, "date", "transaction date", "posting date")
+    ak = find_key(fns, "amount", "value")
+    dr = find_key(fns, "debit", "withdrawal", "payment")
+    crk = find_key(fns, "credit", "deposit")
+    nk = find_key(fns, "name", "payee", "description", "memo", "narrative")
+    ck = find_key(fns, "split", "account", "category")
+    if not dk or not (ak or dr or crk):
+        raise ValueError(f"Books CSV needs a Date column and an Amount (or Debit/Credit) column. Found columns: {fns}")
+    rows = []
+    for r in reader:
+        ds = (r.get(dk) or "").strip()
+        if not ds:
+            continue
+        try:
+            d = parse_date(ds)
+        except ValueError:
+            continue  # skip subtotal/total/junk rows that aren't real dates
+        if ak and (r.get(ak) or "").strip():
+            try:
+                amount = parse_amount(r[ak])
+            except Exception:
+                continue
+        else:
+            try:
+                deb = abs(parse_amount(r[dr])) if (dr and (r.get(dr) or "").strip()) else Decimal(0)
+                cre = abs(parse_amount(r[crk])) if (crk and (r.get(crk) or "").strip()) else Decimal(0)
+            except Exception:
+                continue
+            amount = cre - deb
+        if amount == 0:
+            continue
+        desc = (r.get(nk) or "").strip() if nk else ""
+        cat = (r.get(ck) or "").strip() if ck else None
+        rows.append({"date": d, "amount": amount, "desc": desc, "category": cat or None})
+    return rows
+
+
+def ingest_books(text, account_name):
+    rows = parse_books_csv(text)
+    if not rows:
+        raise ValueError("No transactions found in the books CSV.")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
+    cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
+    arow = cur.fetchone()
+    if not arow:
+        cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
+    acct_uuid, currency = arow
+    # Replace any prior CSV-imported books for this account (idempotent); never touches API-synced rows.
+    cur.execute("DELETE FROM book_txn WHERE account_id=%s AND source_txn_type='CSV';", (acct_uuid,))
+    n = 0
+    for r in rows:
+        desc = r.get("desc") or ""
+        key = hashlib.sha256(f"{r['date']}|{r['amount']}|{desc.lower()}".encode()).hexdigest()[:32]
+        cur.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
+                       posted_date, amount, currency, description, counterparty, category, cleared_status)
+                       VALUES (%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown')
+                       ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
+                         amount=EXCLUDED.amount, description=EXCLUDED.description,
+                         counterparty=EXCLUDED.counterparty, category=EXCLUDED.category;""",
+                    (ORG_ID, acct_uuid, key, r["date"], r["amount"], currency, desc, desc, r.get("category")))
+        n += 1
+    conn.commit(); cur.close(); conn.close()
+    return n
+
+
 def run_matcher(statement_id):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, period_start, period_end FROM statement WHERE statement_id=%s;", (statement_id,))
@@ -580,8 +656,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>{{ na
 <div class=nav><span class=brand>Reconciliation Tool</span><span><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
-<form class=upload action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data>
+<div class=upload>
+<form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
+<div style="font-size:13px;color:#73726c;margin-bottom:6px">Bank statement (CSV or OFX)</div>
 <input type=file name=statement accept=.csv,.ofx required> <button type=submit>Upload &amp; reconcile</button></form>
+<form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
+<div style="font-size:13px;color:#73726c;margin-bottom:6px">Books from QuickBooks (CSV export)</div>
+<input type=file name=books accept=.csv required> <button type=submit>Import books</button></form>
+</div>
 {% if has_results %}
 <div class=cards>
 <div class=card><div class=label>Exact</div><div class=val>{{ n_exact }}</div></div>
@@ -721,6 +803,31 @@ def upload(name):
         run_matcher(sid)
     except Exception as e:
         return f"Could not process file: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+    return redirect(url_for("detail", name=name))
+
+
+@app.route("/account/<name>/import_books", methods=["POST"])
+def import_books(name):
+    f = request.files.get("books")
+    if not f or not f.filename:
+        return redirect(url_for("detail", name=name))
+    try:
+        ingest_books(f.read().decode("utf-8-sig", errors="ignore"), name)
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+        arow = cur.fetchone()
+        sid = None
+        if arow:
+            cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (arow[0],))
+            srow = cur.fetchone(); sid = srow[0] if srow else None
+        cur.close(); conn.close()
+        if sid:
+            run_matcher(sid)
+            c2 = get_conn(); cu2 = c2.cursor()
+            cu2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
+            c2.commit(); cu2.close(); c2.close()
+    except Exception as e:
+        return f"Could not import books: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
