@@ -347,7 +347,7 @@ a{color:inherit;text-decoration:none}
 .nav .links a:hover{color:var(--ink)}
 .wrap{max-width:1000px;margin:0 auto;padding:34px 24px 64px}
 h1{font-size:26px;font-weight:680;letter-spacing:-.02em;margin:0 0 5px}
-h2{font-size:13.5px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);margin:32px 0 13px}
+h2{font-size:15px;font-weight:650;letter-spacing:-.01em;color:var(--ink);margin:30px 0 12px;border-radius:7px;padding:2px 6px;margin-left:-6px}
 .sub{color:var(--muted);margin:0 0 26px;font-size:14px}
 .btn{background:var(--ink);color:#fff;border:none;padding:10px 17px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:550;transition:opacity .15s ease}
 .btn:hover{opacity:.9}
@@ -355,7 +355,7 @@ h2{font-size:13.5px;font-weight:650;letter-spacing:.02em;text-transform:uppercas
 .btn-go:hover{opacity:.92}
 .btn-sm{background:var(--panel);border:1px solid var(--line);padding:6px 12px;border-radius:7px;cursor:pointer;font-size:13px;font-weight:500;color:var(--ink);transition:border-color .15s,background .15s}
 .btn-sm:hover{border-color:#cdd2da;background:#fafbfc}
-.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:8px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:8px}
 .tile{appearance:none;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;cursor:pointer;font:inherit;color:inherit;box-shadow:var(--shadow);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
 .tile:hover{transform:translateY(-2px);box-shadow:var(--lift)}
 .tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -364,6 +364,10 @@ h2{font-size:13.5px;font-weight:650;letter-spacing:.02em;text-transform:uppercas
 .tile.active{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),var(--shadow)}
 .tile.active .t-label{color:var(--accent)}
 .tile .t-val.warn{color:var(--bad)}
+.t-top{display:flex;align-items:center;gap:7px}
+.t-ic{color:var(--muted);display:inline-flex}.t-ic svg{width:16px;height:16px;display:block}
+.tile.active .t-ic{color:var(--accent)}
+.flash{animation:flashbg 1.3s ease}@keyframes flashbg{0%{background:var(--accent-soft)}100%{background:transparent}}
 .fbar{font-size:13.5px;color:var(--muted);margin:14px 0 0;display:none}
 .fbar a{color:var(--accent);font-weight:600;cursor:pointer}
 .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
@@ -404,10 +408,11 @@ LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;color:#16202e;
-  background:radial-gradient(900px 480px at 72% 8%,rgba(16,185,129,.18),transparent 58%),linear-gradient(155deg,#16323a 0%,#111d29 52%,#0f3a36 100%)}
+  background:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px) 0 0/30px 30px,linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px) 0 0/30px 30px,radial-gradient(900px 480px at 72% 8%,rgba(16,185,129,.18),transparent 58%),linear-gradient(155deg,#16323a 0%,#111d29 52%,#0f3a36 100%)}
 .card{background:#fff;border-radius:18px;width:100%;max-width:372px;padding:38px 34px;position:relative;overflow:hidden;
   box-shadow:0 24px 60px rgba(8,15,30,.40),0 2px 10px rgba(8,15,30,.22)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,#0f766e,#10b981)}
+.emblem{width:46px;height:46px;border-radius:12px;background:#ecfdf5;color:#0f766e;display:flex;align-items:center;justify-content:center;margin-bottom:16px}.emblem svg{width:25px;height:25px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:680;font-size:19px;letter-spacing:-.01em}
 .brand .dot{width:11px;height:11px;border-radius:50%;background:#0f766e;box-shadow:0 0 0 4px #d6efea}
 .tag{color:#667085;font-size:14px;margin:10px 0 26px;line-height:1.5}
@@ -420,6 +425,7 @@ button:hover{opacity:.92}
 .foot{text-align:center;color:#98a2b3;font-size:12px;margin-top:24px}
 </style></head><body>
 <div class=card>
+<div class=emblem><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></div>
 <div class=brand><span class=dot></span>Reconciliation Tool</div>
 <p class=tag>Match your books to your bank statements, with confidence.</p>
 <form method=post>
@@ -691,10 +697,10 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <button type=submit class=btn>Sync from QuickBooks</button></form>
 {% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
 <div class=tiles>
-<button class="tile active" data-filter="all"><div class=t-label>Accounts</div><div class=t-val>{{ rows|length }}</div></button>
-<button class="tile" data-filter="reconciled"><div class=t-label>Reconciled</div><div class=t-val>{{ n_recon }}</div></button>
-<button class="tile" data-filter="signed"><div class=t-label>Signed off</div><div class=t-val>{{ n_signed }}</div></button>
-<button class="tile" data-filter="exceptions"><div class=t-label>Open exceptions</div><div class="t-val {{ 'warn' if tot_exc else '' }}">{{ tot_exc }}</div></button>
+<button class="tile active" data-filter="all"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span><span class=t-label>Accounts</span></div><div class=t-val>{{ rows|length }}</div></button>
+<button class="tile" data-filter="reconciled"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.4 12 2.4 2.4L16 9"/></svg></span><span class=t-label>Reconciled</span></div><div class=t-val>{{ n_recon }}</div></button>
+<button class="tile" data-filter="signed"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5.5c0 4 3 6.5 7 7.5 4-1 7-3.5 7-7.5V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></svg></span><span class=t-label>Signed off</span></div><div class=t-val>{{ n_signed }}</div></button>
+<button class="tile" data-filter="exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Open exceptions</span></div><div class="t-val {{ 'warn' if tot_exc else '' }}">{{ tot_exc }}</div></button>
 </div>
 <div class=fbar id=fbar></div>
 <table>
@@ -765,12 +771,12 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
 </div>
 {% if has_results %}
-<div class=cards>
-<div class=card><div class=label>Exact</div><div class=val>{{ n_exact }}</div></div>
-<div class=card><div class=label>Discrepancies</div><div class=val>{{ n_fuzzy }}</div></div>
-<div class=card><div class=label>Batched</div><div class=val>{{ n_m2o }}</div></div>
-<div class=card><div class=label>Exceptions</div><div class=val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></div>
-<div class=card><div class=label>Difference</div><div class=val style="color:{{ '#3a7d44' if diff==0 else ('#73726c' if (writebacks|length + deposits|length + on_stmt|length + in_books|length)>0 else '#b3471f') }}">{{ "%.2f"|format(diff) }}</div></div>
+<div class=tiles id=dtiles>
+<button class="tile" data-target="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7"/></svg></span><span class=t-label>Exact</span></div><div class=t-val>{{ n_exact }}</div></button>
+<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>Discrepancies</span></div><div class=t-val>{{ n_fuzzy }}</div></button>
+<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="8" height="8" rx="1.5"/><rect x="13" y="12.5" width="8" height="8" rx="1.5"/><path d="M13 7.5h3a2 2 0 0 1 2 2v3"/></svg></span><span class=t-label>Batched</span></div><div class=t-val>{{ n_m2o }}</div></button>
+<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
+<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Difference</span></div><div class=t-val style="color:{{ '#047857' if diff==0 else ('#667085' if (writebacks|length + deposits|length + on_stmt|length + in_books|length)>0 else '#b42318') }}">{{ "%.2f"|format(diff) }}</div></button>
 </div>
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
@@ -778,7 +784,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
 </div>
 {% if reviewable %}
-<h2 style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
+<h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
 <table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td><span class="tag {{ 'fuzzy' if r.type=='fuzzy' else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else 'batched' }}</span></td>
@@ -791,7 +797,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
-<h2 style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
+<h2 id=sec-matched style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta != 0 %} · off {{ "%.2f"|format(delta) }}{% endif %}</span></td>
@@ -821,13 +827,15 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
-<h2 style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
+<h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ "%.2f"|format(a) }}</td></tr>{% endfor %}</table>
 <h2 style="font-size:15px">In books, not on statement ({{ in_books|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ "%.2f"|format(a) }}</td></tr>{% endfor %}</table>
-{% endif %}</div></body></html>"""
+{% endif %}
+<script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
+</div></body></html>"""
 
 
 def compute_detail(cur, acct_uuid, atype="bank"):
