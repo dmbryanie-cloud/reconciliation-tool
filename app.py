@@ -328,27 +328,76 @@ def create_deposit(token, deposit_to_qbo, income_id, amount_abs, txn_date, note)
 
 # ---------------- shared styling ----------------
 CSS = """<style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f3;color:#2b2b29;margin:0}
-.nav{background:#fff;border-bottom:1px solid #e3e2dd;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
-.nav .brand{font-weight:600}.nav a{color:#73726c;text-decoration:none;font-size:14px;margin-left:16px}
-.wrap{max-width:960px;margin:0 auto;padding:28px 24px}
-h1{font-size:22px;margin:0 0 4px}.sub{color:#73726c;margin:4px 0 24px;font-size:14px}
-.cards{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}
-.card{flex:1;min-width:140px;background:#fff;border:1px solid #e3e2dd;border-radius:10px;padding:16px}
-.label{font-size:12px;color:#73726c;text-transform:uppercase;letter-spacing:.04em}.val{font-size:24px;font-weight:600;margin-top:6px}
-.upload{background:#fff;border:1px solid #e3e2dd;border-radius:10px;padding:16px;margin-bottom:24px}
-.upload button{background:#2b2b29;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
-.btn-go{background:#3a7d44;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
-.btn-sm{background:#fff;border:1px solid #d8d7d2;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e2dd;border-radius:10px;overflow:hidden;margin-bottom:24px}
-th,td{text-align:left;padding:11px 14px;border-bottom:1px solid #efeeea;font-size:14px;white-space:nowrap}
-th{background:#faf9f7;color:#73726c;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
-tr:last-child td{border-bottom:none}.a{text-align:right;font-variant-numeric:tabular-nums}
-td a{color:#2b2b29;text-decoration:none}.tag{font-size:11px;padding:2px 8px;border-radius:20px}
-.tag.exact{background:#e7f1e9;color:#3a7d44}.tag.fuzzy{background:#fbf0dd;color:#9a6a16}
-.pill{font-size:12px;padding:3px 10px;border-radius:20px}
-.pill.none{background:#eeede9;color:#73726c}.pill.open{background:#fbf0dd;color:#9a6a16}.pill.signed{background:#e7f1e9;color:#3a7d44}
-.exc th{background:#fcefe9;color:#b3471f}
+:root{
+  --bg:#eef1f5;--panel:#fff;--ink:#16202e;--muted:#667085;
+  --line:#e4e7ec;--line-soft:#eef0f3;
+  --accent:#0f766e;--accent-soft:#d6efea;
+  --ok:#047857;--ok-soft:#d7f3e3;--warn:#b45309;--warn-soft:#fbedcf;
+  --bad:#b42318;--bad-soft:#fbe2de;--none:#667085;--none-soft:#ebedf0;
+  --radius:13px;--shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.07);
+  --lift:0 8px 20px rgba(16,24,40,.10);
+}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--ink);margin:0;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+.nav{background:var(--panel);border-bottom:1px solid var(--line);padding:15px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:5}
+.nav .brand{font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
+.nav .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.nav .links a{color:var(--muted);font-size:14px;margin-left:18px}
+.nav .links a:hover{color:var(--ink)}
+.wrap{max-width:1000px;margin:0 auto;padding:34px 24px 64px}
+h1{font-size:26px;font-weight:680;letter-spacing:-.02em;margin:0 0 5px}
+h2{font-size:13.5px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);margin:32px 0 13px}
+.sub{color:var(--muted);margin:0 0 26px;font-size:14px}
+.btn{background:var(--ink);color:#fff;border:none;padding:10px 17px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:550;transition:opacity .15s ease}
+.btn:hover{opacity:.9}
+.btn-go{background:var(--ok);color:#fff;border:none;padding:9px 16px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:550}
+.btn-go:hover{opacity:.92}
+.btn-sm{background:var(--panel);border:1px solid var(--line);padding:6px 12px;border-radius:7px;cursor:pointer;font-size:13px;font-weight:500;color:var(--ink);transition:border-color .15s,background .15s}
+.btn-sm:hover{border-color:#cdd2da;background:#fafbfc}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:8px}
+.tile{appearance:none;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;cursor:pointer;font:inherit;color:inherit;box-shadow:var(--shadow);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
+.tile:hover{transform:translateY(-2px);box-shadow:var(--lift)}
+.tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.tile .t-label{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.tile .t-val{font-size:30px;font-weight:700;margin-top:9px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.tile.active{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),var(--shadow)}
+.tile.active .t-label{color:var(--accent)}
+.tile .t-val.warn{color:var(--bad)}
+.fbar{font-size:13.5px;color:var(--muted);margin:14px 0 0;display:none}
+.fbar a{color:var(--accent);font-weight:600;cursor:pointer}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+.card .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.card .val{font-size:23px;font-weight:680;margin-top:7px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);margin:14px 0 26px}
+th,td{text-align:left;padding:13px 16px;border-bottom:1px solid var(--line-soft);font-size:14px;white-space:nowrap}
+th{background:#fafbfc;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{transition:background .12s ease}
+tbody tr:hover{background:#f7f9fb}
+.a{text-align:right;font-variant-numeric:tabular-nums}
+.pill{font-size:12px;padding:4px 11px;border-radius:999px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.pill::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
+.pill.none{background:var(--none-soft);color:var(--none)}
+.pill.open{background:var(--warn-soft);color:var(--warn)}
+.pill.signed{background:var(--ok-soft);color:var(--ok)}
+.tag{font-size:11px;padding:2px 9px;border-radius:999px;font-weight:600}
+.tag.exact{background:var(--ok-soft);color:var(--ok)}
+.tag.fuzzy{background:var(--warn-soft);color:var(--warn)}
+.upload{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:26px;box-shadow:var(--shadow)}
+.u-label{font-size:13px;color:var(--muted);margin-bottom:7px;font-weight:550}
+.upload input[type=file]{font-size:13px}
+.exc th{background:#fdf2ef;color:var(--bad)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+@media (max-width:760px){
+  .tiles{grid-template-columns:repeat(2,1fr)}
+  .cards{grid-template-columns:repeat(2,1fr)}
+  .wrap{padding:22px 15px 48px}
+  h1{font-size:22px}
+  .nav{padding:13px 16px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none !important}}
 </style>"""
 
 LOGIN_PAGE = """<!doctype html><meta charset=utf-8><title>Sign in</title>
@@ -611,30 +660,59 @@ def account_summary(cur, acct_uuid, name, atype):
             "m2o": mc.get("many_to_one", 0), "exc": exc, "diff": diff}
 
 
-DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>Dashboard</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand>Reconciliation Tool</span><a href="{{ url_for('logout') }}">Sign out</a></div>
-<div class=wrap><h1>All accounts</h1><div class=sub>generated {{ now }} EAT</div>
-<form method=post action="{{ url_for('sync') }}" style="margin-bottom:20px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing… (a few seconds)';b.disabled=true;">
-<button type=submit style="background:#2b2b29;color:#fff;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px">Sync from QuickBooks</button></form>
-{% if sync_msg %}<div class=sub style="color:#3a7d44;margin-top:-8px">{{ sync_msg }}</div>{% endif %}
-<div class=cards>
-<div class=card><div class=label>Accounts</div><div class=val>{{ rows|length }}</div></div>
-<div class=card><div class=label>Reconciled</div><div class=val>{{ n_recon }}</div></div>
-<div class=card><div class=label>Signed off</div><div class=val>{{ n_signed }}</div></div>
-<div class=card><div class=label>Open exceptions</div><div class=val style="color:{{ '#b3471f' if tot_exc else '#3a7d44' }}">{{ tot_exc }}</div></div>
+DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=wrap>
+<h1>All accounts</h1>
+<div class=sub>Updated {{ now }} EAT</div>
+<form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
+<button type=submit class=btn>Sync from QuickBooks</button></form>
+{% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
+<div class=tiles>
+<button class="tile active" data-filter="all"><div class=t-label>Accounts</div><div class=t-val>{{ rows|length }}</div></button>
+<button class="tile" data-filter="reconciled"><div class=t-label>Reconciled</div><div class=t-val>{{ n_recon }}</div></button>
+<button class="tile" data-filter="signed"><div class=t-label>Signed off</div><div class=t-val>{{ n_signed }}</div></button>
+<button class="tile" data-filter="exceptions"><div class=t-label>Open exceptions</div><div class="t-val {{ 'warn' if tot_exc else '' }}">{{ tot_exc }}</div></button>
 </div>
-<table><tr><th>Account</th><th>Type</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr>
-{% for r in rows %}<tr>
+<div class=fbar id=fbar></div>
+<table>
+<thead><tr><th>Account</th><th>Type</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr></thead>
+<tbody>
+{% for r in rows %}<tr data-status="{{ r.status }}" data-exc="{{ r.get('exc',0) }}">
 <td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td>
 <td>{{ 'bank' if r.type=='bank' else 'credit card' }}</td>
-<td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% else %}<span class="pill open">Reconciled · open</span>{% endif %}</td>
-{% if r.status=='none' %}<td>—</td><td>—</td><td>—</td><td class=a>—</td>
+<td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% else %}<span class="pill open">Reconciled</span>{% endif %}</td>
+{% if r.status=='none' %}<td class=muted>—</td><td class=muted>—</td><td class=muted>—</td><td class="a muted">—</td>
 {% else %}<td>{{ r.p_start }} → {{ r.p_end }}</td>
 <td>{{ r.exact }} exact{% if r.fuzzy %}, {{ r.fuzzy }} fuzzy{% endif %}{% if r.m2o %}, {{ r.m2o }} batched{% endif %}</td>
 <td>{{ r.exc }}</td>
-<td class=a>{% if r.diff==0 %}<span style="color:#3a7d44">0.00</span>{% elif r.exc>0 %}<span style="color:#73726c">{{ "%.2f"|format(r.diff) }} · explained</span>{% else %}<span style="color:#b3471f">{{ "%.2f"|format(r.diff) }} · UNEXPLAINED</span>{% endif %}</td>
+<td class=a>{% if r.diff==0 %}<span class=ok>0.00</span>{% elif r.exc>0 %}<span class=muted>{{ "%.2f"|format(r.diff) }} · explained</span>{% else %}<span class=bad>{{ "%.2f"|format(r.diff) }} · unexplained</span>{% endif %}</td>
 {% endif %}</tr>{% endfor %}
-</table></div></body></html>"""
+</tbody></table>
+<script>
+function flt(f){
+  document.querySelectorAll('.tile').forEach(function(t){t.classList.toggle('active', t.getAttribute('data-filter')===f)});
+  var total=document.querySelectorAll('tbody tr').length, shown=0;
+  document.querySelectorAll('tbody tr').forEach(function(tr){
+    var st=tr.getAttribute('data-status'), exc=parseInt(tr.getAttribute('data-exc')||'0',10), show=true;
+    if(f==='reconciled') show = st!=='none';
+    else if(f==='signed') show = st==='signed';
+    else if(f==='exceptions') show = exc>0;
+    tr.style.display = show ? '' : 'none'; if(show) shown++;
+  });
+  var bar=document.getElementById('fbar');
+  var labels={reconciled:'reconciled', signed:'signed off', exceptions:'with open exceptions'};
+  if(f==='all'){ bar.style.display='none'; }
+  else{
+    bar.style.display='block';
+    bar.textContent='Showing '+shown+' of '+total+' accounts '+labels[f]+'.\u00a0';
+    var a=document.createElement('a'); a.textContent='Show all'; a.onclick=function(){flt('all')};
+    bar.appendChild(a);
+  }
+}
+document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click',function(){flt(t.getAttribute('data-filter'))})});
+</script>
+</div></body></html>"""
 
 
 @app.route("/")
@@ -652,17 +730,17 @@ def dashboard():
                                   tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
 
-DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><title>{{ name }}</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand>Reconciliation Tool</span><span><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
-<div style="font-size:13px;color:#73726c;margin-bottom:6px">Bank statement (CSV or OFX)</div>
-<input type=file name=statement accept=.csv,.ofx required> <button type=submit>Upload &amp; reconcile</button></form>
+<div class=u-label>Bank statement (CSV or OFX)</div>
+<input type=file name=statement accept=.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button></form>
 <form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
-<div style="font-size:13px;color:#73726c;margin-bottom:6px">Books from QuickBooks (CSV export)</div>
-<input type=file name=books accept=.csv required> <button type=submit>Import books</button></form>
+<div class=u-label>Books from QuickBooks (CSV export)</div>
+<input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
 </div>
 {% if has_results %}
 <div class=cards>
