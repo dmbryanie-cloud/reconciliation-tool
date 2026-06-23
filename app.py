@@ -334,11 +334,11 @@ CSS = """<style>
   --accent:#0f766e;--accent-soft:#d6efea;
   --ok:#047857;--ok-soft:#d7f3e3;--warn:#b45309;--warn-soft:#fbedcf;
   --bad:#b42318;--bad-soft:#fbe2de;--none:#667085;--none-soft:#ebedf0;
-  --radius:13px;--shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.07);
+  --radius:13px;--shadow:0 1px 2px rgba(16,24,40,.05),0 4px 14px rgba(16,24,40,.06);
   --lift:0 8px 20px rgba(16,24,40,.10);
 }
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--ink);margin:0;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:radial-gradient(1100px 520px at 85% -8%,rgba(15,118,110,.07),transparent 60%),linear-gradient(180deg,#eff3f8 0%,#e6ecf3 65%,#e1e8f0 100%);background-attachment:fixed;min-height:100vh;color:var(--ink);margin:0;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}
 .nav{background:var(--panel);border-bottom:1px solid var(--line);padding:15px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:5}
 .nav .brand{font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
@@ -400,15 +400,37 @@ tbody tr:hover{background:#f7f9fb}
 @media (prefers-reduced-motion:reduce){*{transition:none !important}}
 </style>"""
 
-LOGIN_PAGE = """<!doctype html><meta charset=utf-8><title>Sign in</title>
-<style>body{font-family:system-ui,sans-serif;background:#f5f5f3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{background:#fff;border:1px solid #e3e2dd;border-radius:12px;padding:32px;width:300px}h1{font-size:18px;margin:0 0 16px}
-input{width:100%;padding:10px;border:1px solid #d8d7d2;border-radius:8px;box-sizing:border-box;font-size:14px}
-button{width:100%;margin-top:12px;padding:10px;background:#2b2b29;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px}
-.err{color:#b3471f;font-size:13px;margin-top:10px}</style>
-<div class=box><h1>Reconciliation Tool</h1><form method=post>
-<input type=password name=password placeholder=Password autofocus><button type=submit>Sign in</button>
-{% if error %}<div class=err>{{ error }}</div>{% endif %}</form></div>"""
+LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · Reconciliation Tool</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;color:#16202e;
+  background:radial-gradient(900px 480px at 72% 8%,rgba(16,185,129,.18),transparent 58%),linear-gradient(155deg,#16323a 0%,#111d29 52%,#0f3a36 100%)}
+.card{background:#fff;border-radius:18px;width:100%;max-width:372px;padding:38px 34px;position:relative;overflow:hidden;
+  box-shadow:0 24px 60px rgba(8,15,30,.40),0 2px 10px rgba(8,15,30,.22)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,#0f766e,#10b981)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:680;font-size:19px;letter-spacing:-.01em}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:#0f766e;box-shadow:0 0 0 4px #d6efea}
+.tag{color:#667085;font-size:14px;margin:10px 0 26px;line-height:1.5}
+label{display:block;font-size:12px;font-weight:600;color:#475467;margin-bottom:7px;text-transform:uppercase;letter-spacing:.05em}
+input{width:100%;padding:12px 13px;border:1px solid #d8dee6;border-radius:10px;font-size:15px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:#0f766e;box-shadow:0 0 0 3px #d6efea}
+button{width:100%;margin-top:18px;padding:12px;background:#16202e;color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:15px;font-weight:600;transition:opacity .15s}
+button:hover{opacity:.92}
+.err{color:#b42318;font-size:13px;margin-top:13px;background:#fbe2de;padding:9px 12px;border-radius:8px}
+.foot{text-align:center;color:#98a2b3;font-size:12px;margin-top:24px}
+</style></head><body>
+<div class=card>
+<div class=brand><span class=dot></span>Reconciliation Tool</div>
+<p class=tag>Match your books to your bank statements, with confidence.</p>
+<form method=post>
+<label for=pw>Password</label>
+<input id=pw type=password name=password placeholder="Enter your password" autofocus>
+<button type=submit>Sign in</button>
+{% if error %}<div class=err>{{ error }}</div>{% endif %}
+</form>
+<div class=foot>Private · access by password</div>
+</div>
+</body></html>"""
 
 
 @app.before_request
