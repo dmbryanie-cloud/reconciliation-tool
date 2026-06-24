@@ -668,11 +668,11 @@ def ingest_books(text, account_name):
         desc = r.get("desc") or ""
         key = hashlib.sha256(f"{r['date']}|{r['amount']}|{desc.lower()}".encode()).hexdigest()[:32]
         cur.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
-                       posted_date, amount, currency, description, counterparty, category, cleared_status, is_void, is_deleted)
-                       VALUES (%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown',false,false)
+                       posted_date, amount, currency, description, counterparty, category, cleared_status, is_void, is_deleted, last_modified)
+                       VALUES (%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown',false,false,now())
                        ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
                          amount=EXCLUDED.amount, description=EXCLUDED.description,
-                         counterparty=EXCLUDED.counterparty, category=EXCLUDED.category;""",
+                         counterparty=EXCLUDED.counterparty, category=EXCLUDED.category, last_modified=now();""",
                     (ORG_ID, acct_uuid, key, r["date"], r["amount"], currency, desc, desc, r.get("category")))
         n += 1
     conn.commit(); cur.close(); conn.close()
