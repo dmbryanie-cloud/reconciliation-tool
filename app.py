@@ -18,9 +18,9 @@ DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
 GROUP_WINDOW_DAYS = 60
-MAX_GROUP = 4
-M2O_MAX_LINES = 250   # skip combinatorial pass above this many unmatched lines
-M2O_MAX_CANDS = 8     # candidates considered per line in the combinatorial pass
+MAX_GROUP = 5         # max items combined in a batch
+M2O_MAX_LINES = 1000  # skip combinatorial pass above this many unmatched items
+M2O_MAX_CANDS = 10    # candidates considered per item (sorted by date-closeness)
 EAT = timezone(timedelta(hours=3))
 
 app = Flask(__name__)
@@ -713,12 +713,14 @@ def run_matcher(statement_id):
             if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
                 add([l_id], [t_id], "fuzzy", 0.6, la - ta); used.add(t_id); matched_lines.add(l_id); break
 
-    # pass 3: many-to-one (bounded so it can't run away on large files)
+    # pass 3: many-to-one, BOTH directions (bounded; candidates sorted by date-closeness)
+    # 3a forward: one statement line = sum of several book txns
     unmatched = [(l_id, ld, la) for (l_id, ld, la, lw) in lines if l_id not in matched_lines]
     if len(unmatched) <= M2O_MAX_LINES:
         for l_id, ld, la in unmatched:
-            cands = [(t, a) for (t, d, a, w) in txns
-                     if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS][:M2O_MAX_CANDS]
+            cands = sorted([(t, a, d) for (t, d, a, w) in txns
+                            if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS],
+                           key=lambda c: abs((ld - c[2]).days))[:M2O_MAX_CANDS]
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
                 for combo in itertools.combinations(cands, k):
@@ -730,6 +732,26 @@ def run_matcher(statement_id):
                 tids = [c[0] for c in found]
                 add([l_id], tids, "many_to_one", 0.8, 0)
                 matched_lines.add(l_id); used.update(tids)
+    # 3b reverse: one book txn = sum of several statement lines (e.g. bank charge + its excise duty)
+    unmatched_t = [(t, td, ta) for (t, td, ta, tw) in txns if t not in used]
+    if len(unmatched_t) <= M2O_MAX_LINES:
+        for t_id, td, ta in unmatched_t:
+            cands = sorted([(l, a, d) for (l, d, a, w) in lines
+                            if l not in matched_lines and abs((td - d).days) <= GROUP_WINDOW_DAYS],
+                           key=lambda c: abs((td - c[2]).days))[:M2O_MAX_CANDS]
+            found = None
+            for k in range(2, min(MAX_GROUP, len(cands)) + 1):
+                for combo in itertools.combinations(cands, k):
+                    if sum((c[1] for c in combo), Decimal(0)) == ta:
+                        found = combo; break
+                if found:
+                    break
+            if found:
+                lids = [c[0] for c in found]
+                add(lids, [t_id], "many_to_one", 0.8, 0)
+                used.add(t_id)
+                for lid in lids:
+                    matched_lines.add(lid)
 
     # bulk insert (few round-trips instead of hundreds)
     if matches:
