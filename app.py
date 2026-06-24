@@ -820,7 +820,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <h2 id=sec-matched style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
-<td><span class="tag {{ mt }}">{{ mt }}{% if delta != 0 %} · off {{ "%.2f"|format(delta) }}{% endif %}</span></td>
+<td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ "%.2f"|format(delta) }}{% endif %}</span></td>
 <td class=a>{{ "%.2f"|format(samt) }}</td><td class=a>{{ "%.2f"|format(bamt) }}</td></tr>{% endfor %}</table>
 {% if writebacks %}
 <h2 style="font-size:15px">Unrecorded expenses — add to QuickBooks ({{ writebacks|length }})</h2>
