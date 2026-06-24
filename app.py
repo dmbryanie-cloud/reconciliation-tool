@@ -889,6 +889,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
 <form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterward.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
 {% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
+<a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
 </div>
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
@@ -1203,6 +1204,32 @@ BOOKS_TEMPLATE = (
     "2026-04-10,Customer deposit,408.00,Sales\n"
     "2026-03-29,Chin's Gas and Oil,-54.55,Automobile:Fuel\n"
 )
+
+@app.route("/account/<name>/exceptions.csv")
+def exceptions_csv(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close(); return f"No account named {name}"
+    acct_uuid, atype = row
+    d = compute_detail(cur, acct_uuid, atype)
+    cur.close(); conn.close()
+    buf = io.StringIO()
+    wtr = csv.writer(buf)
+    wtr.writerow(["Source", "Date", "Description", "Amount", "Direction", "Suggested category"])
+    if d.get("has_results"):
+        for wb in d.get("writebacks", []):
+            wtr.writerow(["Bank statement", wb["date"], wb["who"], wb["amount"], "Money out", wb.get("cat") or ""])
+        for dp in d.get("deposits", []):
+            wtr.writerow(["Bank statement", dp["date"], dp["who"], dp["amount"], "Money in", ""])
+        for (lid, dd, a, who) in d.get("on_stmt", []):
+            wtr.writerow(["Bank statement", dd, who, a, ("Money in" if a > 0 else "Money out"), ""])
+        for (tid, dd, a, who) in d.get("in_books", []):
+            wtr.writerow(["Books", dd, who, a, "In books, not on statement", ""])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={name}_exceptions.csv"})
+
 
 @app.route("/account/<name>/diag")
 def diag(name):
