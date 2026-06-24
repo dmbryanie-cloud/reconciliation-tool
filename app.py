@@ -1182,6 +1182,59 @@ BOOKS_TEMPLATE = (
     "2026-03-29,Chin's Gas and Oil,-54.55,Automobile:Fuel\n"
 )
 
+@app.route("/account/<name>/diag")
+def diag(name):
+    conn = get_conn(); cur = conn.cursor()
+    o = []
+    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if not row:
+        return f"No account named {name}"
+    acct, atype, ccy = row
+    o.append(f"ACCOUNT  name={name}  type={atype}  currency={ccy}")
+    o.append(f"         id={acct}")
+    cur.execute("SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct,))
+    st = cur.fetchone()
+    sid = ps = pe = None
+    if st:
+        sid, ps, pe = st
+        o.append("")
+        o.append(f"STATEMENT  period {ps} -> {pe}")
+        cur.execute("SELECT count(*) FROM statement_line WHERE statement_id=%s;", (sid,))
+        o.append(f"           statement_line rows: {cur.fetchone()[0]}")
+        cur.execute("SELECT posted_date, amount, coalesce(description,'') FROM statement_line WHERE statement_id=%s ORDER BY posted_date LIMIT 6;", (sid,))
+        o.append("           sample bank lines (date | amount | desc):")
+        for d,a,de in cur.fetchall(): o.append(f"             {d} | {a} | {de[:34]}")
+    else:
+        o.append("STATEMENT  none found")
+    o.append("")
+    cur.execute("SELECT count(*) FROM book_txn WHERE account_id=%s;", (acct,))
+    o.append(f"BOOKS  total rows (all dates): {cur.fetchone()[0]}")
+    cur.execute("SELECT source_txn_type, count(*) FROM book_txn WHERE account_id=%s GROUP BY source_txn_type;", (acct,))
+    o.append("       by source: " + (", ".join(f"{t}={c}" for t,c in cur.fetchall()) or "(none)"))
+    cur.execute("SELECT count(*) FROM book_txn WHERE account_id=%s AND is_void IS NULL;", (acct,))
+    o.append(f"       rows with is_void NULL: {cur.fetchone()[0]}")
+    if sid:
+        cur.execute("SELECT count(*) FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s;", (acct, ps, pe))
+        o.append(f"       rows inside statement period: {cur.fetchone()[0]}")
+        cur.execute("SELECT count(*) FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false;", (acct, ps, pe))
+        o.append(f"       rows visible to matcher (in period): {cur.fetchone()[0]}")
+        cur.execute("SELECT posted_date, amount, coalesce(description,''), coalesce(category,'') FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s ORDER BY posted_date LIMIT 6;", (acct, ps, pe))
+        o.append("       sample book txns in period (date | amount | desc | category):")
+        for d,a,de,ca in cur.fetchall(): o.append(f"             {d} | {a} | {de[:22]} | {ca[:20]}")
+        cur.execute("""SELECT count(*) FROM statement_line sl WHERE sl.statement_id=%s AND EXISTS
+            (SELECT 1 FROM book_txn bt WHERE bt.account_id=%s AND bt.amount=sl.amount
+             AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false);""", (sid, acct))
+        o.append("")
+        o.append(f"OVERLAP  bank lines with an exact-amount book match somewhere: {cur.fetchone()[0]}")
+        cur.execute("""SELECT count(*) FROM statement_line sl WHERE sl.statement_id=%s AND EXISTS
+            (SELECT 1 FROM book_txn bt WHERE bt.account_id=%s AND bt.amount = -sl.amount
+             AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false);""", (sid, acct))
+        o.append(f"         bank lines matching a book amount with OPPOSITE sign: {cur.fetchone()[0]}")
+    cur.close(); conn.close()
+    return "<pre style='font-size:13px;line-height:1.5;padding:24px;font-family:ui-monospace,monospace'>" + "\n".join(str(x) for x in o) + "</pre>"
+
+
 @app.route("/account/<name>/clear", methods=["POST"])
 def clear_account(name):
     conn = get_conn(); cur = conn.cursor()
