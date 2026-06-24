@@ -9,7 +9,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-from flask import Flask, render_template_string, request, redirect, session, url_for
+from flask import Flask, render_template_string, request, redirect, session, url_for, Response
 import json, base64, urllib.request, urllib.parse, urllib.error
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
@@ -464,7 +464,8 @@ def logout():
 # ---------------- statement parsing (CSV + OFX) ----------------
 def parse_date(s):
     s = s.strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y",
+                "%Y/%m/%d", "%b %d, %Y", "%d %b %Y", "%d-%b-%Y", "%m/%d/%y", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
@@ -484,19 +485,81 @@ def find_key(fieldnames, *cands):
         if c in lookup: return lookup[c]
     return None
 
-def parse_csv(text):
-    reader = csv.DictReader(io.StringIO(text))
-    dk = find_key(reader.fieldnames, "date", "posted date", "transaction date")
-    ak = find_key(reader.fieldnames, "amount", "value")
-    nk = find_key(reader.fieldnames, "description", "payee", "memo", "narrative")
-    if not (dk and ak):
-        raise ValueError(f"CSV needs Date and Amount columns. Found: {reader.fieldnames}")
+def _ledger_reader(text):
+    lines = text.splitlines()
+    start = 0
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if ("date" in low) and any(w in low for w in
+                ("amount", "debit", "credit", "payment", "deposit", "memo", "description", "payee", "name")):
+            start = i; break
+    return csv.DictReader(io.StringIO("\n".join(lines[start:])))
+
+def _amount_col(fns):
+    low = [((f or "").strip().lower(), f) for f in fns]
+    for lk, orig in low:
+        if lk in ("amount", "value"):
+            return orig
+    for lk, orig in low:
+        if "amount" in lk and not any(x in lk for x in ("credit", "debit", "balance", "running", "foreign", "fx")):
+            return orig
+    return None
+
+def _sub_col(fns, *cands):
+    low = [((f or "").strip().lower(), f) for f in fns]
+    for c in cands:
+        for lk, orig in low:
+            if lk == c:
+                return orig
+    for c in cands:
+        for lk, orig in low:
+            if c in lk:
+                return orig
+    return None
+
+def _parse_ledger(text, want_category=False):
+    reader = _ledger_reader(text)
+    fns = reader.fieldnames or []
+    dk = _sub_col(fns, "transaction date", "posted date", "posting date", "trans date", "date")
+    ak = _amount_col(fns)
+    dr = _sub_col(fns, "debit", "withdrawal", "payment")
+    crk = _sub_col(fns, "credit", "deposit")
+    nk = _sub_col(fns, "payee", "description", "name", "memo", "narrative")
+    ck = _sub_col(fns, "split", "category") if want_category else None
+    if not dk or not (ak or dr or crk):
+        raise ValueError(f"Couldn't find a Date column and an Amount (or Debit/Credit, Payment/Deposit) column. Found columns: {fns}")
     rows = []
     for r in reader:
-        if not (r.get(dk) or "").strip(): continue
-        rows.append({"date": parse_date(r[dk]), "amount": parse_amount(r[ak]),
-                     "desc": (r.get(nk) or "").strip() if nk else ""})
+        ds = (r.get(dk) or "").strip()
+        if not ds:
+            continue
+        try:
+            d = parse_date(ds)
+        except ValueError:
+            continue
+        if ak and (r.get(ak) or "").strip():
+            try:
+                amount = parse_amount(r[ak])
+            except Exception:
+                continue
+        else:
+            try:
+                deb = abs(parse_amount(r[dr])) if (dr and (r.get(dr) or "").strip()) else Decimal(0)
+                cre = abs(parse_amount(r[crk])) if (crk and (r.get(crk) or "").strip()) else Decimal(0)
+            except Exception:
+                continue
+            amount = cre - deb
+        if amount == 0:
+            continue
+        desc = (r.get(nk) or "").strip() if nk else ""
+        row = {"date": d, "amount": amount, "desc": desc}
+        if want_category:
+            row["category"] = ((r.get(ck) or "").strip() or None) if ck else None
+        rows.append(row)
     return rows
+
+def parse_csv(text):
+    return _parse_ledger(text, want_category=False)
 
 def parse_ofx(text):
     rows = []
@@ -547,50 +610,7 @@ def ingest_file(text, filename, account_name):
 
 
 def parse_books_csv(text):
-    # QuickBooks exports often have title/blank rows above the real header; find the header line.
-    lines = text.splitlines()
-    start = 0
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if ("date" in low) and ("amount" in low or "debit" in low or "credit" in low or "memo" in low or "name" in low):
-            start = i; break
-    reader = csv.DictReader(io.StringIO("\n".join(lines[start:])))
-    fns = reader.fieldnames or []
-    dk = find_key(fns, "date", "transaction date", "posting date")
-    ak = find_key(fns, "amount", "value")
-    dr = find_key(fns, "debit", "withdrawal", "payment")
-    crk = find_key(fns, "credit", "deposit")
-    nk = find_key(fns, "name", "payee", "description", "memo", "narrative")
-    ck = find_key(fns, "split", "account", "category")
-    if not dk or not (ak or dr or crk):
-        raise ValueError(f"Books CSV needs a Date column and an Amount (or Debit/Credit) column. Found columns: {fns}")
-    rows = []
-    for r in reader:
-        ds = (r.get(dk) or "").strip()
-        if not ds:
-            continue
-        try:
-            d = parse_date(ds)
-        except ValueError:
-            continue  # skip subtotal/total/junk rows that aren't real dates
-        if ak and (r.get(ak) or "").strip():
-            try:
-                amount = parse_amount(r[ak])
-            except Exception:
-                continue
-        else:
-            try:
-                deb = abs(parse_amount(r[dr])) if (dr and (r.get(dr) or "").strip()) else Decimal(0)
-                cre = abs(parse_amount(r[crk])) if (crk and (r.get(crk) or "").strip()) else Decimal(0)
-            except Exception:
-                continue
-            amount = cre - deb
-        if amount == 0:
-            continue
-        desc = (r.get(nk) or "").strip() if nk else ""
-        cat = (r.get(ck) or "").strip() if ck else None
-        rows.append({"date": d, "amount": amount, "desc": desc, "category": cat or None})
-    return rows
+    return _parse_ledger(text, want_category=True)
 
 
 def ingest_books(text, account_name):
@@ -764,10 +784,10 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
-<div class=u-label>Bank statement (CSV or OFX)</div>
+<div class=u-label>Bank statement (CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>
 <input type=file name=statement accept=.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button></form>
 <form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
-<div class=u-label>Books from QuickBooks (CSV export)</div>
+<div class=u-label>Books from QuickBooks (CSV export) · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
 <input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
 </div>
 {% if has_results %}
@@ -1081,6 +1101,27 @@ def deposit_writeback(name, line_id):
     except Exception as e:
         return f"Deposit write-back failed: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
+
+
+BANK_TEMPLATE = (
+    "Date,Description,Amount\n"
+    "2026-04-10,Customer deposit (money in),408.00\n"
+    "2026-03-29,Card purchase (money out),-54.55\n"
+)
+BOOKS_TEMPLATE = (
+    "Date,Description,Amount,Category\n"
+    "2026-04-10,Customer deposit,408.00,Sales\n"
+    "2026-03-29,Chin's Gas and Oil,-54.55,Automobile:Fuel\n"
+)
+
+@app.route("/template/<kind>")
+def template(kind):
+    if kind == "books":
+        data, fname = BOOKS_TEMPLATE, "books_template.csv"
+    else:
+        data, fname = BANK_TEMPLATE, "bank_statement_template.csv"
+    return Response(data, mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 
 @app.route("/sync", methods=["POST"])
