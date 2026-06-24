@@ -4,9 +4,11 @@ import csv
 import hashlib
 import itertools
 import re
+import uuid
 import psycopg2
 from collections import Counter
 from difflib import SequenceMatcher
+from psycopg2.extras import execute_values
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template_string, request, redirect, session, url_for, Response
@@ -17,6 +19,8 @@ ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
 GROUP_WINDOW_DAYS = 60
 MAX_GROUP = 4
+M2O_MAX_LINES = 250   # skip combinatorial pass above this many unmatched lines
+M2O_MAX_CANDS = 8     # candidates considered per line in the combinatorial pass
 EAT = timezone(timedelta(hours=3))
 
 app = Flask(__name__)
@@ -653,36 +657,58 @@ def run_matcher(statement_id):
                    FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s
                    AND is_void=false AND is_deleted=false;""", (acct_uuid, p_start, p_end))
     txns = cur.fetchall()
-    used, matched_lines = set(), set()
-    def wm(lids, tids, mt, conf, delta):
-        cur.execute("INSERT INTO match (org_id, statement_id, status, match_type, confidence, amount_delta) VALUES (%s,%s,'confirmed',%s,%s,%s) RETURNING match_id;",
-                    (ORG_ID, statement_id, mt, conf, delta))
-        mid = cur.fetchone()[0]
-        for l in lids: cur.execute("INSERT INTO match_statement_line (match_id, line_id) VALUES (%s,%s);", (mid, l))
-        for t in tids: cur.execute("INSERT INTO match_book_txn (match_id, txn_id) VALUES (%s,%s);", (mid, t))
+
+    used, matched_lines, matches = set(), set(), []
+    def add(lids, tids, mt, conf, delta):
+        matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids))
+
+    # pass 1: exact (amount equal, date within tolerance)
     for l_id, ld, la, lw in lines:
         for t_id, td, ta, tw in txns:
-            if t_id in used: continue
+            if t_id in used:
+                continue
             if la == ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
-                wm([l_id], [t_id], "exact", 1.0, 0); used.add(t_id); matched_lines.add(l_id); break
+                add([l_id], [t_id], "exact", 1.0, 0); used.add(t_id); matched_lines.add(l_id); break
+
+    # pass 2: fuzzy (same payee, amount differs)
     for l_id, ld, la, lw in lines:
-        if l_id in matched_lines: continue
+        if l_id in matched_lines:
+            continue
         for t_id, td, ta, tw in txns:
-            if t_id in used: continue
+            if t_id in used:
+                continue
             if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
-                wm([l_id], [t_id], "fuzzy", 0.6, la - ta); used.add(t_id); matched_lines.add(l_id); break
-    for l_id, ld, la, lw in lines:
-        if l_id in matched_lines: continue
-        cands = [(t, a) for (t, d, a, w) in txns if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS][:12]
-        found = None
-        for k in range(2, min(MAX_GROUP, len(cands)) + 1):
-            for combo in itertools.combinations(cands, k):
-                if sum((c[1] for c in combo), Decimal(0)) == la:
-                    found = combo; break
-            if found: break
-        if found:
-            tids = [c[0] for c in found]; wm([l_id], tids, "many_to_one", 0.8, 0)
-            matched_lines.add(l_id); used.update(tids)
+                add([l_id], [t_id], "fuzzy", 0.6, la - ta); used.add(t_id); matched_lines.add(l_id); break
+
+    # pass 3: many-to-one (bounded so it can't run away on large files)
+    unmatched = [(l_id, ld, la) for (l_id, ld, la, lw) in lines if l_id not in matched_lines]
+    if len(unmatched) <= M2O_MAX_LINES:
+        for l_id, ld, la in unmatched:
+            cands = [(t, a) for (t, d, a, w) in txns
+                     if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS][:M2O_MAX_CANDS]
+            found = None
+            for k in range(2, min(MAX_GROUP, len(cands)) + 1):
+                for combo in itertools.combinations(cands, k):
+                    if sum((c[1] for c in combo), Decimal(0)) == la:
+                        found = combo; break
+                if found:
+                    break
+            if found:
+                tids = [c[0] for c in found]
+                add([l_id], tids, "many_to_one", 0.8, 0)
+                matched_lines.add(l_id); used.update(tids)
+
+    # bulk insert (few round-trips instead of hundreds)
+    if matches:
+        execute_values(cur,
+            "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta) VALUES %s",
+            [(m[0], ORG_ID, statement_id, "confirmed", m[1], m[2], m[3]) for m in matches])
+        msl = [(m[0], lid) for m in matches for lid in m[4]]
+        if msl:
+            execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", msl)
+        mbt = [(m[0], tid) for m in matches for tid in m[5]]
+        if mbt:
+            execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", mbt)
     conn.commit(); cur.close(); conn.close()
 
 
