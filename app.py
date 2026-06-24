@@ -890,6 +890,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterward.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
 {% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
 <a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
+<a href="{{ url_for('qbo_import_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download for QuickBooks (CSV)</a>
 </div>
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
@@ -1204,6 +1205,41 @@ BOOKS_TEMPLATE = (
     "2026-04-10,Customer deposit,408.00,Sales\n"
     "2026-03-29,Chin's Gas and Oil,-54.55,Automobile:Fuel\n"
 )
+
+@app.route("/account/<name>/qbo_import.csv")
+def qbo_import_csv(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close(); return f"No account named {name}"
+    acct_uuid, atype = row
+    d = compute_detail(cur, acct_uuid, atype)
+    cur.close(); conn.close()
+
+    def clean_desc(s):
+        s = (s or "").replace(",", " ").replace("\n", " ").strip()
+        return s or "Transaction"
+
+    buf = io.StringIO()
+    wtr = csv.writer(buf)
+    wtr.writerow(["Date", "Description", "Amount"])   # exactly 3 columns for QBO bank import
+    if d.get("has_results"):
+        rows = []
+        for wb in d.get("writebacks", []):
+            rows.append((wb["date"], wb["who"], wb["amount"]))
+        for dp in d.get("deposits", []):
+            rows.append((dp["date"], dp["who"], dp["amount"]))
+        for (lid, dd, a, who) in d.get("on_stmt", []):
+            rows.append((dd, who, a))
+        rows.sort(key=lambda r: r[0])
+        for dd, who, a in rows:
+            if a == 0:
+                continue   # QBO rejects zero amounts
+            wtr.writerow([dd.strftime("%d/%m/%Y"), clean_desc(who), f"{a:.2f}"])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={name}_for_quickbooks.csv"})
+
 
 @app.route("/account/<name>/exceptions.csv")
 def exceptions_csv(name):
