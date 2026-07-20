@@ -27,6 +27,7 @@ EAT = timezone(timedelta(hours=3))
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "dmbryanie@gmail.com")  # shown on Terms/Privacy pages
 
 QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
 QBO_BASE = "https://sandbox-quickbooks.api.intuit.com"
@@ -493,6 +494,119 @@ def _money(x):
         return str(x)
 
 
+LEGAL_STYLE = """<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2937;background:#f7f8fa;margin:0;line-height:1.65;font-size:16px}
+.legal-nav{background:#fff;border-bottom:1px solid #e5e7eb;padding:16px 24px;font-weight:650;display:flex;align-items:center;gap:9px}
+.legal-nav .dot{width:9px;height:9px;border-radius:50%;background:#0f766e;box-shadow:0 0 0 3px #d6efea}
+.legal-wrap{max-width:760px;margin:0 auto;padding:40px 24px 80px}
+.legal-wrap h1{font-size:30px;letter-spacing:-.02em;margin:0 0 6px}
+.legal-wrap .updated{color:#6b7280;font-size:14px;margin-bottom:32px}
+.legal-wrap h2{font-size:19px;margin:34px 0 10px;letter-spacing:-.01em}
+.legal-wrap p,.legal-wrap li{color:#374151}
+.legal-wrap ul{padding-left:20px}
+.legal-wrap li{margin:6px 0}
+.legal-wrap a{color:#0f766e}
+.legal-foot{color:#9ca3af;font-size:13px;margin-top:40px;border-top:1px solid #e5e7eb;padding-top:20px}
+</style>"""
+
+PRIVACY_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Privacy Policy · Reconciliation Tool</title>""" + LEGAL_STYLE + """</head><body>
+<div class=legal-nav><span class=dot></span>Reconciliation Tool</div>
+<div class=legal-wrap>
+<h1>Privacy Policy</h1>
+<div class=updated>Last updated: 20 July 2026</div>
+
+<p>This Privacy Policy explains how the Reconciliation Tool (“the app”, “we”) collects, uses, stores, and protects information when you use it to reconcile bank statements against your QuickBooks Online accounting records.</p>
+
+<h2>Information we access and collect</h2>
+<ul>
+<li><b>QuickBooks Online data.</b> With your explicit authorization through Intuit’s secure OAuth process, the app accesses accounting data from your connected QuickBooks Online company — such as transactions, accounts, payees, and related records — only as needed to perform reconciliation and, at your direction, to record transactions back to your books.</li>
+<li><b>Bank statement data you provide.</b> Files you upload (CSV or OFX), containing dates, descriptions, and amounts.</li>
+<li><b>Account access.</b> A password you set to sign in to the app.</li>
+</ul>
+
+<h2>How we use your information</h2>
+<p>We use your information solely to provide the reconciliation service: matching your bank statement against your books, highlighting discrepancies, and — only when you choose to — creating corresponding transactions in your QuickBooks Online company. We do not sell, rent, or share your data with third parties for marketing, advertising, or any unrelated purpose.</p>
+
+<h2>How your information is stored and protected</h2>
+<ul>
+<li>Data is stored in a hosted PostgreSQL database (Supabase) and the application runs on a hosted platform (Render).</li>
+<li>Connections to QuickBooks Online and to the app are encrypted in transit (HTTPS/TLS).</li>
+<li>QuickBooks access and refresh tokens are stored securely and used only to connect to the QuickBooks company you authorized.</li>
+<li>Access to the app is protected by a password.</li>
+</ul>
+
+<h2>Data retention and deletion</h2>
+<p>You remain in control of your data. You can clear an account’s imported statements and stored transactions at any time using the app’s built-in “Clear this account’s data” function. You may also disconnect the app from QuickBooks Online at any time from within your QuickBooks account, which revokes the app’s access. To request deletion of any remaining data, contact us at the address below.</p>
+
+<h2>Use of Intuit / QuickBooks data</h2>
+<p>The app accesses QuickBooks Online data in accordance with Intuit’s API terms and security requirements. QuickBooks data is used only to provide the reconciliation service described above and for no other purpose.</p>
+
+<h2>Third-party services</h2>
+<p>The app relies on Render (application hosting) and Supabase (database hosting) to operate. These providers process data on our behalf to run the service. The app displays no advertising and does not sell data.</p>
+
+<h2>Changes to this policy</h2>
+<p>We may update this Privacy Policy from time to time. The “last updated” date above reflects the most recent revision.</p>
+
+<h2>Contact</h2>
+<p>For any questions about this Privacy Policy or your data, contact: <a href="mailto:__EMAIL__">__EMAIL__</a></p>
+
+<div class=legal-foot>Reconciliation Tool — a tool for reconciling bank statements with QuickBooks Online.</div>
+</div></body></html>"""
+
+TERMS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Terms of Service · Reconciliation Tool</title>""" + LEGAL_STYLE + """</head><body>
+<div class=legal-nav><span class=dot></span>Reconciliation Tool</div>
+<div class=legal-wrap>
+<h1>Terms of Service</h1>
+<div class=updated>Last updated: 20 July 2026</div>
+
+<p>These Terms of Service govern your use of the Reconciliation Tool (“the app”). By using the app, you agree to these terms.</p>
+
+<h2>The service</h2>
+<p>The app helps you reconcile bank statement transactions against your accounting records in QuickBooks Online. It identifies matches and discrepancies and, at your direction, can record transactions back to your QuickBooks Online company.</p>
+
+<h2>Connecting QuickBooks Online</h2>
+<p>You may connect the app to your QuickBooks Online company through Intuit’s authorization process. You authorize the app to access and, where you choose, write accounting data on your behalf. You can revoke this access at any time from within your QuickBooks Online account.</p>
+
+<h2>Your responsibilities</h2>
+<ul>
+<li>You are responsible for the accuracy of the data you upload and for reviewing reconciliation results before relying on them.</li>
+<li>You are responsible for keeping your app password secure.</li>
+<li>You agree to use the app only for lawful purposes and only with accounting data you are authorized to access.</li>
+</ul>
+
+<h2>No warranty; professional advice</h2>
+<p>The app is provided “as is” and “as available”, without warranties of any kind. It is a productivity aid and is not a substitute for professional accounting, bookkeeping, audit, or tax advice. You are responsible for verifying that your books are correct.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, we are not liable for any indirect, incidental, or consequential damages, or for any loss arising from your use of, or inability to use, the app, including any errors in reconciliation results or data written to QuickBooks Online.</p>
+
+<h2>Intellectual property</h2>
+<p>The app and its underlying code and design are the property of their owner. These terms do not grant you any ownership rights in the app.</p>
+
+<h2>Termination</h2>
+<p>You may stop using the app and disconnect it from QuickBooks Online at any time. We may suspend or discontinue the app at our discretion.</p>
+
+<h2>Governing law</h2>
+<p>These terms are governed by the laws of the Republic of Uganda.</p>
+
+<h2>Contact</h2>
+<p>For questions about these terms, contact: <a href="mailto:__EMAIL__">__EMAIL__</a></p>
+
+<div class=legal-foot>Reconciliation Tool — a tool for reconciling bank statements with QuickBooks Online.</div>
+</div></body></html>"""
+
+
+@app.route("/privacy")
+def privacy():
+    return render_template_string(PRIVACY_PAGE.replace("__EMAIL__", CONTACT_EMAIL))
+
+
+@app.route("/terms")
+def terms():
+    return render_template_string(TERMS_PAGE.replace("__EMAIL__", CONTACT_EMAIL))
+
+
 @app.route("/health")
 def health():
     # Lightweight touch so a single keep-warm ping keeps BOTH Render and Supabase awake.
@@ -507,7 +621,7 @@ def health():
 
 @app.before_request
 def require_login():
-    if request.endpoint in ("login", "static", "health"):
+    if request.endpoint in ("login", "static", "health", "terms", "privacy"):
         return
     if not session.get("authed"):
         return redirect(url_for("login"))
