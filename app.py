@@ -768,6 +768,18 @@ def run_matcher(statement_id):
                 for lid in lids:
                     matched_lines.add(lid)
 
+    # pass 4: opposite-sign proposals (reviewable) — e.g. transfers signed the other way in QBO.
+    # Stored as 'manual' (an allowed match_type) so the user confirms or rejects each.
+    for l_id, ld, la, lw in lines:
+        if l_id in matched_lines:
+            continue
+        for t_id, td, ta, tw in txns:
+            if t_id in used:
+                continue
+            if la == -ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
+                add([l_id], [t_id], "manual", 0.5, 0)
+                used.add(t_id); matched_lines.add(l_id); break
+
     # bulk insert (few round-trips instead of hundreds)
     if matches:
         execute_values(cur,
@@ -909,9 +921,10 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </div>
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
+{% if n_signflip %}<div class=sub style="margin:-4px 0 12px">{{ n_signflip }} opposite-sign proposal{{ '' if n_signflip==1 else 's' }} below (same amount, flipped sign) — confirm the real matches, reject the rest.</div>{% endif %}
 <table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
-<td><span class="tag {{ 'fuzzy' if r.type=='fuzzy' else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else 'batched' }}</span></td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else 'batched') }}</span></td>
 <td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
@@ -979,8 +992,10 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     matched = cur.fetchall()
     cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='many_to_one' AND status<>'rejected';", (sid,))
     n_m2o = cur.fetchone()[0]
+    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='manual' AND status<>'rejected';", (sid,))
+    n_signflip = cur.fetchone()[0]
     reviewable = []
-    cur.execute("SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s AND match_type IN ('fuzzy','many_to_one') ORDER BY match_type;", (sid,))
+    cur.execute("SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s AND match_type IN ('fuzzy','many_to_one','manual') ORDER BY match_type;", (sid,))
     for mid, mtype, status, delta in cur.fetchall():
         cur.execute("SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'') FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=%s;", (mid,))
         sls = cur.fetchall()
@@ -1006,7 +1021,7 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     return {"has_results": True, "p_start": ps, "p_end": pe,
             "signed_off": signed.strftime("%Y-%m-%d") if signed else None,
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
-            "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o,
+            "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
             "on_stmt": on_stmt_in,
             "in_books": [t for t in txns if t[0] not in mt], "diff": st - bt_}
