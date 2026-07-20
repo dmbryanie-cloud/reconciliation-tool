@@ -30,7 +30,9 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "dmbryanie@gmail.com")  # shown on Terms/Privacy pages
 
 QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
-QBO_BASE = "https://sandbox-quickbooks.api.intuit.com"
+QBO_BASE = os.environ.get("QBO_BASE", "https://sandbox-quickbooks.api.intuit.com")
+QBO_REDIRECT_URI = os.environ.get("QBO_REDIRECT_URI", "https://reconciliation-tool-l2nk.onrender.com/callback")
+QBO_SCOPE = "com.intuit.quickbooks.accounting"
 
 
 def get_conn():
@@ -79,20 +81,40 @@ def _refresh_with(refresh_token):
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
 
+def _ensure_qbo_auth(cur):
+    cur.execute("CREATE TABLE IF NOT EXISTS qbo_auth (id int PRIMARY KEY, refresh_token text, realm_id text, updated_at timestamptz DEFAULT now());")
+    cur.execute("ALTER TABLE qbo_auth ADD COLUMN IF NOT EXISTS realm_id text;")
+
 def _get_stored_refresh():
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS qbo_auth (id int PRIMARY KEY, refresh_token text, updated_at timestamptz DEFAULT now());")
-    conn.commit()
+    _ensure_qbo_auth(cur); conn.commit()
     cur.execute("SELECT refresh_token FROM qbo_auth WHERE id=1;")
     row = cur.fetchone()
     cur.close(); conn.close()
     return row[0] if row and row[0] else None
 
-def _store_refresh(token):
+def _store_refresh(token, realm=None):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""INSERT INTO qbo_auth (id, refresh_token, updated_at) VALUES (1,%s,now())
-                   ON CONFLICT (id) DO UPDATE SET refresh_token=EXCLUDED.refresh_token, updated_at=now();""", (token,))
+    _ensure_qbo_auth(cur)
+    if realm:
+        cur.execute("""INSERT INTO qbo_auth (id, refresh_token, realm_id, updated_at) VALUES (1,%s,%s,now())
+                       ON CONFLICT (id) DO UPDATE SET refresh_token=EXCLUDED.refresh_token, realm_id=EXCLUDED.realm_id, updated_at=now();""", (token, realm))
+    else:
+        cur.execute("""INSERT INTO qbo_auth (id, refresh_token, updated_at) VALUES (1,%s,now())
+                       ON CONFLICT (id) DO UPDATE SET refresh_token=EXCLUDED.refresh_token, updated_at=now();""", (token,))
     conn.commit(); cur.close(); conn.close()
+
+def qbo_realm():
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        _ensure_qbo_auth(cur); conn.commit()
+        cur.execute("SELECT realm_id FROM qbo_auth WHERE id=1;")
+        row = cur.fetchone(); cur.close(); conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return QBO_REALM_ID
 
 def qbo_token():
     candidates = [t for t in (_get_stored_refresh(), os.environ.get("QBO_REFRESH_TOKEN", "")) if t]
@@ -113,7 +135,7 @@ def qbo_token():
 
 def qbo_query(entity, token):
     q = f"SELECT * FROM {entity} MAXRESULTS 1000"
-    url = f"{QBO_BASE}/v3/company/{QBO_REALM_ID}/query?query=" + urllib.parse.quote(q)
+    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q)
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/json")
@@ -328,7 +350,7 @@ def create_purchase(token, paid_from_qbo, expense_id, amount_abs, txn_date, note
             "TxnDate": txn_date, "PrivateNote": note,
             "Line": [{"DetailType": "AccountBasedExpenseLineDetail", "Amount": amount_abs,
                       "AccountBasedExpenseLineDetail": {"AccountRef": {"value": expense_id}}}]}
-    url = f"{QBO_BASE}/v3/company/{QBO_REALM_ID}/purchase"
+    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/purchase"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
@@ -355,7 +377,7 @@ def create_deposit(token, deposit_to_qbo, income_id, amount_abs, txn_date, note)
     body = {"DepositToAccountRef": {"value": deposit_to_qbo}, "TxnDate": txn_date, "PrivateNote": note,
             "Line": [{"Amount": amount_abs, "DetailType": "DepositLineDetail",
                       "DepositLineDetail": {"AccountRef": {"value": income_id}}}]}
-    url = f"{QBO_BASE}/v3/company/{QBO_REALM_ID}/deposit"
+    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/deposit"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
@@ -1033,8 +1055,12 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <div class=wrap>
 <h1>All accounts</h1>
 <div class=sub>Updated {{ now }} EAT</div>
+<div style="display:flex;gap:12px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+<a href="{{ url_for('connect') }}" class=btn style="text-decoration:none;display:inline-block">Connect to QuickBooks</a>
+{% if qbo_connected %}<span style="color:var(--ok);font-size:13px;font-weight:600">Connected to QuickBooks</span>{% else %}<span style="color:var(--muted);font-size:13px">Not connected yet</span>{% endif %}
+</div>
 <form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
-<button type=submit class=btn>Sync from QuickBooks</button></form>
+<button type=submit class=btn-sm>Sync from QuickBooks</button></form>
 {% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
 <div class=tiles>
 <button class="tile active" data-filter="all"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span><span class=t-label>Accounts</span></div><div class=t-val>{{ rows|length }}</div></button>
@@ -1119,7 +1145,8 @@ def dashboard():
     n_signed = sum(1 for r in rows if r["status"] == "signed")
     tot_exc = sum(r.get("exc", 0) for r in rows)
     sync_msg = session.pop("sync_msg", None)
-    return render_template_string(DASH_TEMPLATE, rows=rows, n_recon=n_recon, n_signed=n_signed,
+    qbo_connected = bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", ""))
+    return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed,
                                   tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
 
@@ -1669,6 +1696,52 @@ def template(kind):
         data, fname = BANK_TEMPLATE, "bank_statement_template.csv"
     return Response(data, mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+@app.route("/connect")
+def connect():
+    state = base64.urlsafe_b64encode(os.urandom(16)).decode().rstrip("=")
+    session["oauth_state"] = state
+    params = urllib.parse.urlencode({
+        "client_id": os.environ.get("QBO_CLIENT_ID", ""),
+        "redirect_uri": QBO_REDIRECT_URI,
+        "response_type": "code",
+        "scope": QBO_SCOPE,
+        "state": state,
+    })
+    return redirect("https://appcenter.intuit.com/connect/oauth2?" + params)
+
+
+@app.route("/callback")
+def callback():
+    if not request.args.get("state") or request.args.get("state") != session.get("oauth_state"):
+        return "Security check failed (state mismatch). Please try Connect again. <a href='/'>Back</a>", 400
+    if request.args.get("error"):
+        return f"Connection was cancelled ({request.args.get('error')}). <a href='/'>Back</a>"
+    code = request.args.get("code")
+    realm = request.args.get("realmId")
+    if not code:
+        return "No authorization code returned. <a href='/'>Back</a>"
+    data = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": QBO_REDIRECT_URI,
+    }).encode()
+    req = urllib.request.Request("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer", data=data, method="POST")
+    auth = base64.b64encode(f"{os.environ.get('QBO_CLIENT_ID','')}:{os.environ.get('QBO_CLIENT_SECRET','')}".encode()).decode()
+    req.add_header("Authorization", "Basic " + auth)
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            tok = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try: body = e.read().decode()
+        except Exception: body = ""
+        return f"Token exchange failed: HTTP {e.code} {body[:200]} <a href='/'>Back</a>"
+    _store_refresh(tok.get("refresh_token"), realm)
+    session["sync_msg"] = "Connected to QuickBooks successfully."
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/sync", methods=["POST"])
