@@ -446,6 +446,7 @@ tbody tr:hover{background:#f7f9fb}
 #loadingov .spin{width:44px;height:44px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
 #loadingov .msg{color:var(--muted);font-size:14px;font-weight:600}
 @keyframes spin{to{transform:rotate(360deg)}}
+.appfoot{max-width:1000px;margin:0 auto;padding:22px 24px 44px;color:#9ca3af;font-size:13px;text-align:center}.appfoot a{color:#6b7280;font-weight:500}.appfoot a:hover{color:var(--accent)}
 </style>"""
 
 LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · Reconciliation Tool</title>
@@ -479,7 +480,7 @@ button:hover{opacity:.92}
 {% if error %}<div class=err>{{ error }}</div>{% endif %}
 </form>
 <details style="margin-top:14px"><summary style="cursor:pointer;color:#667085;font-size:13px">Forgot password?</summary><div style="color:#98a2b3;font-size:12.5px;margin-top:8px;line-height:1.55">The password originally set up for this app still works as a recovery key. Sign in with that, then change your password from the menu.</div></details>
-<div class=foot>Private · access by password</div>
+<div class=foot>Private · access by password<br><a href="{{ url_for('terms') }}" style="color:#98a2b3">Terms</a> · <a href="{{ url_for('privacy') }}" style="color:#98a2b3">Privacy</a></div>
 </div>
 </body></html>"""
 
@@ -1080,7 +1081,8 @@ function flt(f){
 }
 document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click',function(){flt(t.getAttribute('data-filter'))})});
 </script>
-</div><div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
+</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a></div>
+<div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
 var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
 function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
@@ -1208,7 +1210,8 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
-</div><div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
+</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a></div>
+<div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
 var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
 function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
