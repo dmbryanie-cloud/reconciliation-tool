@@ -934,7 +934,8 @@ def dashboard():
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
 <div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
-{% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
+{% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
+<form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
 {% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
@@ -1107,14 +1108,14 @@ def compute_detail(cur, acct_uuid, atype="bank"):
 @app.route("/account/<name>")
 def detail(name):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, atype = row
+    acct_uuid, atype, ccy = row
     d = compute_detail(cur, acct_uuid, atype)
     cur.close(); conn.close()
-    return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype,
+    return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy,
                                   detail_msg=session.pop("detail_msg", None), **d)
 
 
@@ -1374,8 +1375,29 @@ def exceptions_csv(name):
                     headers={"Content-Disposition": f"attachment; filename={name}_exceptions.csv"})
 
 
+@app.route("/account/<name>/currency", methods=["POST"])
+def set_currency(name):
+    ccy = (request.form.get("currency") or "").strip().upper()[:8]
+    if ccy:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+        row = cur.fetchone()
+        if row:
+            acct = row[0]
+            cur.execute("UPDATE account SET currency=%s WHERE account_id=%s;", (ccy, acct))
+            cur.execute("UPDATE statement SET currency=%s WHERE account_id=%s;", (ccy, acct))
+            cur.execute("UPDATE statement_line SET currency=%s WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s);", (ccy, acct))
+            cur.execute("UPDATE book_txn SET currency=%s WHERE account_id=%s;", (ccy, acct))
+            conn.commit()
+            session["detail_msg"] = f"Currency set to {ccy}."
+        cur.close(); conn.close()
+    return redirect(url_for("detail", name=name))
+
+
 @app.route("/account/<name>/diag")
 def diag(name):
+    if request.args.get("key") != os.environ.get("APP_PASSWORD"):
+        return "Not found", 404
     conn = get_conn(); cur = conn.cursor()
     o = []
     cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
