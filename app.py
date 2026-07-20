@@ -659,12 +659,16 @@ def _save_statement(rows, account_name, source_format):
                    VALUES (%s,%s,%s,%s,0,%s,%s,%s) RETURNING statement_id;""",
                 (ORG_ID, acct_uuid, p_start, p_end, closing, currency, source_format))
     sid = cur.fetchone()[0]
+    seen = {}
     for r in rows:
         key = r.get("fitid") or hashlib.sha256(f"{r['date']}|{r['amount']}|{(r.get('desc') or '').lower()}".encode()).hexdigest()[:32]
-        cur.execute("""INSERT INTO statement_line (org_id, statement_id, posted_date, amount,
-                       currency, description, dedupe_key) VALUES (%s,%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT (statement_id, dedupe_key) DO NOTHING;""",
-                    (ORG_ID, sid, r["date"], r["amount"], currency, r.get("desc") or "", key))
+        if key not in seen:
+            seen[key] = (ORG_ID, sid, r["date"], r["amount"], currency, r.get("desc") or "", key)
+    if seen:
+        execute_values(cur,
+            """INSERT INTO statement_line (org_id, statement_id, posted_date, amount, currency, description, dedupe_key)
+               VALUES %s ON CONFLICT (statement_id, dedupe_key) DO NOTHING;""",
+            list(seen.values()))
     conn.commit(); cur.close(); conn.close()
     return sid
 
@@ -692,18 +696,22 @@ def ingest_books(text, account_name):
     acct_uuid, currency = arow
     # Replace any prior CSV-imported books for this account (idempotent); never touches API-synced rows.
     cur.execute("DELETE FROM book_txn WHERE account_id=%s AND source_txn_type='CSV';", (acct_uuid,))
-    n = 0
+    seen = {}
     for r in rows:
         desc = r.get("desc") or ""
         key = hashlib.sha256(f"{r['date']}|{r['amount']}|{desc.lower()}".encode()).hexdigest()[:32]
-        cur.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
-                       posted_date, amount, currency, description, counterparty, category, cleared_status, is_void, is_deleted, last_modified)
-                       VALUES (%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown',false,false,now())
-                       ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
-                         amount=EXCLUDED.amount, description=EXCLUDED.description,
-                         counterparty=EXCLUDED.counterparty, category=EXCLUDED.category, last_modified=now();""",
-                    (ORG_ID, acct_uuid, key, r["date"], r["amount"], currency, desc, desc, r.get("category")))
-        n += 1
+        seen[key] = (ORG_ID, acct_uuid, key, r["date"], r["amount"], currency, desc, desc, r.get("category"))
+    n = len(seen)
+    if seen:
+        execute_values(cur,
+            """INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
+               posted_date, amount, currency, description, counterparty, category, cleared_status, is_void, is_deleted, last_modified)
+               VALUES %s
+               ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
+                 amount=EXCLUDED.amount, description=EXCLUDED.description,
+                 counterparty=EXCLUDED.counterparty, category=EXCLUDED.category, last_modified=now();""",
+            list(seen.values()),
+            template="(%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown',false,false,now())")
     conn.commit(); cur.close(); conn.close()
     return n
 
