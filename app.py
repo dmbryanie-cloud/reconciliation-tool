@@ -455,6 +455,13 @@ def _money(x):
 
 @app.route("/health")
 def health():
+    # Lightweight touch so a single keep-warm ping keeps BOTH Render and Supabase awake.
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT 1;"); cur.fetchone()
+        cur.close(); conn.close()
+    except Exception:
+        pass  # always report healthy for the uptime monitor, even if the DB is briefly cold
     return "ok", 200
 
 
