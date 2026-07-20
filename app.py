@@ -12,6 +12,7 @@ from psycopg2.extras import execute_values
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template_string, request, redirect, session, url_for, Response
+from werkzeug.security import generate_password_hash, check_password_hash
 import json, base64, urllib.request, urllib.parse, urllib.error
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
@@ -33,6 +34,36 @@ QBO_BASE = "https://sandbox-quickbooks.api.intuit.com"
 
 def get_conn():
     return psycopg2.connect(DB_URL)
+
+
+def get_config(key):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT value FROM app_config WHERE key=%s;", (key,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def set_config(key, value):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
+    cur.execute("INSERT INTO app_config (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;", (key, value))
+    conn.commit(); cur.close(); conn.close()
+
+
+def check_password(pw):
+    if not pw:
+        return False
+    stored = get_config("password_hash")
+    if stored:
+        try:
+            if check_password_hash(stored, pw):
+                return True
+        except Exception:
+            pass
+    return bool(APP_PASSWORD) and pw == APP_PASSWORD
 
 
 # ---------------- QuickBooks auth (self-healing token) ----------------
@@ -340,13 +371,13 @@ CSS = """<style>
   --accent:#0f766e;--accent-soft:#d6efea;
   --ok:#047857;--ok-soft:#d7f3e3;--warn:#b45309;--warn-soft:#fbedcf;
   --bad:#b42318;--bad-soft:#fbe2de;--none:#667085;--none-soft:#ebedf0;
-  --radius:13px;--shadow:0 1px 2px rgba(16,24,40,.05),0 4px 14px rgba(16,24,40,.06);
-  --lift:0 8px 20px rgba(16,24,40,.10);
+  --radius:14px;--shadow:0 1px 2px rgba(16,24,40,.04),0 2px 6px rgba(16,24,40,.04),0 10px 28px rgba(16,24,40,.05);
+  --lift:0 14px 32px rgba(16,24,40,.13);
 }
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:radial-gradient(1100px 520px at 85% -8%,rgba(15,118,110,.07),transparent 60%),linear-gradient(180deg,#eff3f8 0%,#e6ecf3 65%,#e1e8f0 100%);background-attachment:fixed;min-height:100vh;color:var(--ink);margin:0;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}
-.nav{background:var(--panel);border-bottom:1px solid var(--line);padding:15px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:5}
+.nav{background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line);padding:15px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:5;box-shadow:0 1px 0 rgba(16,24,40,.03)}
 .nav .brand{font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
 .nav .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .nav .links a{color:var(--muted);font-size:14px;margin-left:18px}
@@ -355,10 +386,11 @@ a{color:inherit;text-decoration:none}
 h1{font-size:26px;font-weight:680;letter-spacing:-.02em;margin:0 0 5px}
 h2{font-size:15px;font-weight:650;letter-spacing:-.01em;color:var(--ink);margin:30px 0 12px;border-radius:7px;padding:2px 6px;margin-left:-6px}
 .sub{color:var(--muted);margin:0 0 26px;font-size:14px}
-.btn{background:var(--ink);color:#fff;border:none;padding:10px 17px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:550;transition:opacity .15s ease}
-.btn:hover{opacity:.9}
-.btn-go{background:var(--ok);color:#fff;border:none;padding:9px 16px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:550}
-.btn-go:hover{opacity:.92}
+.btn{background:linear-gradient(180deg,#243244,#16202e);color:#fff;border:none;padding:10px 18px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:550;box-shadow:0 1px 2px rgba(16,24,40,.24),0 2px 8px rgba(16,24,40,.14);transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
+.btn:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(16,24,40,.28),0 6px 18px rgba(16,24,40,.16);filter:brightness(1.07)}
+.btn:active{transform:translateY(0)}
+.btn-go{background:linear-gradient(180deg,#059669,#047857);color:#fff;border:none;padding:9px 17px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:550;box-shadow:0 1px 2px rgba(4,120,87,.3),0 2px 8px rgba(4,120,87,.18);transition:transform .15s ease,filter .15s ease}
+.btn-go:hover{transform:translateY(-1px);filter:brightness(1.07)}
 .btn-sm{background:var(--panel);border:1px solid var(--line);padding:6px 12px;border-radius:7px;cursor:pointer;font-size:13px;font-weight:500;color:var(--ink);transition:border-color .15s,background .15s}
 .btn-sm:hover{border-color:#cdd2da;background:#fafbfc}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:8px}
@@ -445,6 +477,7 @@ button:hover{opacity:.92}
 <button type=submit>Sign in</button>
 {% if error %}<div class=err>{{ error }}</div>{% endif %}
 </form>
+<details style="margin-top:14px"><summary style="cursor:pointer;color:#667085;font-size:13px">Forgot password?</summary><div style="color:#98a2b3;font-size:12.5px;margin-top:8px;line-height:1.55">The password originally set up for this app still works as a recovery key. Sign in with that, then change your password from the menu.</div></details>
 <div class=foot>Private · access by password</div>
 </div>
 </body></html>"""
@@ -479,10 +512,52 @@ def require_login():
     if not session.get("authed"):
         return redirect(url_for("login"))
 
+CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=wrap style="max-width:440px">
+<h1>Change password</h1>
+<div class=sub>Set a new password for signing in.</div>
+<form method=post>
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Current password</label>
+<input type=password name=current autofocus style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em">New password</label>
+<input type=password name=new style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em">Confirm new password</label>
+<input type=password name=confirm style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<button type=submit class=btn style="margin-top:18px;width:100%">Update password</button>
+{% if error %}<div style="color:var(--bad);font-size:13px;margin-top:13px;background:var(--bad-soft);padding:9px 12px;border-radius:8px">{{ error }}</div>{% endif %}
+</form>
+<div class=sub style="margin-top:22px;font-size:13px;line-height:1.55">Forgot your password? The password originally set up for this app always works as a recovery key — sign in with that, then change it here.</div>
+</div></body></html>"""
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+def change_password():
+    error = None
+    if request.method == "POST":
+        cur_pw = request.form.get("current", "")
+        new_pw = request.form.get("new", "")
+        confirm = request.form.get("confirm", "")
+        if not check_password(cur_pw):
+            error = "Current password is incorrect."
+        elif len(new_pw) < 6:
+            error = "New password must be at least 6 characters."
+        elif new_pw != confirm:
+            error = "The new passwords don't match."
+        else:
+            try:
+                set_config("password_hash", generate_password_hash(new_pw))
+                session["sync_msg"] = "Password updated."
+                return redirect(url_for("dashboard"))
+            except Exception as e:
+                error = f"Could not save password: {e}"
+    return render_template_string(CHANGE_PW_PAGE, error=error)
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if APP_PASSWORD and request.form.get("password") == APP_PASSWORD:
+        if check_password(request.form.get("password")):
             session["authed"] = True
             return redirect(url_for("dashboard"))
         return render_template_string(LOGIN_PAGE, error="Incorrect password")
@@ -816,10 +891,10 @@ def run_matcher(statement_id):
     conn.commit(); cur.close(); conn.close()
 
 
-def account_summary(cur, acct_uuid, name, atype):
+def account_summary(cur, acct_uuid, name, atype, currency=None):
     cur.execute("SELECT statement_id, period_start, period_end, signed_off_at FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
     s = cur.fetchone()
-    if not s: return {"name": name, "type": atype, "status": "none"}
+    if not s: return {"name": name, "type": atype, "status": "none", "currency": currency}
     sid, ps, pe, signed = s
     cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status<>'rejected' GROUP BY match_type;", (sid,))
     mc = dict(cur.fetchall())
@@ -833,13 +908,13 @@ def account_summary(cur, acct_uuid, name, atype):
     txns = cur.fetchall()
     exc = len([l for l in lines if l[0] not in ml]) + len([t for t in txns if t[0] not in mt])
     diff = sum((l[1] for l in lines), Decimal(0)) - sum((t[1] for t in txns), Decimal(0))
-    return {"name": name, "type": atype, "status": "signed" if signed else "open",
+    return {"name": name, "type": atype, "currency": currency, "status": "signed" if signed else "open",
             "p_start": ps, "p_end": pe, "exact": mc.get("exact", 0), "fuzzy": mc.get("fuzzy", 0),
             "m2o": mc.get("many_to_one", 0), "exc": exc, "diff": diff}
 
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap>
 <h1>All accounts</h1>
 <div class=sub>Updated {{ now }} EAT</div>
@@ -854,11 +929,12 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 </div>
 <div class=fbar id=fbar></div>
 <table>
-<thead><tr><th>Account</th><th>Type</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr></thead>
+<thead><tr><th>Account</th><th>Type</th><th>Currency</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr></thead>
 <tbody>
 {% for r in rows %}<tr data-status="{{ r.status }}" data-exc="{{ r.get('exc',0) }}">
 <td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td>
 <td>{{ 'bank' if r.type=='bank' else 'credit card' }}</td>
+<td>{{ r.currency or '—' }}</td>
 <td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% else %}<span class="pill open">Reconciled</span>{% endif %}</td>
 {% if r.status=='none' %}<td class=muted>—</td><td class=muted>—</td><td class=muted>—</td><td class="a muted">—</td>
 {% else %}<td>{{ r.p_start }} → {{ r.p_end }}</td>
@@ -919,9 +995,9 @@ schedule(t);});
 @app.route("/")
 def dashboard():
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, name, type FROM account ORDER BY type, name;")
+    cur.execute("SELECT account_id, name, type, currency FROM account ORDER BY type, name;")
     accts = cur.fetchall()
-    rows = [account_summary(cur, a, n, t) for a, n, t in accts]
+    rows = [account_summary(cur, a, n, t, ccy) for a, n, t, ccy in accts]
     cur.close(); conn.close()
     n_recon = sum(1 for r in rows if r["status"] != "none")
     n_signed = sum(1 for r in rows if r["status"] == "signed")
@@ -932,7 +1008,7 @@ def dashboard():
 
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
