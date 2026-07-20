@@ -502,9 +502,14 @@ button:hover{opacity:.92}
 {% if error %}<div class=err>{{ error }}</div>{% endif %}
 </form>
 <details style="margin-top:14px"><summary style="cursor:pointer;color:#667085;font-size:13px">Forgot password?</summary><div style="color:#98a2b3;font-size:12.5px;margin-top:8px;line-height:1.55">The password originally set up for this app still works as a recovery key. Sign in with that, then change your password from the menu.</div></details>
-<div class=foot>Private · access by password<br><a href="{{ url_for('terms') }}" style="color:#98a2b3">Terms</a> · <a href="{{ url_for('privacy') }}" style="color:#98a2b3">Privacy</a></div>
+<div class=foot>Private · access by password<br><a href="{{ url_for('terms') }}" style="color:#98a2b3">Terms</a> · <a href="{{ url_for('privacy') }}" style="color:#98a2b3">Privacy</a> · <a href="mailto:{{ contact_email }}" style="color:#98a2b3">Contact</a></div>
 </div>
 </body></html>"""
+
+
+@app.context_processor
+def _inject_contact():
+    return {"contact_email": CONTACT_EMAIL}
 
 
 @app.template_filter("money")
@@ -1107,7 +1112,7 @@ function flt(f){
 }
 document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click',function(){flt(t.getAttribute('data-filter'))})});
 </script>
-</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a></div>
+</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
 var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
@@ -1237,7 +1242,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
-</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a></div>
+</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
 var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
