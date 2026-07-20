@@ -258,18 +258,20 @@ def _best_match(keys, payee):
         if score > best: best_key, best = key, score
     return best_key, best
 
-def suggest_category(memory, payee, threshold=0.6):
+def suggest_category(memory, payee, threshold=0.6, fuzzy=True):
     if not payee: return None, 0.0, None, 0.0, None
     key = payee.strip().lower()
     corr, hist = memory["corrections"], memory["history"]
     if key in corr: return corr[key], 1.0, key, 1.0, "your correction"
-    bk, score = _best_match(corr.keys(), payee)
-    if bk and score >= threshold: return corr[bk], 1.0, bk, score, "your correction"
+    if fuzzy:
+        bk, score = _best_match(corr.keys(), payee)
+        if bk and score >= threshold: return corr[bk], 1.0, bk, score, "your correction"
     if key in hist:
         c, conf, _ = hist[key]; return c, conf, key, 1.0, "history"
-    bk, score = _best_match(hist.keys(), payee)
-    if bk and score >= threshold:
-        c, conf, _ = hist[bk]; return c, conf, bk, score, "history"
+    if fuzzy:
+        bk, score = _best_match(hist.keys(), payee)
+        if bk and score >= threshold:
+            c, conf, _ = hist[bk]; return c, conf, bk, score, "history"
     return None, 0.0, None, 0.0, None
 
 
@@ -1054,12 +1056,21 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     n_signflip = cur.fetchone()[0]
     reviewable = []
     cur.execute("SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s AND match_type IN ('fuzzy','many_to_one','manual') ORDER BY match_type;", (sid,))
-    for mid, mtype, status, delta in cur.fetchall():
-        cur.execute("SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'') FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=%s;", (mid,))
-        sls = cur.fetchall()
-        cur.execute("SELECT bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'') FROM match_book_txn mbt JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=%s;", (mid,))
-        bts = cur.fetchall()
-        reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta, "sls": sls, "bts": bts})
+    rmatches = cur.fetchall()
+    rids = [str(r[0]) for r in rmatches]
+    sls_by, bts_by = {}, {}
+    if rids:
+        cur.execute("""SELECT msl.match_id, sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
+                       FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id
+                       WHERE msl.match_id = ANY(%s::uuid[]) ORDER BY sl.posted_date;""", (rids,))
+        for mid_, d, a, w in cur.fetchall(): sls_by.setdefault(str(mid_), []).append((d, a, w))
+        cur.execute("""SELECT mbt.match_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
+                       FROM match_book_txn mbt JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                       WHERE mbt.match_id = ANY(%s::uuid[]) ORDER BY bt.posted_date;""", (rids,))
+        for mid_, d, a, w in cur.fetchall(): bts_by.setdefault(str(mid_), []).append((d, a, w))
+    for mid, mtype, status, delta in rmatches:
+        reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
+                           "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])})
     cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
     ml = {r[0] for r in cur.fetchall()}
     cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
@@ -1069,7 +1080,7 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     writebacks, deposits, on_stmt_in = [], [], []
     for (lid, dd, a, who) in [l for l in lines if l[0] not in ml]:
         if a < 0:
-            cat, conf, matched_p, score, source = suggest_category(mem, who)
+            cat, conf, matched_p, score, source = suggest_category(mem, who, fuzzy=False)
             writebacks.append({"line_id": lid, "date": dd, "amount": a, "who": who,
                                "cat": cat, "conf": conf, "matched": matched_p, "score": score, "source": source})
         elif a > 0 and atype == "bank":
