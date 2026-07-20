@@ -443,9 +443,24 @@ button:hover{opacity:.92}
 </body></html>"""
 
 
+@app.template_filter("money")
+def _money(x):
+    if x is None:
+        return ""
+    try:
+        return f"{Decimal(x):,.2f}"
+    except Exception:
+        return str(x)
+
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
 @app.before_request
 def require_login():
-    if request.endpoint in ("login", "static"):
+    if request.endpoint in ("login", "static", "health"):
         return
     if not session.get("authed"):
         return redirect(url_for("login"))
@@ -815,7 +830,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 {% else %}<td>{{ r.p_start }} → {{ r.p_end }}</td>
 <td>{{ r.exact }} exact{% if r.fuzzy %}, {{ r.fuzzy }} fuzzy{% endif %}{% if r.m2o %}, {{ r.m2o }} batched{% endif %}</td>
 <td>{{ r.exc }}</td>
-<td class=a>{% if r.diff==0 %}<span class=ok>0.00</span>{% elif r.exc>0 %}<span class=muted>{{ "%.2f"|format(r.diff) }} · explained</span>{% else %}<span class=bad>{{ "%.2f"|format(r.diff) }} · unexplained</span>{% endif %}</td>
+<td class=a>{% if r.diff==0 %}<span class=ok>0.00</span>{% elif r.exc>0 %}<span class=muted>{{ r.diff|money }} · explained</span>{% else %}<span class=bad>{{ r.diff|money }} · unexplained</span>{% endif %}</td>
 {% endif %}</tr>{% endfor %}
 </tbody></table>
 <script>
@@ -883,7 +898,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>Discrepancies</span></div><div class=t-val>{{ n_fuzzy }}</div></button>
 <button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="8" height="8" rx="1.5"/><rect x="13" y="12.5" width="8" height="8" rx="1.5"/><path d="M13 7.5h3a2 2 0 0 1 2 2v3"/></svg></span><span class=t-label>Batched</span></div><div class=t-val>{{ n_m2o }}</div></button>
 <button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
-<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Difference</span></div><div class=t-val style="color:{{ '#047857' if diff==0 else ('#667085' if (writebacks|length + deposits|length + on_stmt|length + in_books|length)>0 else '#b42318') }}">{{ "%.2f"|format(diff) }}</div></button>
+<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Difference</span></div><div class=t-val style="color:{{ '#047857' if diff==0 else ('#667085' if (writebacks|length + deposits|length + on_stmt|length + in_books|length)>0 else '#b42318') }}">{{ diff|money }}</div></button>
 </div>
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
@@ -897,8 +912,8 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td><span class="tag {{ 'fuzzy' if r.type=='fuzzy' else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else 'batched' }}</span></td>
-<td>{% for d,a,w in r.sls %}{{ d }} · {{ "%.2f"|format(a) }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ "%.2f"|format(r.delta) }}</span>{% endif %}</td>
-<td>{% for d,a,w in r.bts %}{{ d }} · {{ "%.2f"|format(a) }} · {{ w }}<br>{% endfor %}</td>
+<td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
+<td>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
 <td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}">
 {% if r.status=='rejected' %}<input type=hidden name=status value=confirmed><button type=submit class=btn-sm>Restore</button>
@@ -909,15 +924,15 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <h2 id=sec-matched style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
-<td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ "%.2f"|format(delta) }}{% endif %}</span></td>
-<td class=a>{{ "%.2f"|format(samt) }}</td><td class=a>{{ "%.2f"|format(bamt) }}</td></tr>{% endfor %}</table>
+<td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
+<td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks %}
 <h2 style="font-size:15px">Unrecorded expenses — add to QuickBooks ({{ writebacks|length }})</h2>
 <table><tr><th>Date</th><th>Payee</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
 {% for w in writebacks %}<tr>
 <td>{{ w.date }}</td>
 <td>{{ w.who }}{% if w.matched and w.matched != w.who.strip().lower() %}<br><span style="color:#73726c;font-size:12px">recognized '{{ w.matched }}' {{ "%.0f"|format(w.score*100) }}%</span>{% endif %}</td>
-<td class=a>{{ "%.2f"|format(w.amount) }}</td>
+<td class=a>{{ w.amount|money }}</td>
 <td><form method=post action="{{ url_for('writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 <input type=text name=category value="{{ w.cat or '' }}" placeholder="category" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
 <button type=submit class=btn-sm>Create</button>
@@ -929,7 +944,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <h2 style="font-size:15px">Unrecorded deposits — add to QuickBooks ({{ deposits|length }})</h2>
 <table><tr><th>Date</th><th>Source</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
 {% for w in deposits %}<tr>
-<td>{{ w.date }}</td><td>{{ w.who }}</td><td class=a>{{ "%.2f"|format(w.amount) }}</td>
+<td>{{ w.date }}</td><td>{{ w.who }}</td><td class=a>{{ w.amount|money }}</td>
 <td><form method=post action="{{ url_for('deposit_writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 <input type=text name=category placeholder="income account" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
 <button type=submit class=btn-sm>Create</button>
@@ -938,10 +953,10 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
-{% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ "%.2f"|format(a) }}</td></tr>{% endfor %}</table>
+{% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 <h2 style="font-size:15px">In books, not on statement ({{ in_books|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
-{% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ "%.2f"|format(a) }}</td></tr>{% endfor %}</table>
+{% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
 </div></body></html>"""
