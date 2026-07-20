@@ -406,6 +406,11 @@ tbody tr:hover{background:#f7f9fb}
   .nav{padding:13px 16px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none !important}}
+#loadingov{position:fixed;inset:0;background:rgba(238,243,248,.82);display:none;align-items:center;justify-content:center;flex-direction:column;gap:16px;z-index:9999}
+#loadingov.on{display:flex}
+#loadingov .spin{width:44px;height:44px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+#loadingov .msg{color:var(--muted);font-size:14px;font-weight:600}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>"""
 
 LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · Reconciliation Tool</title>
@@ -875,7 +880,30 @@ function flt(f){
 }
 document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click',function(){flt(t.getAttribute('data-filter'))})});
 </script>
-</div></body></html>"""
+</div><div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
+<script>(function(){
+var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
+function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
+function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
+document.addEventListener('click',function(e){
+var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
+var href=a.getAttribute('href')||'';if(!href)return;
+if(a.target==='_blank'||a.hasAttribute('download'))return;
+if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
+if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1)return;
+if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+schedule('Loading...');});
+document.addEventListener('submit',function(e){
+var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
+if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
+else if(act.indexOf('/import_books')>-1)t='Importing your books...';
+else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
+else if(act.indexOf('/clear')>-1)t='Clearing account data...';
+else if(act.indexOf('/signoff')>-1)t='Signing off...';
+else if(act.indexOf('/reopen')>-1)t='Reopening...';
+schedule(t);});
+})();</script>
+</body></html>"""
 
 
 @app.route("/")
@@ -979,7 +1007,30 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
-</div></body></html>"""
+</div><div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
+<script>(function(){
+var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
+function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
+function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
+document.addEventListener('click',function(e){
+var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
+var href=a.getAttribute('href')||'';if(!href)return;
+if(a.target==='_blank'||a.hasAttribute('download'))return;
+if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
+if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1)return;
+if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+schedule('Loading...');});
+document.addEventListener('submit',function(e){
+var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
+if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
+else if(act.indexOf('/import_books')>-1)t='Importing your books...';
+else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
+else if(act.indexOf('/clear')>-1)t='Clearing account data...';
+else if(act.indexOf('/signoff')>-1)t='Signing off...';
+else if(act.indexOf('/reopen')>-1)t='Reopening...';
+schedule(t);});
+})();</script>
+</body></html>"""
 
 
 def compute_detail(cur, acct_uuid, atype="bank"):
