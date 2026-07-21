@@ -1313,15 +1313,15 @@ document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click
 </div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
-var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
-function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
+var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
+function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(ov)ov.classList.remove('on');},40000);}
 function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
 document.addEventListener('click',function(e){
 var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
 var href=a.getAttribute('href')||'';if(!href)return;
 if(a.target==='_blank'||a.hasAttribute('download'))return;
 if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
-if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1)return;
+if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
 schedule('Loading...');});
 document.addEventListener('submit',function(e){
@@ -1335,6 +1335,7 @@ else if(act.indexOf('/reopen')>-1)t='Reopening...';
 else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
 else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 schedule(t);});
+window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
 })();</script>
 </body></html>"""
 
@@ -1448,15 +1449,15 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
-var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer;
-function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');}
+var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
+function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(ov)ov.classList.remove('on');},40000);}
 function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
 document.addEventListener('click',function(e){
 var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
 var href=a.getAttribute('href')||'';if(!href)return;
 if(a.target==='_blank'||a.hasAttribute('download'))return;
 if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
-if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1)return;
+if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
 schedule('Loading...');});
 document.addEventListener('submit',function(e){
@@ -1470,6 +1471,7 @@ else if(act.indexOf('/reopen')>-1)t='Reopening...';
 else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
 else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 schedule(t);});
+window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
 })();</script>
 </body></html>"""
 
