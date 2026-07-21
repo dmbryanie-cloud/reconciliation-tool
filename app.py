@@ -1328,6 +1328,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
 <a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
+{% if atype=='credit_card' %}<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 20px;line-height:1.5">Credit-card account: enter <b>charges as positive</b> and <b>payments/refunds as negative</b>, so signs match your QuickBooks credit-card register.</div>{% endif %}
 {% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
@@ -1378,7 +1379,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks %}
-<h2 style="font-size:15px">Unrecorded expenses — add to QuickBooks ({{ writebacks|length }})</h2>
+<h2 style="font-size:15px">{% if atype=='credit_card' %}Unrecorded charges{% else %}Unrecorded expenses{% endif %} — add to QuickBooks ({{ writebacks|length }})</h2>
 <table><tr><th>Date</th><th>Payee</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
 {% for w in writebacks %}<tr>
 <td>{{ w.date }}</td>
@@ -1392,14 +1393,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </tr>{% endfor %}</table>
 {% endif %}
 {% if deposits %}
-<h2 style="font-size:15px">Unrecorded deposits — add to QuickBooks ({{ deposits|length }})</h2>
+<h2 style="font-size:15px">{% if atype=='credit_card' %}Unrecorded payments &amp; refunds{% else %}Unrecorded deposits — add to QuickBooks{% endif %} ({{ deposits|length }})</h2>
 <table><tr><th>Date</th><th>Source</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
 {% for w in deposits %}<tr>
 <td>{{ w.date }}</td><td>{{ w.who }}</td><td class=a>{{ w.amount|money }}</td>
-<td><form method=post action="{{ url_for('deposit_writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+<td>{% if atype=='credit_card' %}<span style="color:var(--muted);font-size:12.5px">Record as a card payment or refund in QuickBooks</span>{% else %}<form method=post action="{{ url_for('deposit_writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 <input type=text name=category placeholder="income account" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
 <button type=submit class=btn-sm>Create</button>
-</form></td>
+</form>{% endif %}</td>
 </tr>{% endfor %}</table>
 {% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
@@ -1489,11 +1490,14 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     mem = build_memory()
     writebacks, deposits, on_stmt_in = [], [], []
     for (lid, dd, a, who) in [l for l in lines if l[0] not in ml]:
-        if a < 0:
+        # Credit cards invert the sign: a charge (positive) is the "money out" recorded as an expense;
+        # a payment/refund (negative) is the money-in side. Banks are the reverse.
+        money_out = (a > 0) if atype == "credit_card" else (a < 0)
+        if money_out:
             cat, conf, matched_p, score, source = suggest_category(mem, who, fuzzy=False)
             writebacks.append({"line_id": lid, "date": dd, "amount": a, "who": who,
                                "cat": cat, "conf": conf, "matched": matched_p, "score": score, "source": source})
-        elif a > 0 and atype == "bank":
+        elif a != 0:
             deposits.append({"line_id": lid, "date": dd, "amount": a, "who": who})
         else:
             on_stmt_in.append((lid, dd, a, who))
