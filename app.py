@@ -1173,6 +1173,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
+<a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
 {% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
@@ -1282,6 +1283,12 @@ else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 schedule(t);});
 })();</script>
 </body></html>"""
+
+
+def _ensure_snapshot_cols(cur):
+    for col, typ in (("snap_exact", "int"), ("snap_fuzzy", "int"), ("snap_m2o", "int"),
+                     ("snap_exc", "int"), ("snap_diff", "numeric")):
+        cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {col} {typ};")
 
 
 def compute_detail(cur, acct_uuid, atype="bank"):
@@ -1413,13 +1420,23 @@ def review_match(name, match_id):
 @app.route("/account/<name>/signoff", methods=["POST"])
 def signoff(name):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if row:
-        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (row[0],))
+        acct_uuid, atype = row
+        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
         srow = cur.fetchone()
         if srow:
-            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by='you' WHERE statement_id=%s;", (srow[0],))
+            sid = srow[0]
+            try:
+                d = compute_detail(cur, acct_uuid, atype)
+                exc = len(d.get("writebacks", [])) + len(d.get("deposits", [])) + len(d.get("on_stmt", [])) + len(d.get("in_books", []))
+                _ensure_snapshot_cols(cur)
+                cur.execute("UPDATE statement SET snap_exact=%s, snap_fuzzy=%s, snap_m2o=%s, snap_exc=%s, snap_diff=%s WHERE statement_id=%s;",
+                            (d.get("n_exact", 0), d.get("n_fuzzy", 0), d.get("n_m2o", 0), exc, d.get("diff", 0), sid))
+            except Exception:
+                pass
+            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by='you' WHERE statement_id=%s;", (sid,))
             conn.commit()
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
@@ -1613,6 +1630,54 @@ def exceptions_csv(name):
             wtr.writerow(["Books", dd, who, a, "In books, not on statement", ""])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={name}_exceptions.csv"})
+
+
+HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} history · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('detail', name=name) }}">← Back to {{ name }}</a><a href="{{ url_for('dashboard') }}">All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=wrap>
+<h1>{{ name }} — reconciliation history</h1>
+<div class=sub>Past reconciliations for this account{% if ccy %} · {{ ccy }}{% endif %}</div>
+{% if stmts %}
+<table>
+<thead><tr><th>Period</th><th>Reconciled on</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th><th>Status</th></tr></thead>
+<tbody>
+{% for s in stmts %}<tr>
+<td>{{ s.period_start }} → {{ s.period_end }}</td>
+<td>{{ s.created.strftime('%Y-%m-%d') if s.created else '—' }}</td>
+<td>{% if s.exact is not none %}{{ s.exact }} exact{% if s.fuzzy %}, {{ s.fuzzy }} fuzzy{% endif %}{% if s.m2o %}, {{ s.m2o }} batched{% endif %}{% else %}—{% endif %}</td>
+<td>{% if s.exc is not none %}{{ s.exc }}{% else %}—{% endif %}</td>
+<td class=a>{% if s.diff is not none %}{{ s.diff|money }}{% else %}—{% endif %}</td>
+<td>{% if s.signed %}<span class="pill signed">Signed off {{ s.signed.strftime('%Y-%m-%d') }}</span>{% else %}<span class="pill open">In progress</span>{% endif %}</td>
+</tr>{% endfor %}
+</tbody></table>
+<div class=sub style="font-size:12.5px;margin-top:6px">Match counts and difference are snapshots taken when each period was signed off.</div>
+{% else %}
+<div class=sub>No reconciliations yet for this account.</div>
+{% endif %}
+</div></body></html>"""
+
+
+@app.route("/account/<name>/history")
+def history(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close(); return "Unknown account", 404
+    acct_uuid, atype, ccy = row
+    try:
+        _ensure_snapshot_cols(cur); conn.commit()
+    except Exception:
+        pass
+    cur.execute("""SELECT period_start, period_end, created_at, signed_off_at,
+                          snap_exact, snap_fuzzy, snap_m2o, snap_exc, snap_diff
+                   FROM statement WHERE account_id=%s ORDER BY created_at DESC;""", (acct_uuid,))
+    stmts = []
+    for ps, pe, created, signed, ex, fz, m2, exc, diff in cur.fetchall():
+        stmts.append({"period_start": ps, "period_end": pe, "created": created, "signed": signed,
+                      "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff})
+    cur.close(); conn.close()
+    return render_template_string(HISTORY_TEMPLATE, name=name, ccy=ccy, stmts=stmts)
 
 
 @app.route("/account/<name>/currency", methods=["POST"])
