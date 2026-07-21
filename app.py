@@ -116,6 +116,13 @@ def qbo_realm():
         pass
     return QBO_REALM_ID
 
+def _clear_stored_auth():
+    conn = get_conn(); cur = conn.cursor()
+    _ensure_qbo_auth(cur)
+    cur.execute("DELETE FROM qbo_auth WHERE id=1;")
+    conn.commit(); cur.close(); conn.close()
+
+
 def qbo_token():
     candidates = [t for t in (_get_stored_refresh(), os.environ.get("QBO_REFRESH_TOKEN", "")) if t]
     if not candidates:
@@ -1060,9 +1067,12 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <div class=wrap>
 <h1>All accounts</h1>
 <div class=sub>Updated {{ now }} EAT</div>
-<div style="display:flex;gap:12px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-<a href="{{ url_for('connect') }}" class=btn style="text-decoration:none;display:inline-block">Connect to QuickBooks</a>
-{% if qbo_connected %}<span style="color:var(--ok);font-size:13px;font-weight:600">Connected to QuickBooks</span>{% else %}<span style="color:var(--muted);font-size:13px">Not connected yet</span>{% endif %}
+<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+{% if qbo_connected %}<span style="color:var(--ok);font-size:13px;font-weight:600">● Connected to QuickBooks</span>
+<form method=post action="{{ url_for('check_connection') }}" style="margin:0"><button type=submit class=btn-sm>Check connection</button></form>
+<form method=post action="{{ url_for('disconnect') }}" style="margin:0" onsubmit="return confirm('Disconnect from QuickBooks? You will need to reconnect before syncing again.');"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Disconnect</button></form>
+{% else %}<a href="{{ url_for('connect') }}" class=btn style="text-decoration:none;display:inline-block">Connect to QuickBooks</a>
+<span style="color:var(--muted);font-size:13px">Not connected</span>{% endif %}
 </div>
 <form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
 <button type=submit class=btn-sm>Sync from QuickBooks</button></form>
@@ -1134,6 +1144,8 @@ else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
 else if(act.indexOf('/clear')>-1)t='Clearing account data...';
 else if(act.indexOf('/signoff')>-1)t='Signing off...';
 else if(act.indexOf('/reopen')>-1)t='Reopening...';
+else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
+else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 schedule(t);});
 })();</script>
 </body></html>"""
@@ -1150,7 +1162,8 @@ def dashboard():
     n_signed = sum(1 for r in rows if r["status"] == "signed")
     tot_exc = sum(r.get("exc", 0) for r in rows)
     sync_msg = session.pop("sync_msg", None)
-    qbo_connected = bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", ""))
+    _has_token = bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", ""))
+    qbo_connected = _has_token and get_config("qbo_conn") != "disconnected"
     return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed,
                                   tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
@@ -1264,6 +1277,8 @@ else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
 else if(act.indexOf('/clear')>-1)t='Clearing account data...';
 else if(act.indexOf('/signoff')>-1)t='Signing off...';
 else if(act.indexOf('/reopen')>-1)t='Reopening...';
+else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
+else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 schedule(t);});
 })();</script>
 </body></html>"""
@@ -1745,7 +1760,46 @@ def callback():
         except Exception: body = ""
         return f"Token exchange failed: HTTP {e.code} {body[:200]} <a href='/'>Back</a>"
     _store_refresh(tok.get("refresh_token"), realm)
+    try: set_config("qbo_conn", "connected")
+    except Exception: pass
     session["sync_msg"] = "Connected to QuickBooks successfully."
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    rt = _get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", "")
+    if rt:
+        try:
+            data = json.dumps({"token": rt}).encode()
+            req = urllib.request.Request("https://developer.api.intuit.com/v2/oauth2/tokens/revoke", data=data, method="POST")
+            auth = base64.b64encode(f"{os.environ.get('QBO_CLIENT_ID','')}:{os.environ.get('QBO_CLIENT_SECRET','')}".encode()).decode()
+            req.add_header("Authorization", "Basic " + auth)
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Accept", "application/json")
+            urllib.request.urlopen(req, timeout=15)
+        except Exception:
+            pass  # best-effort revoke; we clear locally regardless
+    _clear_stored_auth()
+    try: set_config("qbo_conn", "disconnected")
+    except Exception: pass
+    session["sync_msg"] = "Disconnected from QuickBooks."
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/check-connection", methods=["POST"])
+def check_connection():
+    try:
+        tok = qbo_token()
+        if not tok:
+            raise RuntimeError("no token")
+        try: set_config("qbo_conn", "connected")
+        except Exception: pass
+        session["sync_msg"] = "QuickBooks connection verified — you're connected."
+    except Exception:
+        try: set_config("qbo_conn", "disconnected")
+        except Exception: pass
+        session["sync_msg"] = "QuickBooks connection isn't active — please reconnect."
     return redirect(url_for("dashboard"))
 
 
