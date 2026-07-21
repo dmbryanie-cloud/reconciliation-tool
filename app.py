@@ -114,6 +114,19 @@ def delete_user(username):
     conn.commit(); cur.close(); conn.close()
 
 
+def update_user(username, name, is_admin, password=None):
+    conn = get_conn(); cur = conn.cursor()
+    _ensure_users(cur)
+    nm = (name or username).strip()
+    if password:
+        cur.execute("UPDATE app_users SET name=%s, is_admin=%s, password_hash=%s WHERE username=%s;",
+                    (nm, bool(is_admin), generate_password_hash(password), username.strip().lower()))
+    else:
+        cur.execute("UPDATE app_users SET name=%s, is_admin=%s WHERE username=%s;",
+                    (nm, bool(is_admin), username.strip().lower()))
+    conn.commit(); cur.close(); conn.close()
+
+
 # ---------------- QuickBooks auth (self-healing token) ----------------
 def _refresh_with(refresh_token):
     cid = os.environ["QBO_CLIENT_ID"]; secret = os.environ["QBO_CLIENT_SECRET"]
@@ -702,21 +715,23 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 {% for un, nm, adm, created in users %}<tr>
 <td><b>{{ un }}</b></td><td>{{ nm }}</td><td>{{ 'Admin' if adm else 'User' }}</td>
 <td>{{ created.strftime('%Y-%m-%d') if created else '' }}</td>
-<td class=a><form method=post style="margin:0" onsubmit="return confirm('Remove user {{ un }}?');"><input type=hidden name=action value=delete><input type=hidden name=username value="{{ un }}"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Remove</button></form></td>
+<td class=a><a href="{{ url_for('users') }}?edit={{ un }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-right:6px">Edit</a><form method=post style="display:inline;margin:0" onsubmit="return confirm('Remove user {{ un }}?');"><input type=hidden name=action value=delete><input type=hidden name=username value="{{ un }}"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Remove</button></form></td>
 </tr>{% endfor %}
 {% if not users %}<tr><td colspan=5 class=muted>No named users yet. Add one below.</td></tr>{% endif %}
 </tbody></table>
-<h2>Add or update a user</h2>
+<h2>{% if edit_user %}Edit user{% else %}Add a user{% endif %}</h2>
 <form method=post style="max-width:420px">
-<input type=hidden name=action value=add>
+<input type=hidden name=action value=save>
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.04em">Username</label>
-<input name=username autocapitalize=off style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<input name=username autocapitalize=off {% if edit_user %}value="{{ edit_user.username }}" readonly{% endif %} style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px{% if edit_user %};background:#f3f4f6;color:var(--muted){% endif %}">
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Display name</label>
-<input name=name style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<input name=name value="{{ edit_user.name if edit_user else '' }}" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Password</label>
-<input name=password type=password style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
-<label style="display:flex;align-items:center;gap:8px;margin:14px 0;font-size:14px;color:var(--ink)"><input type=checkbox name=is_admin> Administrator (can manage users)</label>
-<button type=submit class=btn>Save user</button>
+<input id=pwfield name=password type=password placeholder="{% if edit_user %}Leave blank to keep current{% else %}At least 6 characters{% endif %}" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<label style="display:flex;align-items:center;gap:6px;margin:8px 0 0;font-size:13px;color:var(--muted)"><input type=checkbox onclick="document.getElementById('pwfield').type=this.checked?'text':'password'"> Show password</label>
+<label style="display:flex;align-items:center;gap:8px;margin:16px 0;font-size:14px;color:var(--ink)"><input type=checkbox name=is_admin {% if edit_user and edit_user.is_admin %}checked{% endif %}> Administrator (can manage users)</label>
+<button type=submit class=btn>{% if edit_user %}Update user{% else %}Create user{% endif %}</button>
+{% if edit_user %}<a href="{{ url_for('users') }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-left:8px">Cancel</a>{% endif %}
 </form>
 <div class=sub style="margin-top:18px;font-size:13px;line-height:1.5">Sign-offs are recorded under each user's display name. The recovery password from your server settings always works as an admin — so you can't be locked out.</div>
 </div></body></html>"""
@@ -727,24 +742,36 @@ def users():
     if not session.get("is_admin"):
         return "Admins only. <a href='/'>Back</a>", 403
     error = msg = None
+    edit_user = None
     if request.method == "POST":
         action = request.form.get("action")
-        if action == "add":
+        if action == "save":
             un = (request.form.get("username") or "").strip().lower()
             nm = (request.form.get("name") or "").strip()
             pw = request.form.get("password") or ""
             adm = request.form.get("is_admin") == "on"
-            if not un or len(pw) < 6:
-                error = "Username is required and password must be at least 6 characters."
+            if not un:
+                error = "Username is required."
+            elif get_user(un):
+                update_user(un, nm, adm, pw or None)
+                msg = f"User '{un}' updated."
+            elif len(pw) < 6:
+                error = "New users need a password of at least 6 characters."
             else:
-                add_user(un, nm, pw, adm); msg = f"User '{un}' saved."
+                add_user(un, nm, pw, adm); msg = f"User '{un}' created."
         elif action == "delete":
             un = (request.form.get("username") or "").strip().lower()
             if un == session.get("username"):
                 error = "You can't delete the account you're signed in with."
             else:
                 delete_user(un); msg = f"User '{un}' removed."
-    return render_template_string(USERS_PAGE, users=list_users(), error=error, msg=msg)
+    else:
+        eu = (request.args.get("edit") or "").strip().lower()
+        if eu:
+            row = get_user(eu)
+            if row:
+                edit_user = {"username": row[0], "name": row[1], "is_admin": row[3]}
+    return render_template_string(USERS_PAGE, users=list_users(), error=error, msg=msg, edit_user=edit_user)
 
 
 @app.route("/health")
@@ -823,7 +850,7 @@ def login():
             session["authed"] = True; session["username"] = u[0]
             session["name"] = u[1] or u[0]; session["is_admin"] = bool(u[3])
             return redirect(url_for("dashboard"))
-        if APP_PASSWORD and password == APP_PASSWORD:
+        if check_password(password):
             session["authed"] = True; session["username"] = "admin"
             session["name"] = "Admin"; session["is_admin"] = True
             return redirect(url_for("dashboard"))
