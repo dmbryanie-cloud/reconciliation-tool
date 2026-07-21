@@ -774,6 +774,40 @@ def users():
     return render_template_string(USERS_PAGE, users=list_users(), error=error, msg=msg, edit_user=edit_user)
 
 
+BACKUP_TABLES = ["account", "statement", "statement_line", "book_txn", "match",
+                 "match_statement_line", "match_book_txn", "payee_correction",
+                 "settings", "app_users", "app_config", "qbo_auth"]
+
+
+def _bk_default(o):
+    if isinstance(o, Decimal):
+        return str(o)
+    if hasattr(o, "isoformat"):
+        return o.isoformat()
+    return str(o)
+
+
+@app.route("/backup")
+def backup():
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
+    conn = get_conn(); cur = conn.cursor()
+    out = {"exported_at": datetime.now(timezone.utc).isoformat(), "app": "reconciliation-tool", "tables": {}}
+    for t in BACKUP_TABLES:
+        try:
+            cur.execute("SELECT * FROM " + t + ";")
+            cols = [d[0] for d in cur.description]
+            out["tables"][t] = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except Exception:
+            conn.rollback()
+            out["tables"][t] = None
+    cur.close(); conn.close()
+    data = json.dumps(out, default=_bk_default, indent=2)
+    fname = "reconciliation_backup_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M") + ".json"
+    return Response(data, mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=" + fname})
+
+
 @app.route("/health")
 def health():
     # Lightweight touch so a single keep-warm ping keeps BOTH Render and Supabase awake.
@@ -794,7 +828,7 @@ def require_login():
         return redirect(url_for("login"))
 
 CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap style="max-width:440px">
 <h1>Change password</h1>
 <div class=sub>Set a new password for signing in.</div>
@@ -1208,7 +1242,7 @@ def account_summary(cur, acct_uuid, name, atype, currency=None):
 
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap>
 <h1>All accounts</h1>
 <div class=sub>Updated {{ now }} EAT</div>
@@ -1323,7 +1357,7 @@ def dashboard():
 
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
