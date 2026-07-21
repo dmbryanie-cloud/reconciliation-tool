@@ -1074,6 +1074,15 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 {% else %}<a href="{{ url_for('connect') }}" class=btn style="text-decoration:none;display:inline-block">Connect to QuickBooks</a>
 <span style="color:var(--muted);font-size:13px">Not connected</span>{% endif %}
 </div>
+<details style="margin-bottom:20px">
+<summary style="cursor:pointer;color:var(--muted);font-size:13px">Advanced: connect with a refresh token</summary>
+<form method=post action="{{ url_for('set_token') }}" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+<div><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Refresh token</label><input name=refresh_token style="width:340px;max-width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px"></div>
+<div><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Realm / Company ID</label><input name=realm_id style="width:190px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px"></div>
+<button type=submit class=btn-sm>Save token</button>
+</form>
+<div style="color:var(--muted);font-size:12px;margin-top:8px;line-height:1.5">Paste a refresh token from the Intuit OAuth Playground. This connects the app without needing the redirect URI registered.</div>
+</details>
 <form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
 <button type=submit class=btn-sm>Sync from QuickBooks</button></form>
 {% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
@@ -1828,6 +1837,20 @@ def callback():
     try: set_config("qbo_conn", "connected")
     except Exception: pass
     session["sync_msg"] = "Connected to QuickBooks successfully."
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/set-token", methods=["POST"])
+def set_token():
+    rt = (request.form.get("refresh_token") or "").strip()
+    realm = (request.form.get("realm_id") or "").strip() or None
+    if rt:
+        _store_refresh(rt, realm)
+        try: set_config("qbo_conn", "connected")
+        except Exception: pass
+        session["sync_msg"] = "Refresh token saved. Use 'Check connection' to verify it works."
+    else:
+        session["sync_msg"] = "No refresh token was provided."
     return redirect(url_for("dashboard"))
 
 
