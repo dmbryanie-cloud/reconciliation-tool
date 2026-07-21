@@ -69,6 +69,51 @@ def check_password(pw):
     return bool(APP_PASSWORD) and pw == APP_PASSWORD
 
 
+def _ensure_users(cur):
+    cur.execute("""CREATE TABLE IF NOT EXISTS app_users (
+        username text PRIMARY KEY, name text, password_hash text,
+        is_admin boolean DEFAULT false, created_at timestamptz DEFAULT now());""")
+
+
+def get_user(username):
+    if not username:
+        return None
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        _ensure_users(cur); conn.commit()
+        cur.execute("SELECT username, name, password_hash, is_admin FROM app_users WHERE username=%s;", (username.strip().lower(),))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row
+    except Exception:
+        return None
+
+
+def list_users():
+    conn = get_conn(); cur = conn.cursor()
+    _ensure_users(cur); conn.commit()
+    cur.execute("SELECT username, name, is_admin, created_at FROM app_users ORDER BY created_at;")
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
+
+
+def add_user(username, name, password, is_admin):
+    conn = get_conn(); cur = conn.cursor()
+    _ensure_users(cur)
+    cur.execute("""INSERT INTO app_users (username, name, password_hash, is_admin) VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (username) DO UPDATE SET name=EXCLUDED.name,
+                     password_hash=EXCLUDED.password_hash, is_admin=EXCLUDED.is_admin;""",
+                (username.strip().lower(), (name or "").strip() or username.strip().lower(),
+                 generate_password_hash(password), bool(is_admin)))
+    conn.commit(); cur.close(); conn.close()
+
+
+def delete_user(username):
+    conn = get_conn(); cur = conn.cursor()
+    _ensure_users(cur)
+    cur.execute("DELETE FROM app_users WHERE username=%s;", (username.strip().lower(),))
+    conn.commit(); cur.close(); conn.close()
+
+
 # ---------------- QuickBooks auth (self-healing token) ----------------
 def _refresh_with(refresh_token):
     cid = os.environ["QBO_CLIENT_ID"]; secret = os.environ["QBO_CLIENT_SECRET"]
@@ -503,8 +548,10 @@ button:hover{opacity:.92}
 <div class=brand><span class=dot></span>Reconciliation Tool</div>
 <p class=tag>Match your books to your bank statements, with confidence.</p>
 <form method=post>
-<label for=pw>Password</label>
-<input id=pw type=password name=password placeholder="Enter your password" autofocus>
+<label for=un>Username</label>
+<input id=un type=text name=username placeholder="Your username" autocapitalize=off autofocus>
+<label for=pw style="display:block;margin-top:16px">Password</label>
+<input id=pw type=password name=password placeholder="Enter your password">
 <button type=submit>Sign in</button>
 {% if error %}<div class=err>{{ error }}</div>{% endif %}
 </form>
@@ -642,6 +689,64 @@ def terms():
     return render_template_string(TERMS_PAGE.replace("__EMAIL__", CONTACT_EMAIL))
 
 
+USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Users · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=wrap style="max-width:720px">
+<h1>Users</h1>
+<div class=sub>People who can sign in to this reconciliation tool.</div>
+{% if msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:10px 14px;border-radius:9px;font-size:14px;margin-bottom:16px">{{ msg }}</div>{% endif %}
+{% if error %}<div style="background:var(--bad-soft);color:var(--bad);padding:10px 14px;border-radius:9px;font-size:14px;margin-bottom:16px">{{ error }}</div>{% endif %}
+<table>
+<thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Added</th><th class=a></th></tr></thead>
+<tbody>
+{% for un, nm, adm, created in users %}<tr>
+<td><b>{{ un }}</b></td><td>{{ nm }}</td><td>{{ 'Admin' if adm else 'User' }}</td>
+<td>{{ created.strftime('%Y-%m-%d') if created else '' }}</td>
+<td class=a><form method=post style="margin:0" onsubmit="return confirm('Remove user {{ un }}?');"><input type=hidden name=action value=delete><input type=hidden name=username value="{{ un }}"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Remove</button></form></td>
+</tr>{% endfor %}
+{% if not users %}<tr><td colspan=5 class=muted>No named users yet. Add one below.</td></tr>{% endif %}
+</tbody></table>
+<h2>Add or update a user</h2>
+<form method=post style="max-width:420px">
+<input type=hidden name=action value=add>
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.04em">Username</label>
+<input name=username autocapitalize=off style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Display name</label>
+<input name=name style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Password</label>
+<input name=password type=password style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
+<label style="display:flex;align-items:center;gap:8px;margin:14px 0;font-size:14px;color:var(--ink)"><input type=checkbox name=is_admin> Administrator (can manage users)</label>
+<button type=submit class=btn>Save user</button>
+</form>
+<div class=sub style="margin-top:18px;font-size:13px;line-height:1.5">Sign-offs are recorded under each user's display name. The recovery password from your server settings always works as an admin — so you can't be locked out.</div>
+</div></body></html>"""
+
+
+@app.route("/users", methods=["GET", "POST"])
+def users():
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
+    error = msg = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            un = (request.form.get("username") or "").strip().lower()
+            nm = (request.form.get("name") or "").strip()
+            pw = request.form.get("password") or ""
+            adm = request.form.get("is_admin") == "on"
+            if not un or len(pw) < 6:
+                error = "Username is required and password must be at least 6 characters."
+            else:
+                add_user(un, nm, pw, adm); msg = f"User '{un}' saved."
+        elif action == "delete":
+            un = (request.form.get("username") or "").strip().lower()
+            if un == session.get("username"):
+                error = "You can't delete the account you're signed in with."
+            else:
+                delete_user(un); msg = f"User '{un}' removed."
+    return render_template_string(USERS_PAGE, users=list_users(), error=error, msg=msg)
+
+
 @app.route("/health")
 def health():
     # Lightweight touch so a single keep-warm ping keeps BOTH Render and Supabase awake.
@@ -662,7 +767,7 @@ def require_login():
         return redirect(url_for("login"))
 
 CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap style="max-width:440px">
 <h1>Change password</h1>
 <div class=sub>Set a new password for signing in.</div>
@@ -683,19 +788,24 @@ CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=vi
 @app.route("/change-password", methods=["GET", "POST"])
 def change_password():
     error = None
+    uname = session.get("username")
+    u = get_user(uname) if uname and uname != "admin" else None
     if request.method == "POST":
         cur_pw = request.form.get("current", "")
         new_pw = request.form.get("new", "")
         confirm = request.form.get("confirm", "")
-        if not check_password(cur_pw):
+        ok = bool(u and u[2] and check_password_hash(u[2], cur_pw)) or (APP_PASSWORD and cur_pw == APP_PASSWORD)
+        if not ok:
             error = "Current password is incorrect."
         elif len(new_pw) < 6:
             error = "New password must be at least 6 characters."
         elif new_pw != confirm:
             error = "The new passwords don't match."
+        elif not u:
+            error = "You're signed in with the recovery password. Create a named user under Users, then set its password there."
         else:
             try:
-                set_config("password_hash", generate_password_hash(new_pw))
+                add_user(u[0], u[1], new_pw, u[3])
                 session["sync_msg"] = "Password updated."
                 return redirect(url_for("dashboard"))
             except Exception as e:
@@ -706,10 +816,18 @@ def change_password():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if check_password(request.form.get("password")):
-            session["authed"] = True
+        username = (request.form.get("username") or "").strip().lower()
+        password = request.form.get("password") or ""
+        u = get_user(username) if username else None
+        if u and u[2] and check_password_hash(u[2], password):
+            session["authed"] = True; session["username"] = u[0]
+            session["name"] = u[1] or u[0]; session["is_admin"] = bool(u[3])
             return redirect(url_for("dashboard"))
-        return render_template_string(LOGIN_PAGE, error="Incorrect password")
+        if APP_PASSWORD and password == APP_PASSWORD:
+            session["authed"] = True; session["username"] = "admin"
+            session["name"] = "Admin"; session["is_admin"] = True
+            return redirect(url_for("dashboard"))
+        return render_template_string(LOGIN_PAGE, error="Incorrect username or password")
     return render_template_string(LOGIN_PAGE, error=None)
 
 @app.route("/logout")
@@ -1063,7 +1181,7 @@ def account_summary(cur, acct_uuid, name, atype, currency=None):
 
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap>
 <h1>All accounts</h1>
 <div class=sub>Updated {{ now }} EAT</div>
@@ -1178,7 +1296,7 @@ def dashboard():
 
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
@@ -1445,7 +1563,7 @@ def signoff(name):
                             (d.get("n_exact", 0), d.get("n_fuzzy", 0), d.get("n_m2o", 0), exc, d.get("diff", 0), sid))
             except Exception:
                 pass
-            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by='you' WHERE statement_id=%s;", (sid,))
+            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by=%s WHERE statement_id=%s;", (session.get("name") or "you", sid))
             conn.commit()
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
@@ -1642,7 +1760,7 @@ def exceptions_csv(name):
 
 
 HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} history · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links><a href="{{ url_for('detail', name=name) }}">← Back to {{ name }}</a><a href="{{ url_for('dashboard') }}">All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('detail', name=name) }}">← Back to {{ name }}</a><a href="{{ url_for('dashboard') }}">All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap>
 <h1>{{ name }} — reconciliation history</h1>
 <div class=sub>Past reconciliations for this account{% if ccy %} · {{ ccy }}{% endif %}</div>
