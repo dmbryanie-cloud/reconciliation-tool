@@ -883,6 +883,38 @@ def qbo_info():
             L.append("Bank / Credit Card accounts:    " + str(len(banks)))
             for a in banks[:30]:
                 L.append("  - " + str(a.get("Name")) + "  [" + str(a.get("AccountType")) + "]  id=" + str(a.get("Id")))
+            # live discovery test: try to upsert one bank account and report the real error
+            L.append("")
+            L.append("--- discovery test ---")
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='account';")
+            cols = sorted([r[0] for r in cur.fetchall()])
+            L.append("account table columns: " + ", ".join(cols))
+            if banks:
+                a = banks[0]
+                qid = a.get("Id"); nm = a.get("Name") or ("Account " + str(qid))
+                ccy = (a.get("CurrencyRef") or {}).get("value")
+                t = {"Bank": "bank", "Credit Card": "credit_card"}.get(a.get("AccountType", ""))
+                try:
+                    cur.execute("SELECT account_id FROM account WHERE source_account_id=%s;", (qid,))
+                    exists = cur.fetchone()
+                    if exists:
+                        L.append("first bank account ALREADY in app: " + nm)
+                    else:
+                        fields = {"source_account_id": qid, "name": nm, "type": t}
+                        if "currency" in cols and ccy: fields["currency"] = ccy
+                        if "org_id" in cols: fields["org_id"] = ORG_ID
+                        cn = list(fields.keys()); ph = ["%s"] * len(cn)
+                        if "account_id" in cols:
+                            cn = ["account_id"] + cn; ph = ["gen_random_uuid()"] + ph
+                        sql = "INSERT INTO account (" + ", ".join(cn) + ") VALUES (" + ", ".join(ph) + ");"
+                        L.append("insert sql: " + sql)
+                        cur.execute(sql, [fields[c] for c in fields]); conn.commit()
+                        L.append("INSERT SUCCEEDED for: " + nm)
+                except Exception as e:
+                    conn.rollback()
+                    L.append("INSERT FAILED: " + repr(e))
+            cur.close(); conn.close()
         except Exception as e:
             L.append("Account query error: " + str(e))
     except Exception as e:
