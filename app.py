@@ -260,6 +260,26 @@ def _h_journalentry(e, acct, atype):
             cat = det.get("AccountRef", {}).get("name")
     return (net, "Journal entry", e.get("PrivateNote"), cat) if hit else None
 
+def _account_refs(etype, e):
+    if etype == "Purchase":
+        return [e.get("AccountRef", {}).get("value")]
+    if etype in ("Deposit", "Payment"):
+        return [e.get("DepositToAccountRef", {}).get("value")]
+    if etype == "Transfer":
+        return [e.get("ToAccountRef", {}).get("value"), e.get("FromAccountRef", {}).get("value")]
+    if etype == "BillPayment":
+        return [e.get("CheckPayment", {}).get("BankAccountRef", {}).get("value"),
+                e.get("CreditCardPayment", {}).get("CCAccountRef", {}).get("value")]
+    if etype == "JournalEntry":
+        refs = []
+        for ln in e.get("Line", []):
+            det = ln.get("JournalEntryLineDetail")
+            if det:
+                refs.append(det.get("AccountRef", {}).get("value"))
+        return refs
+    return []
+
+
 QBO_HANDLERS = {"Purchase": _h_purchase, "Deposit": _h_deposit, "Transfer": _h_transfer,
                 "BillPayment": _h_billpayment, "Payment": _h_payment, "JournalEntry": _h_journalentry}
 
@@ -331,32 +351,45 @@ def sync_from_quickbooks():
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
     conn.commit()
     cur.execute("SELECT account_id, source_account_id, name, type FROM account ORDER BY type, name;")
-    accounts = cur.fetchall()
-    total = 0
-    for acct_uuid, acct_qbo, name, atype in accounts:
-        for etype, handler in QBO_HANDLERS.items():
-            for e in cache[etype]:
+    by_qbo = {}
+    for acct_uuid, acct_qbo, name, atype in cur.fetchall():
+        if acct_qbo:
+            by_qbo[str(acct_qbo)] = (acct_uuid, atype)
+    rows = []
+    for etype, handler in QBO_HANDLERS.items():
+        for e in cache[etype]:
+            seen = set()
+            for ref in _account_refs(etype, e):
+                if not ref:
+                    continue
+                ref = str(ref)
+                if ref in seen or ref not in by_qbo:
+                    continue
+                seen.add(ref)
+                acct_uuid, atype = by_qbo[ref]
                 try:
-                    res = handler(e, acct_qbo, atype)
+                    res = handler(e, ref, atype)
                 except Exception:
                     continue
-                if not res: continue
+                if not res:
+                    continue
                 amount, cp, desc, cat = res
-                cur.execute("""
-                    INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
-                                          posted_date, amount, currency, description, counterparty,
-                                          reference, category, cleared_status, last_modified)
-                    VALUES (%(org)s,%(acct)s,%(sid)s,%(stype)s,%(date)s,%(amt)s,%(cur)s,%(desc)s,%(cp)s,%(ref)s,%(cat)s,'unknown',%(lm)s)
-                    ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
-                      posted_date=EXCLUDED.posted_date, amount=EXCLUDED.amount, currency=EXCLUDED.currency,
-                      description=EXCLUDED.description, counterparty=EXCLUDED.counterparty,
-                      reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
-                """, {"org": ORG_ID, "acct": acct_uuid, "sid": e.get("Id"), "stype": etype,
-                      "date": e.get("TxnDate"), "amt": amount,
-                      "cur": e.get("CurrencyRef", {}).get("value", "USD"),
-                      "desc": desc, "cp": cp, "ref": e.get("DocNumber"), "cat": cat,
-                      "lm": e.get("MetaData", {}).get("LastUpdatedTime")})
-                total += 1
+                rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
+                             e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
+                             e.get("DocNumber"), cat, "unknown",
+                             e.get("MetaData", {}).get("LastUpdatedTime")))
+    if rows:
+        execute_values(cur, """
+            INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
+                                  posted_date, amount, currency, description, counterparty,
+                                  reference, category, cleared_status, last_modified)
+            VALUES %s
+            ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
+              posted_date=EXCLUDED.posted_date, amount=EXCLUDED.amount, currency=EXCLUDED.currency,
+              description=EXCLUDED.description, counterparty=EXCLUDED.counterparty,
+              reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
+        """, rows, page_size=500)
+    total = len(rows)
     conn.commit(); cur.close(); conn.close()
     return total
 
