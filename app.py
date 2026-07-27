@@ -263,8 +263,54 @@ def _h_journalentry(e, acct, atype):
 QBO_HANDLERS = {"Purchase": _h_purchase, "Deposit": _h_deposit, "Transfer": _h_transfer,
                 "BillPayment": _h_billpayment, "Payment": _h_payment, "JournalEntry": _h_journalentry}
 
+def import_accounts_from_qbo(token):
+    """Discover Bank and Credit Card accounts from the connected QBO company and upsert them."""
+    try:
+        accts = qbo_query("Account", token)
+    except Exception:
+        return 0
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='account';")
+    cols = {r[0] for r in cur.fetchall()}
+    created = 0
+    for a in accts:
+        t = {"Bank": "bank", "Credit Card": "credit_card"}.get(a.get("AccountType", ""))
+        if not t:
+            continue
+        qid = a.get("Id")
+        if not qid:
+            continue
+        name = a.get("Name") or ("Account " + str(qid))
+        ccy = (a.get("CurrencyRef") or {}).get("value")
+        try:
+            cur.execute("SELECT account_id FROM account WHERE source_account_id=%s;", (qid,))
+            if cur.fetchone():
+                cur.execute("UPDATE account SET name=%s, type=%s WHERE source_account_id=%s;", (name, t, qid))
+                conn.commit()
+                continue
+            fields = {"source_account_id": qid, "name": name, "type": t}
+            if "currency" in cols and ccy:
+                fields["currency"] = ccy
+            if "org_id" in cols:
+                fields["org_id"] = ORG_ID
+            colnames = list(fields.keys())
+            placeholders = ["%s"] * len(colnames)
+            if "account_id" in cols:
+                colnames = ["account_id"] + colnames
+                placeholders = ["gen_random_uuid()"] + placeholders
+            sql = "INSERT INTO account (" + ", ".join(colnames) + ") VALUES (" + ", ".join(placeholders) + ");"
+            cur.execute(sql, [fields[c] for c in fields])
+            conn.commit()
+            created += 1
+        except Exception:
+            conn.rollback()
+    cur.close(); conn.close()
+    return created
+
+
 def sync_from_quickbooks():
     token = qbo_token()
+    import_accounts_from_qbo(token)
     cache = {}
     for etype in QBO_HANDLERS:
         try:
@@ -1375,6 +1421,8 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div style="margin-top:15px;border-top:1px solid var(--line-soft);padding-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
 <form method=post action="{{ url_for('clear_account', name=name) }}" onsubmit="return confirm('Clear ALL statements and book transactions for this account? This removes old synced or imported data so you can start fresh offline. This cannot be undone.');" style="display:inline">
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Clear this account&#39;s data</button></form>
+<form method=post action="{{ url_for('delete_account', name=name) }}" onsubmit="return confirm('Delete this account entirely, including all its statements and transactions? Use this to remove old sandbox accounts. This cannot be undone.');" style="display:inline;margin-left:8px">
+<button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Delete account</button></form>
 <span style="color:var(--muted);font-size:12px">Removes old synced/imported data for a clean offline slate</span>
 </div>
 </div>
@@ -1946,6 +1994,26 @@ def diag(name):
         o.append(f"         bank lines matching a book amount with OPPOSITE sign: {cur.fetchone()[0]}")
     cur.close(); conn.close()
     return "<pre style='font-size:13px;line-height:1.5;padding:24px;font-family:ui-monospace,monospace'>" + "\n".join(str(x) for x in o) + "</pre>"
+
+
+@app.route("/account/<name>/delete", methods=["POST"])
+def delete_account(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if row:
+        acct = row[0]
+        cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s));", (acct,))
+        cur.execute("DELETE FROM match_book_txn WHERE match_id IN (SELECT match_id FROM match WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s));", (acct,))
+        cur.execute("DELETE FROM match WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s);", (acct,))
+        cur.execute("DELETE FROM statement_line WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s);", (acct,))
+        cur.execute("DELETE FROM statement WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM book_txn WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM account WHERE account_id=%s;", (acct,))
+        conn.commit()
+        session["sync_msg"] = "Removed account '" + name + "' and all its data."
+    cur.close(); conn.close()
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/account/<name>/clear", methods=["POST"])
