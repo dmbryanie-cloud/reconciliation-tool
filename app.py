@@ -854,6 +854,42 @@ def backup():
                     headers={"Content-Disposition": "attachment; filename=" + fname})
 
 
+@app.route("/qbo-info")
+def qbo_info():
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
+    L = []
+    L.append("QBO_BASE       = " + QBO_BASE)
+    L.append("resolved realm = " + str(qbo_realm()))
+    L.append("env QBO_REALM_ID = " + (os.environ.get("QBO_REALM_ID", "") or "(unset)"))
+    L.append("")
+    try:
+        token = qbo_token()
+        L.append("token: OK")
+        try:
+            ci = qbo_query("CompanyInfo", token)
+            if ci:
+                L.append("COMPANY: " + str(ci[0].get("CompanyName", "?")))
+                L.append("Country: " + str(ci[0].get("Country", "?")))
+            else:
+                L.append("CompanyInfo: (empty)")
+        except Exception as e:
+            L.append("CompanyInfo error: " + str(e))
+        try:
+            accts = qbo_query("Account", token)
+            banks = [a for a in accts if a.get("AccountType") in ("Bank", "Credit Card")]
+            L.append("")
+            L.append("Total accounts returned by QBO: " + str(len(accts)))
+            L.append("Bank / Credit Card accounts:    " + str(len(banks)))
+            for a in banks[:30]:
+                L.append("  - " + str(a.get("Name")) + "  [" + str(a.get("AccountType")) + "]  id=" + str(a.get("Id")))
+        except Exception as e:
+            L.append("Account query error: " + str(e))
+    except Exception as e:
+        L.append("token error: " + str(e))
+    return Response("\n".join(L), mimetype="text/plain")
+
+
 @app.route("/health")
 def health():
     # Lightweight touch so a single keep-warm ping keeps BOTH Render and Supabase awake.
