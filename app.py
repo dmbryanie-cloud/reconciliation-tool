@@ -272,6 +272,14 @@ def import_accounts_from_qbo(token):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='account';")
     cols = {r[0] for r in cur.fetchall()}
+    conn_id = None
+    if "connection_id" in cols:
+        try:
+            cur.execute("SELECT connection_id FROM account WHERE connection_id IS NOT NULL LIMIT 1;")
+            r = cur.fetchone()
+            conn_id = r[0] if r else None
+        except Exception:
+            conn.rollback()
     created = 0
     for a in accts:
         t = {"Bank": "bank", "Credit Card": "credit_card"}.get(a.get("AccountType", ""))
@@ -293,6 +301,8 @@ def import_accounts_from_qbo(token):
                 fields["currency"] = ccy
             if "org_id" in cols:
                 fields["org_id"] = ORG_ID
+            if "connection_id" in cols and conn_id is not None:
+                fields["connection_id"] = conn_id
             colnames = list(fields.keys())
             placeholders = ["%s"] * len(colnames)
             if "account_id" in cols:
@@ -901,9 +911,14 @@ def qbo_info():
                     if exists:
                         L.append("first bank account ALREADY in app: " + nm)
                     else:
+                        conn_id = None
+                        if "connection_id" in cols:
+                            cur.execute("SELECT connection_id FROM account WHERE connection_id IS NOT NULL LIMIT 1;")
+                            rr = cur.fetchone(); conn_id = rr[0] if rr else None
                         fields = {"source_account_id": qid, "name": nm, "type": t}
                         if "currency" in cols and ccy: fields["currency"] = ccy
                         if "org_id" in cols: fields["org_id"] = ORG_ID
+                        if "connection_id" in cols and conn_id is not None: fields["connection_id"] = conn_id
                         cn = list(fields.keys()); ph = ["%s"] * len(cn)
                         if "account_id" in cols:
                             cn = ["account_id"] + cn; ph = ["gen_random_uuid()"] + ph
