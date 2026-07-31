@@ -198,14 +198,32 @@ def qbo_token():
             continue
     raise RuntimeError(f"Token refresh rejected by QuickBooks — {detail}")
 
+QBO_PAGE_SIZE = 1000
+QBO_MAX_PAGES = 50  # safety ceiling: 50,000 records per entity
+
 def qbo_query(entity, token):
-    q = f"SELECT * FROM {entity} MAXRESULTS 1000"
-    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q)
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read()).get("QueryResponse", {}).get(entity, [])
+    """Query a QBO entity, following STARTPOSITION paging until exhausted.
+
+    QuickBooks caps ANY single query at 1000 rows. The previous version sent
+    MAXRESULTS 1000 with no paging, so any entity with more than 1000 records
+    was silently truncated -- no error, no warning. For a reconciliation tool
+    that surfaces as phantom "unrecorded" items on the bank side.
+    """
+    out = []
+    start = 1
+    for _ in range(QBO_MAX_PAGES):
+        q = f"SELECT * FROM {entity} STARTPOSITION {start} MAXRESULTS {QBO_PAGE_SIZE}"
+        url = f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q)
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req) as resp:
+            batch = json.loads(resp.read()).get("QueryResponse", {}).get(entity, [])
+        out.extend(batch)
+        if len(batch) < QBO_PAGE_SIZE:
+            break
+        start += QBO_PAGE_SIZE
+    return out
 
 def _D(x): return Decimal(str(x or 0))
 
