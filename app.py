@@ -3,6 +3,7 @@ import io
 import csv
 import hashlib
 import itertools
+import time
 import re
 import uuid
 import psycopg2
@@ -212,7 +213,7 @@ def _sync_since():
     m = (m - 1) % 12 + 1
     return f"{y:04d}-{m:02d}-01"
 
-def qbo_query(entity, token, since=None):
+def qbo_query(entity, token, since=None, changed_since=None):
     """Query a QBO entity, following STARTPOSITION paging until exhausted.
 
     QuickBooks caps ANY single query at 1000 rows. The previous version sent
@@ -222,7 +223,12 @@ def qbo_query(entity, token, since=None):
     """
     out = []
     start = 1
-    where = f" WHERE TxnDate >= '{since}'" if since else ""
+    conds = []
+    if since:
+        conds.append(f"TxnDate >= '{since}'")
+    if changed_since:
+        conds.append(f"MetaData.LastUpdatedTime >= '{changed_since}'")
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
     for _ in range(QBO_MAX_PAGES):
         q = f"SELECT * FROM {entity}{where} STARTPOSITION {start} MAXRESULTS {QBO_PAGE_SIZE}"
         url = f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q)
@@ -368,19 +374,25 @@ def import_accounts_from_qbo(token):
     return created
 
 
-def sync_from_quickbooks():
+def sync_from_quickbooks(full=False):
     token = qbo_token()
     import_accounts_from_qbo(token)
     since = _sync_since()
+    # Watermark: only pull records QBO says changed since our last good sync.
+    # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
+    changed_since = None if full else get_config("last_sync_at")
+    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S-00:00")
+    t0 = time.time()
     cache = {}
     fetched = {}
     for etype in QBO_HANDLERS:
         try:
-            cache[etype] = qbo_query(etype, token, since=since)
+            cache[etype] = qbo_query(etype, token, since=since, changed_since=changed_since)
             fetched[etype] = len(cache[etype])
         except urllib.error.HTTPError:
             cache[etype] = []
             fetched[etype] = -1  # -1 marks a failed pull, distinct from a genuine zero
+    fetch_secs = time.time() - t0
     conn = get_conn(); cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
     conn.commit()
@@ -412,6 +424,7 @@ def sync_from_quickbooks():
                              e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
                              e.get("DocNumber"), cat, "unknown",
                              e.get("MetaData", {}).get("LastUpdatedTime")))
+    t1 = time.time()
     if rows:
         execute_values(cur, """
             INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
@@ -425,8 +438,16 @@ def sync_from_quickbooks():
         """, rows, page_size=500)
     total = len(rows)
     conn.commit(); cur.close(); conn.close()
+    insert_secs = time.time() - t1
+    clean = all(v >= 0 for v in fetched.values())
+    if clean:
+        set_config("last_sync_at", started_at)   # only advance if every entity pulled OK
     detail = ", ".join(f"{k} {'FAILED' if v < 0 else v}" for k, v in fetched.items())
-    return total, detail
+    mode = "full" if changed_since is None else f"changes since {changed_since[:16].replace('T', ' ')}"
+    timing = f"fetch {fetch_secs:.0f}s, save {insert_secs:.0f}s"
+    if not clean:
+        detail += " \u2014 some types failed, so the next sync will re-check the same period"
+    return total, detail, mode, timing
 
 
 # Make sure sign-off columns exist (runs once at startup)
@@ -1513,6 +1534,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 </details>
 <form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
 <button type=submit class=btn-sm>Sync from QuickBooks</button></form>
+<form method=post action="{{ url_for('sync') }}" style="display:inline" onsubmit="return confirm('Full resync re-downloads every transaction in the window, ignoring the last-sync marker. Slower, but use it if you think something was missed.');"><input type=hidden name=full value="1"><button type=submit class=btn-sm>Full resync</button></form>
 {% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
 <div class=tiles>
 <button class="tile active" data-filter="all"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span><span class=t-label>Accounts</span></div><div class=t-val>{{ rows|length }}</div></button>
@@ -2352,10 +2374,12 @@ def check_connection():
 @app.route("/sync", methods=["POST"])
 def sync():
     try:
-        n, detail = sync_from_quickbooks()
+        full = request.form.get("full") == "1"
+        n, detail, mode, timing = sync_from_quickbooks(full=full)
         window = _sync_since()
         scope = f"since {window}" if window else "all history"
-        session["sync_msg"] = f"Synced {n} transactions from QuickBooks ({scope}). Records fetched: {detail}."
+        session["sync_msg"] = (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
+                               f"Records fetched: {detail}.")
     except Exception as e:
         session["sync_msg"] = f"Sync failed: {e}"
     return redirect(url_for("dashboard"))
