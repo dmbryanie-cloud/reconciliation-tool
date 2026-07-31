@@ -10,7 +10,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 from psycopg2.extras import execute_values
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from flask import Flask, render_template_string, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import json, base64, urllib.request, urllib.parse, urllib.error
@@ -200,8 +200,19 @@ def qbo_token():
 
 QBO_PAGE_SIZE = 1000
 QBO_MAX_PAGES = 50  # safety ceiling: 50,000 records per entity
+SYNC_MONTHS = int(os.environ.get("SYNC_MONTHS", "24"))  # how far back sync reaches
 
-def qbo_query(entity, token):
+def _sync_since():
+    """First day of the month SYNC_MONTHS ago, as YYYY-MM-DD."""
+    if SYNC_MONTHS <= 0:
+        return None  # 0 or negative = pull all history
+    t = date.today()
+    m = t.month - SYNC_MONTHS
+    y = t.year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    return f"{y:04d}-{m:02d}-01"
+
+def qbo_query(entity, token, since=None):
     """Query a QBO entity, following STARTPOSITION paging until exhausted.
 
     QuickBooks caps ANY single query at 1000 rows. The previous version sent
@@ -211,8 +222,9 @@ def qbo_query(entity, token):
     """
     out = []
     start = 1
+    where = f" WHERE TxnDate >= '{since}'" if since else ""
     for _ in range(QBO_MAX_PAGES):
-        q = f"SELECT * FROM {entity} STARTPOSITION {start} MAXRESULTS {QBO_PAGE_SIZE}"
+        q = f"SELECT * FROM {entity}{where} STARTPOSITION {start} MAXRESULTS {QBO_PAGE_SIZE}"
         url = f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q)
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {token}")
@@ -359,12 +371,16 @@ def import_accounts_from_qbo(token):
 def sync_from_quickbooks():
     token = qbo_token()
     import_accounts_from_qbo(token)
+    since = _sync_since()
     cache = {}
+    fetched = {}
     for etype in QBO_HANDLERS:
         try:
-            cache[etype] = qbo_query(etype, token)
+            cache[etype] = qbo_query(etype, token, since=since)
+            fetched[etype] = len(cache[etype])
         except urllib.error.HTTPError:
             cache[etype] = []
+            fetched[etype] = -1  # -1 marks a failed pull, distinct from a genuine zero
     conn = get_conn(); cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
     conn.commit()
@@ -409,7 +425,8 @@ def sync_from_quickbooks():
         """, rows, page_size=500)
     total = len(rows)
     conn.commit(); cur.close(); conn.close()
-    return total
+    detail = ", ".join(f"{k} {'FAILED' if v < 0 else v}" for k, v in fetched.items())
+    return total, detail
 
 
 # Make sure sign-off columns exist (runs once at startup)
@@ -2281,8 +2298,10 @@ def check_connection():
 @app.route("/sync", methods=["POST"])
 def sync():
     try:
-        n = sync_from_quickbooks()
-        session["sync_msg"] = f"Synced {n} transactions from QuickBooks."
+        n, detail = sync_from_quickbooks()
+        window = _sync_since()
+        scope = f"since {window}" if window else "all history"
+        session["sync_msg"] = f"Synced {n} transactions from QuickBooks ({scope}). Records fetched: {detail}."
     except Exception as e:
         session["sync_msg"] = f"Sync failed: {e}"
     return redirect(url_for("dashboard"))
