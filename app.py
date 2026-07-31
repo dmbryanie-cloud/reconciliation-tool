@@ -434,6 +434,7 @@ try:
     _c = get_conn(); _cur = _c.cursor()
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_at timestamptz;")
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_by text;")
+    _cur.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;")
     _c.commit(); _cur.close(); _c.close()
 except Exception as e:
     print("startup check:", e)
@@ -861,6 +862,57 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 </div></body></html>"""
 
 
+ACCOUNTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Accounts · Reconciliation Tool</title>""" + CSS + """</head><body>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=wrap><h1>Accounts</h1>
+<div class=sub>QuickBooks has {{ rows|length }} bank and credit-card accounts. Tick only the ones you actually reconcile — the rest stay synced but stop loading on the dashboard.</div>
+{% if msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ msg }}</div>{% endif %}
+<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 18px;line-height:1.5">Hiding an account never deletes anything. Its transactions and reconciliation history stay in the database — tick it again any time to bring it back.</div>
+<form method=post>
+<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+<button type=button class=btn-sm onclick="document.querySelectorAll('.acc').forEach(c=>c.checked=true)">Select all</button>
+<button type=button class=btn-sm onclick="document.querySelectorAll('.acc').forEach(c=>c.checked=false)">Select none</button>
+<button type=button class=btn-sm onclick="document.querySelectorAll('.acc').forEach(c=>{c.checked=c.dataset.hastxn=='1'})">Only ones with data</button>
+</div>
+<table><tr><th style="width:70px">Show</th><th>Account</th><th>Type</th><th>Currency</th><th style="text-align:right">Transactions</th></tr>
+{% for r in rows %}<tr>
+<td><input type=checkbox class=acc name=active value="{{ r.id }}" data-hastxn="{{ '1' if r.n else '0' }}" {% if r.active %}checked{% endif %}></td>
+<td>{{ r.name }}</td><td>{{ 'Credit card' if r.type=='credit_card' else 'Bank' }}</td>
+<td>{{ r.currency or '' }}</td><td style="text-align:right">{{ r.n }}</td></tr>{% endfor %}
+</table>
+<div style="margin-top:18px"><button type=submit class=btn-go>Save</button>
+<a href="{{ url_for('dashboard') }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-left:8px">Cancel</a></div>
+</form></div></body></html>"""
+
+
+@app.route("/accounts", methods=["GET", "POST"])
+def manage_accounts():
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
+    conn = get_conn(); cur = conn.cursor()
+    msg = None
+    if request.method == "POST":
+        keep = set(request.form.getlist("active"))
+        cur.execute("SELECT account_id FROM account;")
+        all_ids = [str(r[0]) for r in cur.fetchall()]
+        on = [i for i in all_ids if i in keep]
+        off = [i for i in all_ids if i not in keep]
+        if on:
+            cur.execute("UPDATE account SET is_active=true WHERE account_id::text = ANY(%s);", (on,))
+        if off:
+            cur.execute("UPDATE account SET is_active=false WHERE account_id::text = ANY(%s);", (off,))
+        conn.commit()
+        msg = f"Saved — {len(on)} account{'' if len(on)==1 else 's'} showing, {len(off)} hidden."
+    # one grouped query for counts, rather than one per account
+    cur.execute("SELECT account_id, count(*) FROM book_txn GROUP BY account_id;")
+    counts = {str(a): n for a, n in cur.fetchall()}
+    cur.execute("SELECT account_id, name, type, currency, coalesce(is_active,true) FROM account ORDER BY type, name;")
+    rows = [{"id": str(a), "name": n, "type": t, "currency": c, "active": act,
+             "n": counts.get(str(a), 0)} for a, n, t, c, act in cur.fetchall()]
+    cur.close(); conn.close()
+    return render_template_string(ACCOUNTS_TEMPLATE, rows=rows, msg=msg)
+
+
 @app.route("/users", methods=["GET", "POST"])
 def users():
     if not session.get("is_admin"):
@@ -1025,7 +1077,7 @@ def require_login():
         return redirect(url_for("login"))
 
 CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('manage_accounts') }}">Accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap style="max-width:440px">
 <h1>Change password</h1>
 <div class=sub>Set a new password for signing in.</div>
@@ -1442,7 +1494,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}{% if session.is_admin %}<a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
 <div class=wrap>
 <h1>All accounts</h1>
-<div class=sub>Updated {{ now }} EAT</div>
+<div class=sub>Updated {{ now }} EAT{% if n_hidden %} · {{ n_hidden }} account{{ '' if n_hidden==1 else 's' }} hidden{% if session.is_admin %} · <a href="{{ url_for('manage_accounts') }}" style="color:var(--accent);font-weight:600">manage</a>{% endif %}{% endif %}</div>
 <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
 {% if qbo_connected %}<span style="color:var(--ok);font-size:13px;font-weight:600">● Connected to QuickBooks</span>
 <form method=post action="{{ url_for('check_connection') }}" style="margin:0"><button type=submit class=btn-sm>Check connection</button></form>
@@ -1540,9 +1592,11 @@ window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(h
 @app.route("/")
 def dashboard():
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, name, type, currency FROM account ORDER BY type, name;")
+    cur.execute("SELECT account_id, name, type, currency FROM account WHERE coalesce(is_active,true) ORDER BY type, name;")
     accts = cur.fetchall()
     rows = [account_summary(cur, a, n, t, ccy) for a, n, t, ccy in accts]
+    cur.execute("SELECT count(*) FROM account WHERE NOT coalesce(is_active,true);")
+    n_hidden = cur.fetchone()[0]
     cur.close(); conn.close()
     n_recon = sum(1 for r in rows if r["status"] != "none")
     n_signed = sum(1 for r in rows if r["status"] == "signed")
@@ -1550,7 +1604,7 @@ def dashboard():
     sync_msg = session.pop("sync_msg", None)
     _has_token = bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", ""))
     qbo_connected = _has_token and get_config("qbo_conn") != "disconnected"
-    return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed,
+    return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed, n_hidden=n_hidden,
                                   tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
 
