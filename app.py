@@ -456,6 +456,8 @@ try:
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_at timestamptz;")
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_by text;")
     _cur.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_book_txn_amt_date ON book_txn (amount, posted_date);")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_line_amt_date ON statement_line (amount, posted_date);")
     _c.commit(); _cur.close(); _c.close()
 except Exception as e:
     print("startup check:", e)
@@ -1713,6 +1715,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </form>{% endif %}</td>
 </tr>{% endfor %}</table>
 {% endif %}
+{% if n_xfer %}<h2 id=sec-exceptions style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
+<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 nothing is matched or written back. Confirm each one before acting. If a pair is a genuine transfer, record it once as a Transfer in QuickBooks, not as two separate transactions.</div>
+<table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
+{% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
+<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td>
+<td><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
+<td style="font-size:12px;color:var(--muted)">{{ c.note }}</td></tr>
+{% endfor %}{% endif %}{% endfor %}</table>{% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
@@ -1755,6 +1765,74 @@ def _ensure_snapshot_cols(cur):
     for col, typ in (("snap_exact", "int"), ("snap_fuzzy", "int"), ("snap_m2o", "int"),
                      ("snap_exc", "int"), ("snap_diff", "numeric")):
         cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {col} {typ};")
+
+
+TRANSFER_WINDOW_DAYS = 4      # how far apart the two sides of a transfer may sit
+TRANSFER_EXACT_ONLY = True    # fees charged as separate debits, so amounts should tie exactly
+
+
+def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_DAYS):
+    """Find likely own-transfer counterparts on OTHER accounts.
+
+    Two fingerprints, deliberately kept apart because they mean different things:
+
+      Rule 1 (opposite sign, other account's STATEMENT) -- the money visibly left one
+      bank and arrived at another but was never recorded. Also catches in-transit items
+      straddling a period end.
+
+      Rule 2 (same sign, other account's BOOKS) -- the entry exists in QuickBooks but
+      against the wrong bank, so that account shows a book entry its statement will
+      never confirm.
+
+    Suggestions only. Nothing here auto-matches or writes anything back.
+    """
+    if not unmatched_lines:
+        return {}
+    ids = [str(l[0]) for l in unmatched_lines]
+    dts = [l[1] for l in unmatched_lines]
+    amts = [l[2] for l in unmatched_lines]
+    out = {}
+
+    # Rule 1: unmatched statement line on another account, opposite sign
+    cur.execute("""
+        WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
+        SELECT un.line_id, a.name, sl.posted_date, sl.amount,
+               coalesce(sl.counterparty, sl.description, '')
+        FROM un
+        JOIN statement s ON s.account_id <> %s
+        JOIN statement_line sl ON sl.statement_id = s.statement_id
+                              AND sl.amount = -un.amt
+                              AND sl.posted_date BETWEEN un.d - %s AND un.d + %s
+        JOIN account a ON a.account_id = s.account_id
+        WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
+                          JOIN match m ON m.match_id = msl.match_id
+                          WHERE msl.line_id = sl.line_id AND m.status <> 'rejected');
+    """, (ids, dts, amts, acct_uuid, window, window))
+    for lid, nm, d, a, who in cur.fetchall():
+        out.setdefault(str(lid), []).append(
+            {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who,
+             "note": "Opposite entry on another bank statement, not recorded in QuickBooks either side."})
+
+    # Rule 2: unmatched BOOK transaction on another account, same sign
+    cur.execute("""
+        WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
+        SELECT un.line_id, a.name, bt.posted_date, bt.amount,
+               coalesce(bt.counterparty, bt.description, '')
+        FROM un
+        JOIN book_txn bt ON bt.account_id <> %s
+                        AND bt.amount = un.amt
+                        AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
+        JOIN account a ON a.account_id = bt.account_id
+        WHERE coalesce(bt.is_void, false) = false AND coalesce(bt.is_deleted, false) = false
+          AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
+                          JOIN match m ON m.match_id = mbt.match_id
+                          WHERE mbt.txn_id = bt.txn_id AND m.status <> 'rejected');
+    """, (ids, dts, amts, acct_uuid, window, window))
+    for lid, nm, d, a, who in cur.fetchall():
+        out.setdefault(str(lid), []).append(
+            {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who,
+             "note": "Recorded in QuickBooks against this account instead \u2014 likely posted to the wrong bank."})
+    return out
 
 
 def compute_detail(cur, acct_uuid, atype="bank"):
@@ -1812,7 +1890,14 @@ def compute_detail(cur, acct_uuid, atype="bank"):
             deposits.append({"line_id": lid, "date": dd, "amount": a, "who": who})
         else:
             on_stmt_in.append((lid, dd, a, who))
-    return {"has_results": True, "p_start": ps, "p_end": pe,
+    _unmatched = [l for l in lines if l[0] not in ml]
+    _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
+    try:
+        xfers = transfer_candidates(cur, acct_uuid, _unmatched)
+    except Exception:
+        xfers = {}   # a suggestion engine must never break the reconciliation itself
+    return {"xfers": xfers, "n_xfer": sum(len(v) for v in xfers.values()), "all_unmatched": _all_unmatched,
+            "has_results": True, "p_start": ps, "p_end": pe,
             "signed_off": signed.strftime("%Y-%m-%d") if signed else None,
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
