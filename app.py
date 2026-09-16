@@ -14,6 +14,7 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta, date
 from flask import Flask, render_template_string, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
+from markupsafe import escape
 import json, base64, urllib.request, urllib.parse, urllib.error
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
@@ -682,7 +683,21 @@ tbody tr:hover{background:#f7f9fb}
 #loadingov .msg{color:var(--muted);font-size:14px;font-weight:600}
 @keyframes spin{to{transform:rotate(360deg)}}
 .appfoot{max-width:1000px;margin:0 auto;padding:22px 24px 44px;color:#9ca3af;font-size:13px;text-align:center}.appfoot a{color:#6b7280;font-weight:500}.appfoot a:hover{color:var(--accent)}
+.pw-wrap{position:relative}
+.pw-wrap input{padding-right:42px !important}
+.pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;height:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:var(--muted);display:flex}
+.pw-toggle:hover{color:var(--ink)}
+.pw-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 </style>"""
+
+# Reusable show/hide-password eye icon: EYE_ICON = "click to reveal" state, EYE_OFF_ICON = "click to hide" state.
+EYE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>'
+EYE_OFF_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.27 21.27 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 7 11 7a21.27 21.27 0 0 1-4.22 5.06"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>'
+PW_TOGGLE_JS = ("function togglePw(btn,id){var i=document.getElementById(id);if(!i)return;"
+                 "var showing=i.type==='text';i.type=showing?'password':'text';"
+                 "btn.setAttribute('aria-pressed',showing?'false':'true');"
+                 "btn.setAttribute('aria-label',showing?'Show password':'Hide password');"
+                 "btn.innerHTML=showing?" + repr(EYE_ICON) + ":" + repr(EYE_OFF_ICON) + ";}")
 
 LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · Reconciliation Tool</title>
 <style>
@@ -699,6 +714,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 label{display:block;font-size:12px;font-weight:600;color:#475467;margin-bottom:7px;text-transform:uppercase;letter-spacing:.05em}
 input{width:100%;padding:12px 13px;border:1px solid #d8dee6;border-radius:10px;font-size:15px;outline:none;transition:border-color .15s,box-shadow .15s}
 input:focus{border-color:#0f766e;box-shadow:0 0 0 3px #d6efea}
+.pw-wrap{position:relative}
+.pw-wrap input{padding-right:42px}
+.pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:#98a2b3;display:flex}
+.pw-toggle:hover{color:#475467}
+.pw-toggle:focus-visible{outline:2px solid #0f766e;outline-offset:1px}
 button{width:100%;margin-top:18px;padding:12px;background:#16202e;color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:15px;font-weight:600;transition:opacity .15s}
 button:hover{opacity:.92}
 .err{color:#b42318;font-size:13px;margin-top:13px;background:#fbe2de;padding:9px 12px;border-radius:8px}
@@ -712,13 +732,17 @@ button:hover{opacity:.92}
 <label for=un>Username</label>
 <input id=un type=text name=username placeholder="Your username" autocapitalize=off autofocus>
 <label for=pw style="display:block;margin-top:16px">Password</label>
+<div class=pw-wrap>
 <input id=pw type=password name=password placeholder="Enter your password">
+<button type=button class=pw-toggle onclick="togglePw(this,'pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button>
+</div>
 <button type=submit>Sign in</button>
 {% if error %}<div class=err>{{ error }}</div>{% endif %}
 </form>
 <details style="margin-top:14px"><summary style="cursor:pointer;color:#667085;font-size:13px">Forgot password?</summary><div style="color:#98a2b3;font-size:12.5px;margin-top:8px;line-height:1.55">The password originally set up for this app still works as a recovery key. Sign in with that, then change your password from the menu.</div></details>
 <div class=foot>Private · access by password<br><a href="{{ url_for('terms') }}" style="color:#98a2b3">Terms</a> · <a href="{{ url_for('privacy') }}" style="color:#98a2b3">Privacy</a> · <a href="mailto:{{ contact_email }}" style="color:#98a2b3">Contact</a></div>
 </div>
+<script>""" + PW_TOGGLE_JS + """</script>
 </body></html>"""
 
 
@@ -1106,16 +1130,21 @@ CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=vi
 <div class=sub>Set a new password for signing in.</div>
 <form method=post>
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Current password</label>
-<input type=password name=current autofocus style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<div class=pw-wrap><input id=cpw-cur type=password name=current autofocus style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<button type=button class=pw-toggle onclick="togglePw(this,'cpw-cur')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div>
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em">New password</label>
-<input type=password name=new style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<div class=pw-wrap><input id=cpw-new type=password name=new style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<button type=button class=pw-toggle onclick="togglePw(this,'cpw-new')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div>
 <label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em">Confirm new password</label>
-<input type=password name=confirm style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<div class=pw-wrap><input id=cpw-confirm type=password name=confirm style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+<button type=button class=pw-toggle onclick="togglePw(this,'cpw-confirm')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div>
 <button type=submit class=btn style="margin-top:18px;width:100%">Update password</button>
 {% if error %}<div style="color:var(--bad);font-size:13px;margin-top:13px;background:var(--bad-soft);padding:9px 12px;border-radius:8px">{{ error }}</div>{% endif %}
 </form>
 <div class=sub style="margin-top:22px;font-size:13px;line-height:1.55">Forgot your password? The password originally set up for this app always works as a recovery key — sign in with that, then change it here.</div>
-</div></body></html>"""
+</div>
+<script>""" + PW_TOGGLE_JS + """</script>
+</body></html>"""
 
 
 @app.route("/change-password", methods=["GET", "POST"])
@@ -1647,6 +1676,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
 <div class=u-label>Books from QuickBooks (CSV export) · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
 <input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
+{% if session.is_admin %}
 <div style="margin-top:15px;border-top:1px solid var(--line-soft);padding-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
 <form method=post action="{{ url_for('clear_account', name=name) }}" onsubmit="return confirm('Clear ALL statements and book transactions for this account? This removes old synced or imported data so you can start fresh offline. This cannot be undone.');" style="display:inline">
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Clear this account&#39;s data</button></form>
@@ -1654,6 +1684,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Delete account</button></form>
 <span style="color:var(--muted);font-size:12px">Removes old synced/imported data for a clean offline slate</span>
 </div>
+{% endif %}
 </div>
 {% if has_results %}
 <div class=tiles id=dtiles>
@@ -1930,7 +1961,7 @@ def upload(name):
         run_matcher(sid)
         session["detail_msg"] = f"Loaded {n} statement lines and reconciled."
     except Exception as e:
-        return f"Could not process file: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
@@ -1956,7 +1987,7 @@ def import_books(name):
             c2.commit(); cu2.close(); c2.close()
         session["detail_msg"] = f"Imported {n} book transactions."
     except Exception as e:
-        return f"Could not import books: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"Could not import books: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
@@ -2057,9 +2088,9 @@ def writeback(name, line_id):
     except urllib.error.HTTPError as e:
         try: body = e.read().decode()[:300]
         except Exception: body = ""
-        return f"QuickBooks rejected it (HTTP {e.code}): {body} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"QuickBooks rejected it (HTTP {e.code}): {escape(body)} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     except Exception as e:
-        return f"Write-back failed: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"Write-back failed: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
@@ -2108,9 +2139,9 @@ def deposit_writeback(name, line_id):
     except urllib.error.HTTPError as e:
         try: body = e.read().decode()[:300]
         except Exception: body = ""
-        return f"QuickBooks rejected it (HTTP {e.code}): {body} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"QuickBooks rejected it (HTTP {e.code}): {escape(body)} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     except Exception as e:
-        return f"Deposit write-back failed: {e} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+        return f"Deposit write-back failed: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
@@ -2131,7 +2162,7 @@ def qbo_import_csv(name):
     cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
-        cur.close(); conn.close(); return f"No account named {name}"
+        cur.close(); conn.close(); return f"No account named {escape(name)}"
     acct_uuid, atype = row
     d = compute_detail(cur, acct_uuid, atype)
     cur.close(); conn.close()
@@ -2166,7 +2197,7 @@ def exceptions_csv(name):
     cur.execute("SELECT account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
-        cur.close(); conn.close(); return f"No account named {name}"
+        cur.close(); conn.close(); return f"No account named {escape(name)}"
     acct_uuid, atype = row
     d = compute_detail(cur, acct_uuid, atype)
     cur.close(); conn.close()
@@ -2262,7 +2293,7 @@ def diag(name):
     cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
-        return f"No account named {name}"
+        return f"No account named {escape(name)}"
     acct, atype, ccy = row
     o.append(f"ACCOUNT  name={name}  type={atype}  currency={ccy}")
     o.append(f"         id={acct}")
@@ -2305,11 +2336,13 @@ def diag(name):
              AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false);""", (sid, acct))
         o.append(f"         bank lines matching a book amount with OPPOSITE sign: {cur.fetchone()[0]}")
     cur.close(); conn.close()
-    return "<pre style='font-size:13px;line-height:1.5;padding:24px;font-family:ui-monospace,monospace'>" + "\n".join(str(x) for x in o) + "</pre>"
+    return "<pre style='font-size:13px;line-height:1.5;padding:24px;font-family:ui-monospace,monospace'>" + str(escape("\n".join(str(x) for x in o))) + "</pre>"
 
 
 @app.route("/account/<name>/delete", methods=["POST"])
 def delete_account(name):
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
@@ -2330,6 +2363,8 @@ def delete_account(name):
 
 @app.route("/account/<name>/clear", methods=["POST"])
 def clear_account(name):
+    if not session.get("is_admin"):
+        return "Admins only. <a href='/'>Back</a>", 403
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
@@ -2376,7 +2411,7 @@ def callback():
     if not request.args.get("state") or request.args.get("state") != session.get("oauth_state"):
         return "Security check failed (state mismatch). Please try Connect again. <a href='/'>Back</a>", 400
     if request.args.get("error"):
-        return f"Connection was cancelled ({request.args.get('error')}). <a href='/'>Back</a>"
+        return f"Connection was cancelled ({escape(request.args.get('error'))}). <a href='/'>Back</a>"
     code = request.args.get("code")
     realm = request.args.get("realmId")
     if not code:
@@ -2397,7 +2432,7 @@ def callback():
     except urllib.error.HTTPError as e:
         try: body = e.read().decode()
         except Exception: body = ""
-        return f"Token exchange failed: HTTP {e.code} {body[:200]} <a href='/'>Back</a>"
+        return f"Token exchange failed: HTTP {e.code} {escape(body[:200])} <a href='/'>Back</a>"
     _store_refresh(tok.get("refresh_token"), realm)
     try: set_config("qbo_conn", "connected")
     except Exception: pass
