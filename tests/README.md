@@ -10,11 +10,13 @@ throwaway in-memory Postgres. **No suite ever talks to QuickBooks** — every Qu
 | `suite_reconciliation.py` | Statement import (date/amount formats, duplicate rows, running balances, OFX), the balance proof, carry-forward of outstanding items, footing and continuity checks, sign-off gating and override |
 | `suite_sync_deletions.py` | Sync: CDC deletions, moved and voided transactions, restored transactions, full-resync safety guard, company change, stale watermarks, CDC cap |
 | `suite_review_writeback.py` | Suggested matches waiting for review, books from QuickBooks, chart-of-accounts cache, write-back (single, bulk, retries, double-click protection), learned suggestions, the one-time migration |
+| `suite_manual_match.py` | Matching by hand (1-1, many-1, 1-many), differences in the balance proof, undo, validation, learning from hand-made matches, the duplicate guard on write-back |
+| `suite_ui.py` | The account page's own JavaScript run in a simulated browser (jsdom): manual-match totals, closest-amount sorting, search, "Match it instead", bulk-record confirmation |
 | `suite_security.py` | CSRF tokens on every POST form, refusal of missing/forged/other-session tokens, session cookie flags |
 
 ## Running
 
-One-time setup (needs Python 3.11+ and Node.js 18+):
+One-time setup (needs Python 3.11+ and Node.js 20+; `npm install` fetches PGlite and jsdom):
 
 ```sh
 pip install -r requirements.txt

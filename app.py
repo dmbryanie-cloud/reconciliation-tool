@@ -774,7 +774,7 @@ class PostingMemory:
                        JOIN statement_line sl ON sl.line_id=msl.line_id
                        JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
                        JOIN account a ON a.account_id=bt.account_id
-                       WHERE m.status='confirmed' AND m.match_type IN ('exact','fuzzy')
+                       WHERE m.status='confirmed' AND (m.match_type IN ('exact','fuzzy') OR m.created_by='user')
                          AND bt.category IS NOT NULL AND NOT bt.is_deleted;""")
         for desc, amt, atype, cat, cp, ref in cur.fetchall():
             self._add(2, desc, _money_out(amt, atype), cat, cp, ref, 1)
@@ -895,6 +895,49 @@ def qbo_record_line(token, acct_qbo, atype, money_out, target_id, amount_abs, tx
         else:
             raise
     return entity, str((res.get(entity) or {}).get("Id") or ""), payee_ref if "EntityRef" in body else None
+
+
+DUP_WINDOW_DAYS = 45   # how far apart a bank line and its QuickBooks twin can plausibly be dated
+
+
+def possible_duplicates(cur, acct_uuid, lines):
+    """{line_id: [...]} QuickBooks transactions that look like the same money as these unmatched
+    bank lines -- same amount within DUP_WINDOW_DAYS and not matched to anything yet. Recording
+    such a line would put a duplicate in the books."""
+    if not lines:
+        return {}
+    cur.execute("""WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
+                   SELECT un.line_id, bt.txn_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
+                   FROM un JOIN book_txn bt ON bt.account_id=%s AND bt.amount=un.amt
+                        AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
+                   WHERE NOT bt.is_deleted AND NOT bt.is_void
+                     AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt JOIN match m ON m.match_id=mbt.match_id
+                                     WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed')
+                   ORDER BY abs(bt.posted_date - un.d);""",
+                ([str(l[0]) for l in lines], [l[1] for l in lines], [l[2] for l in lines], acct_uuid,
+                 DUP_WINDOW_DAYS, DUP_WINDOW_DAYS))
+    out = {}
+    for lid, tid, d, a, who in cur.fetchall():
+        out.setdefault(str(lid), []).append({"txn_id": str(tid), "date": d, "amount": a, "who": who})
+    return out
+
+
+def match_sides(cur, match_ids):
+    """({match_id: [(date, amount, who)]} for statement lines, same for book txns)."""
+    sls, bts = {}, {}
+    ids = [str(m) for m in match_ids]
+    if ids:
+        cur.execute("""SELECT msl.match_id, sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
+                       FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id
+                       WHERE msl.match_id = ANY(%s::uuid[]) ORDER BY sl.posted_date;""", (ids,))
+        for mid, d, a, w in cur.fetchall():
+            sls.setdefault(str(mid), []).append((d, a, w))
+        cur.execute("""SELECT mbt.match_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
+                       FROM match_book_txn mbt JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                       WHERE mbt.match_id = ANY(%s::uuid[]) ORDER BY bt.posted_date;""", (ids,))
+        for mid, d, a, w in cur.fetchall():
+            bts.setdefault(str(mid), []).append((d, a, w))
+    return sls, bts
 
 
 def _claim_writeback(line_id, user):
@@ -1031,6 +1074,20 @@ tbody tr:hover{background:#f7f9fb}
 .rectbl select{width:230px}.rectbl input.payee{width:150px}
 .booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dupwarn{margin-top:6px;padding:7px 9px;border-radius:7px;background:#fffbeb;border:1px solid #fde68a;color:#92400e;font-size:12.5px;line-height:1.45;white-space:normal}
+.dupwarn .btn-sm{margin-top:5px}
+.mmgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.mmcol{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.mmhead{padding:10px 12px;border-bottom:1px solid var(--line-soft);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;color:var(--muted);display:flex;gap:8px;align-items:center;justify-content:space-between}
+.mmsearch{padding:5px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;width:55%;text-transform:none;letter-spacing:0}
+.mmlist{max-height:340px;overflow:auto}
+.mmrow{display:grid;grid-template-columns:22px 86px 1fr auto;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
+.mmrow:hover{background:#f7f9fb}.mmrow.on{background:var(--accent-soft)}
+.mmrow .mmw{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mmrow .a{font-variant-numeric:tabular-nums}
+.mmbar{position:sticky;bottom:0;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0 26px;padding:12px 16px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);font-size:14px;font-variant-numeric:tabular-nums}
+.mmbar .ok{color:var(--ok);font-weight:600}.mmbar .warn{color:var(--warn);font-weight:600}
+@media (max-width:760px){.mmgrid{grid-template-columns:1fr}}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
 @media (max-width:760px){
   .tiles{grid-template-columns:repeat(2,1fr)}
@@ -2000,14 +2057,14 @@ def run_matcher(statement_id):
     cur.execute("""SELECT m.match_type, m.confidence, m.status, m.amount_delta,
                           array(SELECT line_id::text FROM match_statement_line WHERE match_id=m.match_id),
                           array(SELECT txn_id::text FROM match_book_txn WHERE match_id=m.match_id),
-                          m.confirmed_by, m.confirmed_at
+                          m.confirmed_by, m.confirmed_at, m.created_by
                    FROM match m WHERE m.statement_id=%s AND m.status IN ('confirmed','rejected');""", (statement_id,))
     pinned, rejected = [], {}
-    for mt, conf, st, delta, ls, ts, by, at in cur.fetchall():
+    for mt, conf, st, delta, ls, ts, by, at, origin in cur.fetchall():
         if st == "rejected":
-            rejected[(mt, frozenset(ls), frozenset(ts))] = (mt, conf, delta, ls, ts, by, at)
+            rejected[(mt, frozenset(ls), frozenset(ts))] = (mt, conf, delta, ls, ts, by, at, origin)
         elif mt != "exact" or (conf is not None and conf < 1):
-            pinned.append((mt, conf, delta, ls, ts, by, at))
+            pinned.append((mt, conf, delta, ls, ts, by, at, origin))   # user-confirmed, or matched by hand
     cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match_book_txn WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match WHERE statement_id=%s;", (statement_id,))
@@ -2016,17 +2073,17 @@ def run_matcher(statement_id):
     txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
     used, matched_lines, matches = set(), set(), []
-    def add(lids, tids, mt, conf, delta, status=None, by=None, at=None):
+    def add(lids, tids, mt, conf, delta, status=None, by=None, at=None, origin="engine"):
         # Only an exact amount on (nearly) the same date is safe to accept unseen.
         status = status or ("confirmed" if mt == "exact" and conf >= 1 else "proposed")
-        matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids, status, by, at))
+        matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids, status, by, at, origin or "engine"))
     def ok(mt, lids, tids):
         return (mt, frozenset(map(str, lids)), frozenset(map(str, tids))) not in rejected
 
     line_ids = {str(l[0]) for l in lines}; pool_ids = {str(t[0]) for t in txns}
-    for mt, conf, delta, ls, ts, by, at in pinned:
+    for mt, conf, delta, ls, ts, by, at, origin in pinned:
         if set(ls) <= line_ids and set(ts) <= pool_ids and not (set(ts) & used) and not (set(ls) & matched_lines):
-            add(ls, ts, mt, float(conf or 0), delta, "confirmed", by, at)
+            add(ls, ts, mt, float(conf or 0), delta, "confirmed", by, at, origin)
             used.update(ts); matched_lines.update(ls)
     used = {str(u) for u in used}; matched_lines = {str(m) for m in matched_lines}
     lines = [(str(a), b, c, d) for a, b, c, d in lines]
@@ -2125,15 +2182,15 @@ def run_matcher(statement_id):
                 used.add(t_id); matched_lines.add(l_id); break
 
     # Rejected pairings stay on record (so they can be restored) but claim nothing.
-    for mt, conf, delta, ls, ts, by, at in rejected.values():
+    for mt, conf, delta, ls, ts, by, at, origin in rejected.values():
         if set(ls) <= line_ids and set(ts) <= pool_ids:
-            add(ls, ts, mt, float(conf or 0), delta, "rejected", by, at)
+            add(ls, ts, mt, float(conf or 0), delta, "rejected", by, at, origin)
 
     # bulk insert (few round-trips instead of hundreds)
     if matches:
         execute_values(cur,
-            "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta, confirmed_by, confirmed_at) VALUES %s",
-            [(m[0], ORG_ID, statement_id, m[6], m[1], m[2], m[3], m[7], m[8]) for m in matches])
+            "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta, confirmed_by, confirmed_at, created_by) VALUES %s",
+            [(m[0], ORG_ID, statement_id, m[6], m[1], m[2], m[3], m[7], m[8], m[9]) for m in matches])
         msl = [(m[0], lid) for m in matches for lid in m[4]]
         if msl:
             execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", msl)
@@ -2250,6 +2307,7 @@ document.addEventListener('submit',function(e){
 if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
 if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
+else if(act.indexOf('/match')>-1||act.indexOf('/unmatch')>-1)t='Matching...';
 if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
 else if(act.indexOf('/import_books')>-1)t='Importing your books...';
 else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
@@ -2413,16 +2471,19 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <form method=post action="{{ url_for('record', name=name) }}" id=recform>
 <table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
 {% for w in writebacks + deposits %}<tr>
-<td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.acct_id %}checked{% endif %}>{% endif %}</td>
+<td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.acct_id and not w.dups %}checked{% endif %}>{% endif %}</td>
 <td>{{ w.date }}</td>
-<td style="white-space:normal;max-width:280px">{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}</td>
+<td style="white-space:normal;max-width:280px">{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
+{% if w.dups and not w.wb %}<div class=dupwarn>&#9888; QuickBooks may already have this: {% for x in w.dups %}{{ x.date }} · {{ x.amount|money }}{% if x.who %} · {{ x.who }}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}.
+{% if w.dup_matchable %}<br><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable }}">Match it instead</button>
+{% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh.{% endif %}</div>{% endif %}</td>
 <td class=a>{{ w.amount|money }}</td>
 {% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px">I checked — it's not in QuickBooks</button></td>
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
 <td><select name="acct_{{ w.line_id }}" class=acct data-dir="{{ 'out' if w.out else 'in' }}" data-sel="{{ w.acct_id or '' }}" aria-label="Account"></select>{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
-<td><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class=payee aria-label="Payee"><input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
+<td><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class=payee aria-label="Payee">{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm>Record</button></td>
 {% endif %}
 </tr>{% endfor %}</table>
@@ -2449,6 +2510,68 @@ if(f)f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='
   if(!n){e.preventDefault();return}
   if(!confirm('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString(undefined,{minimumFractionDigits:2})+' in QuickBooks?'))e.preventDefault();});
 })();</script>
+{% endif %}
+{% if all_unmatched or in_books or user_matches %}
+<h2 id=sec-manual style="font-size:15px">Match manually</h2>
+<div class=sub style="margin:-4px 0 12px">Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</div>
+{% if user_matches %}
+<table><tr><th>Matched by you</th><th>Statement side</th><th>Books side</th><th class=a>Difference</th><th></th></tr>
+{% for u in user_matches %}<tr>
+<td class=hint>{{ u.by or '' }}{% if u.at %}<br>{{ u.at.strftime('%Y-%m-%d') }}{% endif %}</td>
+<td>{% for d,a,w in u.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
+<td>{% for d,a,w in u.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
+<td class=a>{% if u.delta %}<span class=warn>{{ u.delta|money }}</span>{% else %}0.00{% endif %}</td>
+<td><form method=post action="{{ url_for('unmatch', name=name, match_id=u.id) }}"><button type=submit class=btn-sm>Undo</button></form></td>
+</tr>{% endfor %}</table>
+{% endif %}
+{% if all_unmatched and in_books %}
+<form method=post action="{{ url_for('manual_match', name=name) }}" id=mmform>
+<div class=mmgrid>
+<div class=mmcol><div class=mmhead>Bank statement ({{ all_unmatched|length }}) <input class=mmsearch data-list=mml placeholder="Search" aria-label="Search bank lines"></div>
+<div class=mmlist id=mml>{% for lid, d, a, who in all_unmatched %}<label class=mmrow data-amt="{{ a }}" data-date="{{ d }}" data-text="{{ who|lower }} {{ a }} {{ d }}"><input type=checkbox name=ml value="{{ lid }}"><span class=hint>{{ d }}</span><span class=mmw title="{{ who }}">{{ who }}</span><span class=a>{{ a|money }}</span></label>{% endfor %}</div></div>
+<div class=mmcol><div class=mmhead>QuickBooks ({{ in_books|length }}) <input class=mmsearch data-list=mmb placeholder="Search" aria-label="Search QuickBooks transactions"></div>
+<div class=mmlist id=mmb>{% for tid, d, a, who in in_books %}<label class=mmrow data-amt="{{ a }}" data-date="{{ d }}" data-text="{{ who|lower }} {{ a }} {{ d }}"><input type=checkbox name=mb value="{{ tid }}"><span class=hint>{{ d }}</span><span class=mmw title="{{ who }}">{{ who }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</span><span class=a>{{ a|money }}</span></label>{% endfor %}</div></div>
+</div>
+<div class=mmbar><span id=mmsum>Tick at least one item on each side.</span><button type=submit class=btn id=mmgo disabled>Match selected</button></div>
+</form>
+<script>(function(){
+var f=document.getElementById('mmform');if(!f)return;
+function num(x){return parseFloat(x)||0}
+function rowsOf(id){return Array.prototype.slice.call(document.querySelectorAll('#'+id+' .mmrow'))}
+function picked(id){return rowsOf(id).filter(function(r){return r.querySelector('input').checked})}
+function fmt(v){return v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+var diff=0;
+function update(rank){
+  var L=picked('mml'),B=picked('mmb'),sl=0,sb=0;
+  rowsOf('mml').concat(rowsOf('mmb')).forEach(function(r){r.classList.toggle('on',r.querySelector('input').checked)});
+  L.forEach(function(r){sl+=num(r.getAttribute('data-amt'))});B.forEach(function(r){sb+=num(r.getAttribute('data-amt'))});
+  diff=Math.round((sl-sb)*100)/100;
+  var s=document.getElementById('mmsum'),go=document.getElementById('mmgo');
+  if(!L.length||!B.length){s.textContent='Tick at least one item on each side.';s.className='';go.disabled=true}
+  else{s.textContent='Bank '+fmt(sl)+'  ·  QuickBooks '+fmt(sb)+'  ·  Difference '+fmt(diff);s.className=diff===0?'ok':'warn';go.disabled=false}
+  if(rank&&L.length){   // closest remaining amount first, then closest date
+    var target=sl-sb,d0=new Date(L[0].getAttribute('data-date')).getTime(),box=document.getElementById('mmb');
+    rowsOf('mmb').sort(function(a,b){
+      var ca=a.querySelector('input').checked,cb=b.querySelector('input').checked;if(ca!==cb)return ca?-1:1;
+      var x=Math.abs(num(a.getAttribute('data-amt'))-target)-Math.abs(num(b.getAttribute('data-amt'))-target);if(x)return x;
+      return Math.abs(new Date(a.getAttribute('data-date')).getTime()-d0)-Math.abs(new Date(b.getAttribute('data-date')).getTime()-d0);
+    }).forEach(function(r){box.appendChild(r)});box.scrollTop=0;
+  }
+}
+document.getElementById('mml').addEventListener('change',function(){update(true)});
+document.getElementById('mmb').addEventListener('change',function(){update(false)});
+document.querySelectorAll('.mmsearch').forEach(function(inp){inp.addEventListener('input',function(){
+  var q=inp.value.trim().toLowerCase().replace(/,/g,'');
+  rowsOf(inp.getAttribute('data-list')).forEach(function(r){r.style.display=!q||r.getAttribute('data-text').indexOf(q)>-1?'':'none'})})});
+document.querySelectorAll('.mm-open').forEach(function(b){b.addEventListener('click',function(){
+  f.querySelectorAll('input[type=checkbox]').forEach(function(c){c.checked=false});
+  var l=f.querySelector('input[name=ml][value="'+b.getAttribute('data-line')+'"]'),t=f.querySelector('input[name=mb][value="'+b.getAttribute('data-txn')+'"]');
+  if(l)l.checked=true;if(t)t.checked=true;update(true);
+  document.getElementById('sec-manual').scrollIntoView({behavior:'smooth',block:'start'});})});
+f.addEventListener('submit',function(e){if(diff!==0&&!confirm('The two sides differ by '+fmt(diff)+'. Match anyway? The difference will show under amount differences.'))e.preventDefault()});
+update(false);
+})();</script>
+{% endif %}
 {% endif %}
 {% if n_xfer %}<h2 id=sec-exceptions style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 nothing is matched or written back. Confirm each one before acting. If a pair is a genuine transfer, record it once as a Transfer in QuickBooks, not as two separate transactions.</div>
@@ -2484,6 +2607,7 @@ document.addEventListener('submit',function(e){
 if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
 if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
+else if(act.indexOf('/match')>-1||act.indexOf('/unmatch')>-1)t='Matching...';
 if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
 else if(act.indexOf('/import_books')>-1)t='Importing your books...';
 else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
@@ -2680,22 +2804,19 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     reviewable = []
     cur.execute("""SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s
                    AND (match_type IN ('fuzzy','many_to_one','manual') OR (match_type='exact' AND confidence < 1))
+                   AND created_by <> 'user'
                    ORDER BY status='proposed' DESC, match_type;""", (sid,))
     rmatches = cur.fetchall()
-    rids = [str(r[0]) for r in rmatches]
-    sls_by, bts_by = {}, {}
-    if rids:
-        cur.execute("""SELECT msl.match_id, sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
-                       FROM match_statement_line msl JOIN statement_line sl ON sl.line_id=msl.line_id
-                       WHERE msl.match_id = ANY(%s::uuid[]) ORDER BY sl.posted_date;""", (rids,))
-        for mid_, d, a, w in cur.fetchall(): sls_by.setdefault(str(mid_), []).append((d, a, w))
-        cur.execute("""SELECT mbt.match_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
-                       FROM match_book_txn mbt JOIN book_txn bt ON bt.txn_id=mbt.txn_id
-                       WHERE mbt.match_id = ANY(%s::uuid[]) ORDER BY bt.posted_date;""", (rids,))
-        for mid_, d, a, w in cur.fetchall(): bts_by.setdefault(str(mid_), []).append((d, a, w))
+    cur.execute("""SELECT match_id, amount_delta, confirmed_by, confirmed_at FROM match
+                   WHERE statement_id=%s AND created_by='user' AND status='confirmed' ORDER BY confirmed_at;""", (sid,))
+    umatches = cur.fetchall()
+    sls_by, bts_by = match_sides(cur, [r[0] for r in rmatches] + [r[0] for r in umatches])
     for mid, mtype, status, delta in rmatches:
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])})
+    user_matches = [{"id": mid, "delta": delta, "by": by, "at": at,
+                     "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])}
+                    for mid, delta, by, at in umatches]
     unmatched_lines = [l for l in lines if l[0] not in ml]
     mem = PostingMemory(cur) if unmatched_lines else None
     coa = load_coa(cur)
@@ -2704,6 +2825,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         cur.execute("SELECT line_id, status, qbo_id FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
                     ([str(l[0]) for l in unmatched_lines],))
         wb = {str(r[0]): (r[1], r[2]) for r in cur.fetchall()}
+    dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
+    pool_ids = {str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
     for (lid, dd, a, who) in unmatched_lines:
         if a == 0:
@@ -2720,7 +2843,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
                 "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
                 "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done") else None,
-                "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not}
+                "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not,
+                "dups": dups.get(str(lid), [])[:3]}
+        item["dup_matchable"] = next((x["txn_id"] for x in item["dups"] if x["txn_id"] in pool_ids), None)
         (writebacks if out else deposits).append(item)
     _unmatched = [l for l in lines if l[0] not in ml]
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
@@ -2735,7 +2860,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
-            "n_pending": rec["n_pending"],
+            "n_pending": rec["n_pending"], "user_matches": user_matches,
             "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"]} for a in coa]).replace("<", "\\u003c"))}
 
 
@@ -2872,6 +2997,70 @@ def review_all(name):
     return redirect(url_for("detail", name=name) + "#sec-review")
 
 
+@app.route("/account/<name>/match", methods=["POST"])
+def manual_match(name):
+    """Pair bank lines with QuickBooks transactions by hand (any shape: 1-1, many-1, 1-many)."""
+    lids = list(dict.fromkeys(request.form.getlist("ml")))
+    tids = list(dict.fromkeys(request.form.getlist("mb")))
+    back = redirect(url_for("detail", name=name) + "#sec-manual")
+    if not lids or not tids:
+        session["detail_msg"] = "Pick at least one bank line and one QuickBooks transaction."
+        return back
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    if not s:
+        cur.close(); conn.close(); return back
+    acct_uuid, (sid, ps, pe) = row[0], s[:3]
+    cur.execute("""SELECT line_id, amount FROM statement_line sl WHERE statement_id=%s AND line_id = ANY(%s::uuid[])
+                   AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                                   WHERE msl.line_id=sl.line_id AND m.status='confirmed');""", (sid, lids))
+    lines = cur.fetchall()
+    # Only book entries this statement can clear: dated up to its end, not cleared elsewhere.
+    pool = {str(t[0]): t for t in book_pool(cur, acct_uuid, sid, ps, pe)}
+    cur.execute("""SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
+                   WHERE m.statement_id=%s AND m.status='confirmed';""", (sid,))
+    taken = {str(r[0]) for r in cur.fetchall()}
+    txns = [pool[t] for t in tids if t in pool and t not in taken]
+    if len(lines) != len(lids) or len(txns) != len(tids):
+        cur.close(); conn.close()
+        session["detail_msg"] = "Some of those items were already matched or can't be matched to this statement. Reload and try again."
+        return back
+    delta = sum((l[1] for l in lines), Decimal(0)) - sum((t[2] for t in txns), Decimal(0))
+    mid = str(uuid.uuid4())
+    cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
+                                      created_by, confirmed_by, confirmed_at)
+                   VALUES (%s,%s,%s,'confirmed','manual',1,%s,'user',%s,now());""",
+                (mid, ORG_ID, sid, delta, session.get("name") or "user"))
+    execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", [(mid, str(l[0])) for l in lines])
+    execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, str(t[0])) for t in txns])
+    conn.commit(); cur.close(); conn.close()
+    _after_review(sid)   # re-match the rest around it; suggestions that used these items are replaced
+    session["detail_msg"] = (f"Matched {len(lines)} bank line{'' if len(lines) == 1 else 's'} to {len(txns)} "
+                             f"QuickBooks transaction{'' if len(txns) == 1 else 's'}."
+                             + (f" The difference of {_money(delta)} shows under amount differences." if delta else ""))
+    return back
+
+
+@app.route("/account/<name>/unmatch/<match_id>", methods=["POST"])
+def unmatch(name, match_id):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT m.statement_id FROM match m JOIN statement s ON s.statement_id=m.statement_id
+                   JOIN account a ON a.account_id=s.account_id
+                   WHERE m.match_id=%s AND m.created_by='user' AND a.name=%s;""", (match_id, name))
+    row = cur.fetchone()
+    if row:
+        cur.execute("DELETE FROM match_statement_line WHERE match_id=%s;", (match_id,))
+        cur.execute("DELETE FROM match_book_txn WHERE match_id=%s;", (match_id,))
+        cur.execute("DELETE FROM match WHERE match_id=%s;", (match_id,))
+    conn.commit(); cur.close(); conn.close()
+    if row:
+        _after_review(row[0])
+        session["detail_msg"] = "Match undone."
+    return redirect(url_for("detail", name=name) + "#sec-manual")
+
+
 @app.route("/account/<name>/record", methods=["POST"])
 def record(name):
     """Record selected unmatched bank lines in QuickBooks (Purchase for money out, Deposit for money in)."""
@@ -2894,6 +3083,7 @@ def record(name):
                                      WHERE msl.line_id=sl.line_id AND m.status='confirmed')
                    ORDER BY sl.posted_date;""", (s[0], ids))
     lines = cur.fetchall()
+    dups = possible_duplicates(cur, acct_uuid, lines)
     cur.close(); conn.close()
     done, problems, skipped = 0, [], 0
     token = None
@@ -2906,6 +3096,10 @@ def record(name):
             problems.append(f"{label}: choose an account"); continue
         if atype == "credit_card" and not out:
             problems.append(f"{label}: card payments/refunds aren't recorded from here"); continue
+        if dups.get(lid) and not request.form.get(f"dupok_{lid}"):
+            x = dups[lid][0]
+            problems.append(f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
+                            f"match it instead, or tick 'Not a duplicate'"); continue
         payee = (request.form.get(f"payee_{lid}") or "").strip()
         # Only reuse the learned payee ID if the user kept the suggested payee name.
         ref = request.form.get(f"pref_{lid}") or None

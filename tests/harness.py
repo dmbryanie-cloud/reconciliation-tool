@@ -42,7 +42,8 @@ CREATE TABLE statement_line (line_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 CREATE TABLE match (match_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), org_id uuid NOT NULL,
   statement_id uuid NOT NULL REFERENCES statement ON DELETE CASCADE, status text NOT NULL DEFAULT 'proposed',
   match_type text NOT NULL, confidence numeric, amount_delta numeric NOT NULL DEFAULT 0,
-  confirmed_by text, confirmed_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now());
+  created_by text NOT NULL DEFAULT 'engine', confirmed_by text, confirmed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE match_statement_line (match_id uuid REFERENCES match ON DELETE CASCADE,
   line_id uuid REFERENCES statement_line ON DELETE CASCADE, PRIMARY KEY (match_id, line_id));
 CREATE TABLE match_book_txn (match_id uuid REFERENCES match ON DELETE CASCADE,

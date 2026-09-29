@@ -4,6 +4,7 @@
   "description": "Throwaway in-memory Postgres (PGlite) used by the Python test suites",
   "dependencies": {
     "@electric-sql/pglite": "0.5.8",
-    "@electric-sql/pglite-socket": "0.2.11"
+    "@electric-sql/pglite-socket": "0.2.11",
+    "jsdom": "29.1.1"
   }
 }
