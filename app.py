@@ -2009,6 +2009,303 @@ def parse_ofx(text):
                      "fitid": tag("FITID")})
     return rows
 
+
+# ---------------- PDF statements ----------------
+# Bank PDFs have no fixed layout, so this reads positioned words, finds the table header
+# (Date ... Debit / Credit / Balance), and takes each line starting with a date as a transaction.
+# Nothing is guessed silently: signs come from the Debit/Credit columns or the running balance,
+# and when the statement has running balances every line must agree with them, or the upload
+# is refused with the lines that don't add up.
+
+PDF_MAX_PAGES = 300
+
+
+class PdfPasswordError(ValueError):
+    pass
+
+
+_MONEY_STRICT = re.compile(r"^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\)?-?(?:CR|DR|Cr|Dr|cr|dr)?$"
+                           r"|^\(?-?\d{1,3}(?:,\d{3})+\)?-?(?:CR|DR|Cr|Dr|cr|dr)?$")
+_PDF_COLS = {"debit": "debit", "debits": "debit", "withdrawal": "debit", "withdrawals": "debit", "dr": "debit",
+             "credit": "credit", "credits": "credit", "deposit": "credit", "deposits": "credit", "cr": "credit",
+             "lodgement": "credit", "lodgements": "credit", "receipts": "credit", "payments": "debit",
+             "balance": "balance", "bal": "balance", "amount": "amount"}
+_PDF_OPENING = re.compile(r"opening balance|brought forward|balance b/?f|\bb/f\b|balance at start|previous balance", re.I)
+_PDF_CLOSING = re.compile(r"closing balance|carried forward|balance c/?f|\bc/f\b|ending balance|balance at end", re.I)
+_PDF_SKIP = re.compile(r"^page \d+|\bpage \d+ of \d+|^total|^sub-?total|statement of account|continued", re.I)
+_PDF_DATE_FMTS = ("%d %b %Y", "%d-%b-%Y", "%d %B %Y", "%d-%b-%y", "%d %b %y", "%d/%b/%Y", "%d/%b/%y", "%d.%m.%Y",
+                  "%d.%m.%y", "%b %d, %Y", "%b %d %Y", "%B %d, %Y")
+_PDF_DATE_TOKEN = re.compile(r"^(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}[/-][A-Za-z]{3,9}[/-]?\d{0,4}|\d{1,2})$")
+
+
+def _pdf_one_date(s, dayfirst):
+    s = s.strip().rstrip(",")
+    if re.match(r"^\d{1,2}\.\d{1,2}\.\d{2,4}$", s):
+        s = s.replace(".", "/")
+    try:
+        return parse_date(s, dayfirst=dayfirst)
+    except ValueError:
+        pass
+    for fmt in _PDF_DATE_FMTS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _pdf_date(words, dayfirst):
+    """(date, words used) when the line starts with a date in any common layout, else (None, 0)."""
+    if not words or not _PDF_DATE_TOKEN.match(words[0]["text"]) and not re.match(r"^[A-Za-z]{3,9}$", words[0]["text"]):
+        return None, 0
+    for n in (3, 2, 1):
+        if len(words) >= n:
+            d = _pdf_one_date(" ".join(w["text"] for w in words[:n]), dayfirst)
+            if d and 1990 <= d.year <= 2100:
+                return d, n
+    return None, 0
+
+
+def _pdf_lines(page):
+    """Words grouped into visual lines, top to bottom, left to right."""
+    words = sorted(page.extract_words(keep_blank_chars=False, x_tolerance=1.5, y_tolerance=2),
+                   key=lambda w: (round(w["top"]), w["x0"]))
+    lines = []
+    for w in words:
+        if lines and abs(lines[-1][0]["top"] - w["top"]) <= 3:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return [sorted(l, key=lambda w: w["x0"]) for l in lines]
+
+
+def _pdf_header(line):
+    """{column: (x0, x1)} when this line is a statement table header."""
+    texts = [w["text"].lower().strip(":.()") for w in line]
+    if not any(t in ("date", "posted", "posting", "txn", "trans") or t.endswith("date") for t in texts):
+        return None
+    cols = {}
+    for i, (w, t) in enumerate(zip(line, texts)):
+        nxt = texts[i + 1] if i + 1 < len(texts) else ""
+        prev = texts[i - 1] if i else ""
+        col = _PDF_COLS.get(t)
+        if t in ("out", "in") and prev in ("money", "paid"):
+            col = "debit" if t == "out" else "credit"
+        if t == "value" and nxt != "date":
+            col = "amount"
+        if col == "debit" and t == "payments" and "withdrawals" in texts:
+            col = None
+        if col and col not in cols:
+            x0 = line[i - 1]["x0"] if t in ("out", "in") and prev in ("money", "paid") else w["x0"]
+            cols[col] = (x0, w["x1"])
+    if "balance" in cols and len(cols) == 1:
+        return None
+    return cols if cols and ("debit" in cols or "credit" in cols or "amount" in cols) else None
+
+
+def _pdf_col(w, cols):
+    """Which money column a number sits in: nearest header by centre or right edge (numbers are right-aligned)."""
+    c = (w["x0"] + w["x1"]) / 2
+    best = None
+    for name, (x0, x1) in cols.items():
+        dist = min(abs(c - (x0 + x1) / 2), abs(w["x1"] - x1))
+        if best is None or dist < best[0]:
+            best = (dist, name)
+    return best[1] if best and best[0] <= 60 else None
+
+
+def _pdf_money_tail(words, cols):
+    """Split a line into (description words, trailing money tokens). A lone CR/DR after a number
+    belongs to it. Plain integers only count when they sit under a money column."""
+    money, i = [], len(words)
+    while i > 0:
+        t = words[i - 1]["text"]
+        if t.upper() in ("CR", "DR") and i >= 2 and _MONEY_STRICT.match(words[i - 2]["text"]):
+            w = dict(words[i - 2]); w["text"] += t
+            money.insert(0, w); i -= 2; continue
+        # A bare number ("500") is money only when it stands apart from the text before it, under a
+        # money column -- not "INV 2231" at the end of a description.
+        gap = words[i - 1]["x0"] - words[i - 2]["x1"] if i >= 2 else 99
+        if _MONEY_STRICT.match(t) or (cols and re.match(r"^\d+$", t) and gap > 12 and _pdf_col(words[i - 1], cols)):
+            money.insert(0, words[i - 1]); i -= 1; continue
+        break
+    return words[:i], money
+
+
+def _signed(t):
+    return bool(re.search(r"^\(|^-|-$|\)$|(CR|DR)$", t.strip(), re.I))
+
+
+def parse_pdf(data, password=None, opening_hint=None):
+    """Statement lines from a bank's PDF statement. Returns _Rows like the CSV/OFX parsers."""
+    try:
+        import pdfplumber
+        from pdfminer.pdfdocument import PDFPasswordIncorrect
+    except ImportError:
+        raise ValueError("PDF import isn't installed on this server (pdfplumber). Upload the CSV or OFX instead.")
+    try:
+        pdf = pdfplumber.open(io.BytesIO(data), password=password or "")
+        pages = pdf.pages
+    except Exception as e:
+        # pdfplumber wraps pdfminer's error, so look inside it too.
+        if (isinstance(e, PDFPasswordIncorrect) or any(isinstance(a, PDFPasswordIncorrect) for a in e.args)
+                or "password" in repr(e).lower()):
+            raise PdfPasswordError("This PDF is password-protected. Enter its password and upload again." if not password
+                                   else "That PDF password isn't right. Check it and upload again.")
+        raise ValueError("That file couldn't be read as a PDF.")
+    try:
+        if len(pages) > PDF_MAX_PAGES:
+            raise ValueError(f"That PDF has {len(pages)} pages; the limit is {PDF_MAX_PAGES}. Split it by month.")
+        page_lines = [_pdf_lines(p) for p in pages]
+    finally:
+        pdf.close()
+    if not any(page_lines):
+        raise ValueError("This PDF has no readable text — it's probably a scan or photo. Download the statement "
+                         "from online banking as a PDF, CSV or Excel file instead.")
+    all_text = "\n".join(" ".join(w["text"] for w in l) for pl in page_lines for l in pl)
+    dayfirst = _detect_dayfirst([l[0]["text"] for pl in page_lines for l in pl if l])
+
+    rows, raw, cols, opening, closing = _Rows(), [], None, None, None
+    for pl in page_lines:
+        prev = None      # the transaction a wrapped description line belongs to (same page only)
+        for line in pl:
+            text = " ".join(w["text"] for w in line)
+            h = _pdf_header(line) if not _pdf_date(line, dayfirst)[0] else None
+            if h:
+                cols, prev = h, None; continue
+            d, k = _pdf_date(line, dayfirst)
+            body, money = _pdf_money_tail(line[k:] if d else line, cols)
+            if d:
+                d2, k2 = _pdf_date(body, dayfirst)       # a value date next to the transaction date
+                if d2:
+                    body = body[k2:]
+            desc = " ".join(w["text"] for w in body).strip()
+            if money and (_PDF_OPENING.search(text) or _PDF_CLOSING.search(text)):
+                v = parse_amount(money[-1]["text"])
+                if _PDF_OPENING.search(text):
+                    opening = v if opening is None else opening
+                else:
+                    closing = v
+                prev = None; continue
+            if not d:
+                # A wrapped description: no numbers, lined up under the description, close below it.
+                if (prev is not None and not money and not _PDF_SKIP.search(text)
+                        and line[0]["x0"] >= prev["desc_x0"] - 4 and line[0]["top"] - prev["bottom"] < 14
+                        and line[-1]["x1"] <= prev["money_x0"] + 2):
+                    prev["desc"] = (prev["desc"] + " " + text).strip()
+                    prev["bottom"] = line[0]["bottom"]
+                else:
+                    prev = None
+                continue
+            if not money:
+                prev = None; continue
+            r = {"date": d, "desc": desc, "debit": None, "credit": None, "amount": None, "balance": None,
+                 "known": False, "desc_x0": body[0]["x0"] if body else money[0]["x0"],
+                 "money_x0": money[0]["x0"], "bottom": line[0]["bottom"]}
+            if cols:
+                for w in money:
+                    c = _pdf_col(w, cols)
+                    if c and r[c] is None:
+                        r[c] = w["text"]
+            else:
+                r["balance"] = money[-1]["text"] if len(money) >= 2 else None
+                r["amount"] = money[-2]["text"] if len(money) >= 2 else money[0]["text"]
+            try:
+                if r["debit"] or r["credit"]:
+                    deb = abs(parse_amount(r["debit"])) if r["debit"] else Decimal(0)
+                    cre = abs(parse_amount(r["credit"])) if r["credit"] else Decimal(0)
+                    r["amount"], r["known"] = cre - deb, True
+                elif r["amount"]:
+                    t = r["amount"]; r["known"] = bool(cols) and _signed(t)
+                    r["amount"] = parse_amount(t)
+                    if not r["known"]:
+                        r["amount"] = abs(r["amount"])
+                r["balance"] = parse_amount(r["balance"]) if r["balance"] else None
+            except Exception:
+                rows.skipped.append(str(d)); prev = None; continue
+            if r["amount"] is None:
+                prev = None; continue       # a balance-only line (e.g. a dated "balance b/f")
+            raw.append(r); prev = r
+
+    if not raw:
+        raise ValueError("No transactions found in the PDF. If it's a statement, upload the CSV or OFX export instead.")
+
+    # Signs the columns didn't settle come from the running balance.
+    bals = [r["balance"] for r in raw]
+    have_bal = all(b is not None for b in bals)
+    if not all(r["known"] for r in raw):
+        if not have_bal:
+            raise ValueError("This PDF shows amounts without Debit/Credit columns or a running balance, so money in "
+                             "and money out can't be told apart. Upload the CSV or OFX export instead.")
+        start = opening if opening is not None else opening_hint
+        def fits(order):
+            seq = raw if order == "asc" else raw[::-1]
+            before, ok = start, 0
+            for r in seq:
+                if before is not None and abs(r["balance"] - before) == abs(r["amount"]):
+                    ok += 1
+                before = r["balance"]
+            return ok
+        order = "asc" if fits("asc") >= fits("desc") else "desc"
+        seq = raw if order == "asc" else raw[::-1]
+        before = start
+        for r in seq:
+            if not r["known"]:
+                if before is None:
+                    raise ValueError("Couldn't tell whether the first line is money in or out. Enter the statement's "
+                                     "opening balance and upload again.")
+                r["amount"] = r["balance"] - before
+                r["known"] = True
+            before = r["balance"]
+
+    # Every running balance must agree, whichever way round the statement is sorted.
+    if have_bal and len(raw) >= 1:
+        def breaks(seq, start):
+            bad, before = [], start
+            for r in seq:
+                if before is not None and r["balance"] != before + r["amount"]:
+                    bad.append(r)
+                before = r["balance"]
+            return bad
+        asc, desc_ = breaks(raw, opening), breaks(raw[::-1], opening)
+        bad = asc if len(asc) <= len(desc_) else desc_
+        if bad:
+            eg = "; ".join(f"{r['date']} {r['desc'][:30]} {_money(r['amount'])} (balance {_money(r['balance'])})" for r in bad[:3])
+            raise ValueError(f"The running balance doesn't add up on {len(bad)} line{'' if len(bad) == 1 else 's'} of "
+                             f"the PDF, so it may have been read wrongly: {eg}. Nothing was imported — upload the CSV "
+                             f"or OFX export instead, or send this PDF to support.")
+        rows.pdf_checked = True
+    else:
+        rows.pdf_checked = False
+
+    for r in raw:
+        if r["amount"] != 0:
+            rows.append({"date": r["date"], "amount": r["amount"], "desc": r["desc"],
+                         **({"balance": r["balance"]} if r["balance"] is not None else {})})
+    run_o, run_c = _balances_from_running(rows) if have_bal and len(rows) >= 2 else (None, None)
+    if have_bal and len(rows) == 1:
+        run_c = rows[0]["balance"]; run_o = run_c - rows[0]["amount"]
+    rows.opening = opening if opening is not None else run_o
+    rows.closing = run_c if run_c is not None else closing
+
+    # The statement's own period, when it says so ("Period: 01/01/2026 to 31/01/2026").
+    first, last = min(r["date"] for r in rows), max(r["date"] for r in rows)
+    dpat = r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}[ -][A-Za-z]{3,9}[ ,-]*\d{2,4}|[A-Za-z]{3,9} \d{1,2},? \d{4})"
+    for m in re.finditer(r"(?:period|from|statement date|dated)[^\n]{0,20}?" + dpat + r"\s*(?:to|-|–|—|through|till)\s*" + dpat,
+                         all_text, re.I):
+        a, b = _pdf_one_date(m.group(1), dayfirst), _pdf_one_date(m.group(2), dayfirst)
+        if a and b and a <= first and b >= last and (b - a).days <= 400:
+            rows.period_start, rows.period_end = a, b
+            break
+    return rows
+
+
+def ingest_pdf(data, account_name, password=None, opening=None, closing=None, p_start=None, p_end=None):
+    rows = parse_pdf(data, password, opening)
+    sid = _save_statement(rows, account_name, "pdf", opening, closing, p_start, p_end)
+    return sid, len(rows), rows.skipped, rows.pdf_checked
+
+
 def _prev_signed_closing(cur, acct_uuid, before, exclude_sid=None):
     """Closing balance of the latest signed-off statement ending before `before`, if it's known."""
     cur.execute("""SELECT closing_balance, period_end FROM statement
@@ -2430,15 +2727,16 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
-<div class=u-label>Bank statement (CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>
-<input type=file name=statement accept=.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button>
+<div class=u-label>Bank statement (PDF, CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>
+<input type=file name=statement accept=.pdf,.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button>
 <div class=balform style="margin-top:10px">
 <div><label>Opening balance <span class=muted>(optional)</span></label><input name=opening_balance inputmode=decimal placeholder="from the statement"></div>
 <div><label>Closing balance</label><input name=closing_balance inputmode=decimal placeholder="from the statement"></div>
 <div><label>Period start</label><input type=date name=period_start></div>
 <div><label>Period end (statement date)</label><input type=date name=period_end></div>
+<div><label>PDF password <span class=muted>(if it has one)</span></label><input type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--accent)"{% endif %}></div>
 </div>
-<div class=muted style="font-size:12px">Leave blank if the file has a running-balance column (CSV) or a ledger balance (OFX) — they're read automatically. Opening defaults to last signed-off closing. Set the period end to the statement date: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></form>
+<div class=muted style="font-size:12px">Leave blank if the file has a running-balance column (PDF, CSV) or a ledger balance (OFX) — they're read automatically. A PDF must be the one downloaded from online banking, not a scan; its password is used once to open it and never stored. Opening defaults to last signed-off closing. Set the period end to the statement date: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></form>
 <div class=u-label>Books</div>
 {% if qbo_connected and qbo_linked %}
 <form method=post action="{{ url_for('sync') }}" class=booksrc><input type=hidden name=back value="{{ name }}">
@@ -3164,6 +3462,15 @@ def upload(name):
     f = request.files.get("statement")
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
+    data = f.read()
+    is_pdf = data[:5] == b"%PDF-" or f.filename.lower().endswith(".pdf")
+    try:
+        opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
+        if is_pdf:   # read it first: a wrong password shouldn't cost a QuickBooks sync
+            pdf_rows = parse_pdf(data, request.form.get("pdf_password") or None, opening)
+    except ValueError as e:
+        session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
+        return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
     refreshed = ""
     if qbo_is_connected():
         try:
@@ -3172,11 +3479,19 @@ def upload(name):
         except Exception as e:
             refreshed = f" (Couldn't refresh books from QuickBooks: {e} — matched against the last sync.)"
     try:
-        opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
-        sid, n, skipped = ingest_file(f.read().decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
-                                      _form_date("period_start"), _form_date("period_end"))
+        checked = ""
+        if is_pdf:
+            sid = _save_statement(pdf_rows, name, "pdf", opening, closing, _form_date("period_start"), _form_date("period_end"))
+            n, skipped = len(pdf_rows), pdf_rows.skipped
+            checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
+                       " Read from the PDF. It has no running balance to check against, so compare the totals with "
+                       "the statement before signing off.")
+        else:
+            sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
+                                          _form_date("period_start"), _form_date("period_end"))
         note = run_matcher(sid)
-        session["detail_msg"] = f"Loaded {n} statement lines and reconciled." + refreshed + _skipped_note(skipped) + (f" {note}" if note else "")
+        session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + refreshed + _skipped_note(skipped)
+                                 + (f" {note}" if note else ""))
     except Exception as e:
         return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))

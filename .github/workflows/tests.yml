@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: tests/package-lock.json
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r tests/requirements.txt   # tests also need pypdf, to lock sample PDFs
 
       - name: Install the test database (PGlite)
         working-directory: tests
