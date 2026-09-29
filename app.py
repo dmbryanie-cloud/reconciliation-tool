@@ -685,6 +685,17 @@ def qbo_is_connected():
     return bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", "")) and get_config("qbo_conn") != "disconnected"
 
 
+BOOK_BALANCE_FRESH_SECS = 15 * 60   # a sync this recent is fresh enough for the book balance
+
+
+def _sync_age_secs(stamp):
+    try:
+        t = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return float("inf")
+
+
 def _sync_age_days(stamp):
     try:
         t = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
@@ -3635,20 +3646,6 @@ def upload(name):
     except ValueError as e:
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
-    refreshed = ""
-    if qbo_is_connected() and sync_running():
-        refreshed = (" A QuickBooks sync is running, so books weren't refreshed now; this statement is re-matched"
-                     " automatically when the sync finishes.")
-    elif qbo_is_connected() and sync_full_due():
-        refreshed = (" Books not refreshed: a full QuickBooks sync is due and takes several minutes, so it isn't run"
-                     " during an upload. Press Sync from QuickBooks (it runs in the background); the statement was matched"
-                     " against the last sync until then.")
-    elif qbo_is_connected():
-        try:
-            sync_from_quickbooks()   # books straight from QuickBooks, so matching sees today's entries
-            refreshed = " Books refreshed from QuickBooks."
-        except Exception as e:
-            refreshed = f" (Couldn't refresh books from QuickBooks: {e} — matched against the last sync.)"
     try:
         checked = ""
         if is_pdf:
@@ -3661,10 +3658,21 @@ def upload(name):
             sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
                                           _form_date("period_start"), _form_date("period_end"))
         note = run_matcher(sid)
-        session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + refreshed + _skipped_note(skipped)
-                                 + (f" {note}" if note else ""))
     except Exception as e:
         return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
+    # Fresh books come from a background sync, never inside this request: even a quick one
+    # re-matches every open reconciliation, and a slow response is cut off before the page
+    # comes back. The statement is matched now; the sync re-matches it when it finishes.
+    refreshed = ""
+    if qbo_is_connected():
+        try:
+            refreshed = (" Refreshing books from QuickBooks in the background; the matches update when it finishes."
+                         if start_sync(False, session.get("username")) else
+                         " A QuickBooks sync is running; this statement is re-matched automatically when it finishes.")
+        except Exception as e:
+            refreshed = f" (Couldn't start a QuickBooks refresh: {e}. Matched against the last sync.)"
+    session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
+                             + (f" {note}" if note else "") + refreshed)
     return redirect(url_for("detail", name=name))
 
 
@@ -4019,9 +4027,12 @@ def balances(name):
                 raise ValueError("This account isn't linked to a QuickBooks account.")
             if sync_running():
                 raise ValueError("A QuickBooks sync is running. Try again when it finishes.")
-            if sync_full_due():
-                raise ValueError("A full QuickBooks sync is due first. Press Sync from QuickBooks, then try again when it finishes.")
-            sync_from_quickbooks(full=False)   # the calculation needs fresh transactions
+            # The calculation needs freshly synced transactions. Syncing here would outlast the
+            # request, so use a sync from the last few minutes or start one in the background.
+            if sync_full_due() or _sync_age_secs(get_config("last_sync_at")) > BOOK_BALANCE_FRESH_SECS:
+                start_sync(False, session.get("username"))
+                raise ValueError("Refreshing books from QuickBooks first (see the banner). Press Get book balance "
+                                 "again when it finishes.")
             bal = qbo_book_balance_at(qbo_token(), acct_uuid, acct_qbo, pe)
             conn = get_conn(); cur = conn.cursor()
             cur.execute("UPDATE statement SET book_balance=%s, book_balance_source='qbo' WHERE statement_id=%s;", (bal, sid))

@@ -184,25 +184,36 @@ check("capped CDC forces the next sync to be full", mode == "full")
 _, mode = sync()
 check("…and then back to incremental", mode.startswith("changes since"))
 
-# 14. a full re-pull takes minutes on a real company: never inside an upload or a balance fetch
+# 14. uploads and balance fetches never sync inside the request (a slow response is cut off);
+#     they start the background sync instead (run inline in tests)
 A.qbo_is_connected = lambda: True
 A.set_config("sync_force_full", "1")
 check("full sync reported as due", A.sync_full_due() is True)
-q0 = len(STATE["queries"])
+seen = {}
+def watching_query(entity, token, since=None, changed_since=None, each=None):
+    cur.execute("SELECT statement_id FROM statement ORDER BY created_at DESC LIMIT 1"); seen.setdefault("latest", cur.fetchone()[0]); c.rollback()
+    return fake_query(entity, token, since, changed_since, each)
+A.qbo_query = watching_query
 r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data", follow_redirects=True)
 page = r.get_data(as_text=True)
-check("upload while a full sync is due doesn't sync", len(STATE["queries"]) == q0)
-check("…still loads and matches the statement", "Loaded 3 statement lines" in page)
-check("…and says why books weren't refreshed", "full QuickBooks sync is due" in page)
-r = cl.post("/account/Stanbic/balances", data={"action": "fetch_book"}, follow_redirects=True)
-check("balance fetch refused while a full sync is due", len(STATE["queries"]) == q0
-      and "full QuickBooks sync is due first" in r.get_data(as_text=True))
-_, mode = sync()
-check("the Sync button runs the full pull", mode == "full" and A.sync_full_due() is False)
+A.qbo_query = fake_query
+check("upload loads and matches the statement", "Loaded 3 statement lines" in page)
+cur.execute("SELECT statement_id FROM statement ORDER BY created_at DESC LIMIT 1"); newest = cur.fetchone()[0]; c.rollback()
+check("…saved it before the books refresh started", seen.get("latest") == newest)
+check("…and started the refresh (the due full pull) as a background sync",
+      "Refreshing books from QuickBooks in the background" in page and A.sync_job().get("state") == "done"
+      and "full" in A.sync_job().get("msg", "") and A.sync_full_due() is False)
+A.qbo_book_balance_at = lambda token, acct_uuid, acct_qbo, as_of: D("1234.00")
+A.set_config("last_sync_at", (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S-00:00"))
 q0 = len(STATE["queries"])
-cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
-        "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
-check("after it, uploads refresh books again", len(STATE["queries"]) > q0)
+r = cl.post("/account/Stanbic/balances", data={"action": "fetch_book"}, follow_redirects=True)
+body = r.get_data(as_text=True)
+check("balance fetch with stale books starts a sync instead of waiting on one",
+      len(STATE["queries"]) > q0 and "Press Get book balance again" in body)
+q0 = len(STATE["queries"])
+r = cl.post("/account/Stanbic/balances", data={"action": "fetch_book"}, follow_redirects=True)
+body = r.get_data(as_text=True)
+check("…and with fresh books reads the balance without syncing", len(STATE["queries"]) == q0 and "1,234.00" in body)
 
 sys.exit(T.summary())
