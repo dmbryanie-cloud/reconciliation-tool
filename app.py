@@ -2899,7 +2899,10 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
 {% if atype=='credit_card' %}<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 20px;line-height:1.5">Credit-card account: enter <b>charges as positive</b> and <b>payments/refunds as negative</b>, so signs match your QuickBooks credit-card register.</div>{% endif %}
 {{ sync_banner() }}
-{% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
+{% if detail_msg %}<div id=flash style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>
+<script>// After an action the page opens at its section (#sec-record...): show the result there, not off-screen at the top.
+document.addEventListener('DOMContentLoaded',function(){var f=document.getElementById('flash'),id=location.hash.slice(1),
+h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px';h.parentNode.insertBefore(f,h.nextSibling);}});</script>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
 <div class=u-label>Bank statement (PDF, CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>

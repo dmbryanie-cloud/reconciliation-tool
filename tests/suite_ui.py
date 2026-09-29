@@ -59,4 +59,36 @@ else:
     check("browser test ran to the end", out.returncode in (0, 1) and len(lines) > 10)
     if out.stderr.strip():
         print(out.stderr[-2000:])
+
+    # After an action the page opens at its section; the result must be shown there, not off-screen.
+    cur = c.cursor()
+    cur.execute("SELECT line_id FROM statement_line WHERE description='NEW EXPENSE'"); lid = str(cur.fetchone()[0]); c.rollback()
+    r = cl.post("/account/Stanbic/record", data={"only": lid})   # no account chosen
+    check("record without an account redirects to the record section", r.headers["Location"].endswith("#sec-record"))
+    after = cl.get("/account/Stanbic").data
+    FLASH = """
+const { JSDOM } = require("jsdom");
+const html = require("fs").readFileSync(process.argv[2], "utf8");
+for (const hash of ["#sec-record", ""]) {
+  const dom = new JSDOM(html, { runScripts: "dangerously", url: "http://app.test/account/Stanbic" + hash });
+  dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
+  const f = dom.window.document.getElementById("flash");
+  const prev = f && f.previousElementSibling;
+  console.log(JSON.stringify({hash, text: f ? f.textContent : null, after: prev ? prev.id : null}));
+}"""
+    with tempfile.NamedTemporaryFile("wb", suffix=".html", delete=False) as f:
+        f.write(after)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8") as g:
+        g.write(FLASH)
+    try:
+        res = subprocess.run([node, g.name, f.name], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+    finally:
+        os.unlink(f.name); os.unlink(g.name)
+    import json
+    got = [json.loads(l) for l in res.stdout.splitlines() if l.startswith("{")]
+    if res.stderr.strip():
+        print(res.stderr[-1500:])
+    check("result message says what's wrong", len(got) == 2 and "choose an account" in (got[0]["text"] or ""))
+    check("…shown right under the record section heading", len(got) == 2 and got[0]["after"] == "sec-record")
+    check("…and at the top when the page opens without a section", len(got) == 2 and got[1]["after"] != "sec-record")
 sys.exit(T.summary())
