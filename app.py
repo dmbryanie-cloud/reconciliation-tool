@@ -2,6 +2,8 @@ import os
 import io
 import csv
 import hashlib
+import hmac
+import secrets
 import itertools
 import time
 import re
@@ -29,6 +31,12 @@ EAT = timezone(timedelta(hours=3))
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",   # browsers won't send the session on cross-site POSTs
+    # HTTPS-only cookie on Render (it sets RENDER); stays off for local http development.
+    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")) or os.environ.get("SESSION_COOKIE_SECURE") == "1",
+)
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "dmbryanie@gmail.com")  # shown on Terms/Privacy pages
 
@@ -1525,6 +1533,43 @@ def health():
     return "ok", 200
 
 
+# ---------------- CSRF protection ----------------
+# Every POST must carry the session's token. It's injected into each POST form on the way out,
+# so new forms are covered without remembering to add a field.
+def csrf_token():
+    tok = session.get("csrf")
+    if not tok:
+        tok = session["csrf"] = secrets.token_urlsafe(32)
+    return tok
+
+
+_POST_FORM = re.compile(r"""(<form\b[^>]*\bmethod\s*=\s*["']?post\b[^>]*>)""", re.IGNORECASE)
+
+
+@app.after_request
+def _inject_csrf(resp):
+    if resp.mimetype == "text/html" and not resp.direct_passthrough:
+        html = resp.get_data(as_text=True)
+        if _POST_FORM.search(html):
+            field = f'<input type=hidden name=_csrf value="{csrf_token()}">'
+            resp.set_data(_POST_FORM.sub(lambda m: m.group(1) + field, html))
+    return resp
+
+
+@app.before_request
+def check_csrf():
+    if request.method != "POST":
+        return
+    good = session.get("csrf")
+    sent = request.form.get("_csrf", "")
+    if good and hmac.compare_digest(sent, good):
+        return
+    if request.endpoint == "login":
+        return render_template_string(LOGIN_PAGE, error="That sign-in page had expired. Please try again."), 400
+    return (f"This form had expired or didn't come from this app, so nothing was changed. "
+            f"<a href='{url_for('dashboard')}'>Reload the app</a> and try again."), 400
+
+
 @app.before_request
 def require_login():
     if request.endpoint in ("login", "static", "health", "terms", "privacy"):
@@ -1591,10 +1636,12 @@ def login():
         password = request.form.get("password") or ""
         u = get_user(username) if username else None
         if u and u[2] and check_password_hash(u[2], password):
+            session["csrf"] = secrets.token_urlsafe(32)
             session["authed"] = True; session["username"] = u[0]
             session["name"] = u[1] or u[0]; session["is_admin"] = bool(u[3])
             return redirect(url_for("dashboard"))
         if check_password(password):
+            session["csrf"] = secrets.token_urlsafe(32)
             session["authed"] = True; session["username"] = "admin"
             session["name"] = "Admin"; session["is_admin"] = True
             return redirect(url_for("dashboard"))
