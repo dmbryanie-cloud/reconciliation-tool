@@ -18,6 +18,7 @@ from flask import Flask, render_template_string, request, redirect, session, url
 from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
+import threading
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
@@ -65,6 +66,136 @@ def set_config(key, value):
     cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
     cur.execute("INSERT INTO app_config (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;", (key, value))
     conn.commit(); cur.close(); conn.close()
+
+
+# ---------------- background sync ----------------
+# A full QuickBooks pull takes minutes on a real company, longer than a web request may run
+# (the server cuts it off with a 502). So Sync starts it in a background thread and returns at
+# once, and every page shows its progress. The job lives in app_config rather than memory, so
+# all server workers see the same one and two syncs can't run side by side.
+SYNC_STALE_SECS = 600        # no progress for this long: the server restarted mid-sync
+SYNC_IN_BACKGROUND = True    # the tests run it inline
+
+
+def _load_job():
+    try:
+        return json.loads(get_config("sync_job") or "{}")
+    except Exception:
+        return {}
+
+
+def sync_job():
+    """The current or last sync: {} if none. A 'running' job that stopped reporting is 'stalled'."""
+    job = _load_job()
+    if job.get("state") == "running" and time.time() - job.get("beat", 0) > SYNC_STALE_SECS:
+        job["state"] = "stalled"
+    return job
+
+
+def sync_running():
+    return sync_job().get("state") == "running"
+
+
+def _claim_sync(full, by):
+    """Mark a sync as running unless one already is. True if this caller got it."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
+    cur.execute("INSERT INTO app_config (key, value) VALUES ('sync_job', '{}') ON CONFLICT (key) DO NOTHING;")
+    cur.execute("SELECT value FROM app_config WHERE key='sync_job' FOR UPDATE;")   # one claimer at a time
+    try:
+        job = json.loads(cur.fetchone()[0] or "{}")
+    except Exception:
+        job = {}
+    if job.get("state") == "running" and time.time() - job.get("beat", 0) <= SYNC_STALE_SECS:
+        conn.rollback(); cur.close(); conn.close()
+        return False
+    now = time.time()
+    cur.execute("UPDATE app_config SET value=%s WHERE key='sync_job';",
+                (json.dumps({"state": "running", "full": bool(full), "by": by, "started": now, "beat": now,
+                             "step": "Starting"}),))
+    conn.commit(); cur.close(); conn.close()
+    return True
+
+
+def _sync_step(step):
+    """Progress from the running sync; also its heartbeat."""
+    job = _load_job()
+    job.update(step=step, beat=time.time())
+    set_config("sync_job", json.dumps(job))
+
+
+def _run_sync_job(full):
+    try:
+        n, detail, mode, timing = sync_from_quickbooks(full=full, progress=_sync_step)
+        window = _sync_since()
+        scope = f"since {window}" if window else "all history"
+        state, msg = "done", (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
+                              f"Records fetched: {detail}.")
+    except Exception as e:
+        state, msg = "failed", f"Sync failed: {e}"
+    try:
+        job = _load_job()
+        job.update(state=state, msg=msg, finished=time.time(), beat=time.time())
+        set_config("sync_job", json.dumps(job))
+    except Exception:
+        pass   # the job goes stale and the next Sync can start
+
+
+def start_sync(full=False, by=None):
+    """Start a QuickBooks sync in the background. False if one is already running."""
+    if not _claim_sync(full, by):
+        return False
+    if SYNC_IN_BACKGROUND:
+        threading.Thread(target=_run_sync_job, args=(full,), daemon=True, name="qbo-sync").start()
+    else:
+        _run_sync_job(full)
+    return True
+
+
+def _ago(secs):
+    m = int(max(0, secs) // 60)
+    return "just now" if m < 1 else f"{m} min ago"
+
+
+def sync_banner():
+    """The progress/result strip shown at the top of the dashboard and account pages."""
+    try:
+        return _sync_banner()
+    except Exception:
+        return ""   # a status strip must never break the page
+
+
+def _sync_banner():
+    job = sync_job()
+    st = job.get("state")
+    if st == "running":
+        what = "Full sync" if job.get("full") else "Syncing"
+        return Markup(
+            '<div id=syncbar class=syncbar data-state=running style="background:var(--accent-soft);color:var(--accent);'
+            'padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;font-weight:550;line-height:1.5">'
+            f'&#8635; {what} from QuickBooks in progress (started {_ago(time.time() - job.get("started", 0))}): '
+            f'<span class=sync-step>{escape(job.get("step") or "")}</span>. You can keep working; '
+            'a big company takes several minutes. This page refreshes when it finishes.</div>'
+            '<script>(function(){var dirty=false;document.addEventListener("input",function(){dirty=true},true);'
+            'document.addEventListener("change",function(){dirty=true},true);var bar=document.getElementById("syncbar");'
+            'function tick(){fetch("' + url_for("sync_status") + '",{credentials:"same-origin"}).then(function(r){return r.json()})'
+            '.then(function(j){if(j.state!=="running"){if(dirty){bar.innerHTML="Sync finished. <a href=\\"\\" '
+            'onclick=\\"location.reload();return false\\">Reload to see the results</a>";}else{location.reload();}return;}'
+            'var s=bar.querySelector(".sync-step");if(s)s.textContent=j.step||"";setTimeout(tick,4000);})'
+            '.catch(function(){setTimeout(tick,10000)});}setTimeout(tick,4000);})();</script>')
+    if st == "stalled":
+        return Markup(
+            '<div class=syncbar data-state=stalled style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;'
+            'padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;line-height:1.5">The last QuickBooks sync '
+            'stopped before finishing (the server restarted). Nothing was lost; press <b>Sync from QuickBooks</b> to run it again.</div>')
+    if st in ("done", "failed") and session.get("sync_seen") != job.get("started"):
+        session["sync_seen"] = job.get("started")   # the result is shown once
+        ok = st == "done"
+        return Markup(
+            f'<div class=syncbar data-state={st} style="background:{"var(--accent-soft)" if ok else "#fef2f2"};'
+            f'color:{"var(--accent)" if ok else "#991b1b"};padding:11px 14px;border-radius:9px;font-size:14px;'
+            f'margin:0 0 18px;line-height:1.5">{escape(job.get("msg") or "")}</div>')
+    return ""
 
 
 def check_password(pw):
@@ -611,7 +742,9 @@ def _book_rows(etype, handler, ents, by_qbo):
     return rows
 
 
-def sync_from_quickbooks(full=False):
+def sync_from_quickbooks(full=False, progress=None):
+    step = progress or (lambda msg: None)
+    step("Reading your chart of accounts")
     token = qbo_token()
     import_accounts_from_qbo(token)
     since = _sync_since()
@@ -632,9 +765,12 @@ def sync_from_quickbooks(full=False):
     # large company never holds every raw record in memory at once.
     rows, cache, fetched = [], {}, {}
     for etype, handler in QBO_HANDLERS.items():
-        got = []
-        def keep(batch, etype=etype, handler=handler, got=got):
+        got, seen_n = [], [0]
+        step(f"Downloading {etype} records")
+        def keep(batch, etype=etype, handler=handler, got=got, seen_n=seen_n):
             got.extend(_book_rows(etype, handler, batch, by_qbo))
+            seen_n[0] += len(batch)
+            step(f"Downloading {etype} records ({seen_n[0]:,} so far)")
             return [str(e["Id"]) for e in batch if e.get("Id")]
         try:
             cache[etype] = qbo_query(etype, token, since=since, changed_since=changed_since, each=keep)
@@ -651,6 +787,7 @@ def sync_from_quickbooks(full=False):
             cdc_ok = False
             notes.append("couldn't read deletions from QuickBooks; they'll be checked on the next sync")
     fetch_secs = time.time() - t0
+    step(f"Saving {len(rows):,} transactions")
     conn = get_conn(); cur = conn.cursor()
     t1 = time.time()
     if rows:
@@ -678,6 +815,7 @@ def sync_from_quickbooks(full=False):
     conn.commit(); cur.close(); conn.close()
     # Fresh books: re-match every open reconciliation (the user's review decisions are kept).
     for sid in set(reopen) | set(_open_statement_ids()):
+        step("Re-matching open reconciliations")
         run_matcher(sid)
     if removed:
         notes.append(f"flagged {len(removed)} transaction{'' if len(removed)==1 else 's'} deleted or moved in QuickBooks"
@@ -1261,7 +1399,7 @@ button:hover{opacity:.92}
 
 @app.context_processor
 def _inject_contact():
-    return {"contact_email": CONTACT_EMAIL}
+    return {"contact_email": CONTACT_EMAIL, "sync_banner": sync_banner}
 
 
 @app.template_filter("acct")
@@ -2645,6 +2783,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <button type=submit class=btn-sm>Sync from QuickBooks</button></form>
 <form method=post action="{{ url_for('sync') }}" style="display:inline" onsubmit="return confirm('Full resync re-downloads every transaction in the window, ignoring the last-sync marker. Slower, but use it if you think something was missed.');"><input type=hidden name=full value="1"><button type=submit class=btn-sm>Full resync</button></form>
 {% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
+{{ sync_banner() }}
 <div class=tiles>
 <button class="tile active" data-filter="all"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span><span class=t-label>Accounts</span></div><div class=t-val>{{ rows|length }}</div></button>
 <button class="tile" data-filter="reconciled"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.4 12 2.4 2.4L16 9"/></svg></span><span class=t-label>Reconciled</span></div><div class=t-val>{{ n_recon }}</div></button>
@@ -2748,6 +2887,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
 <a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
 {% if atype=='credit_card' %}<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 20px;line-height:1.5">Credit-card account: enter <b>charges as positive</b> and <b>payments/refunds as negative</b>, so signs match your QuickBooks credit-card register.</div>{% endif %}
+{{ sync_banner() }}
 {% if detail_msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>{% endif %}
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
@@ -3496,9 +3636,12 @@ def upload(name):
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
     refreshed = ""
-    if qbo_is_connected() and sync_full_due():
+    if qbo_is_connected() and sync_running():
+        refreshed = (" A QuickBooks sync is running, so books weren't refreshed now; this statement is re-matched"
+                     " automatically when the sync finishes.")
+    elif qbo_is_connected() and sync_full_due():
         refreshed = (" Books not refreshed: a full QuickBooks sync is due and takes several minutes, so it isn't run"
-                     " during an upload. Use Sync from QuickBooks on the dashboard; the statement was matched"
+                     " during an upload. Press Sync from QuickBooks (it runs in the background); the statement was matched"
                      " against the last sync until then.")
     elif qbo_is_connected():
         try:
@@ -3874,8 +4017,10 @@ def balances(name):
             cur.close(); conn.close()
             if not acct_qbo:
                 raise ValueError("This account isn't linked to a QuickBooks account.")
+            if sync_running():
+                raise ValueError("A QuickBooks sync is running. Try again when it finishes.")
             if sync_full_due():
-                raise ValueError("A full QuickBooks sync is due first. Run Sync from QuickBooks on the dashboard, then try again.")
+                raise ValueError("A full QuickBooks sync is due first. Press Sync from QuickBooks, then try again when it finishes.")
             sync_from_quickbooks(full=False)   # the calculation needs fresh transactions
             bal = qbo_book_balance_at(qbo_token(), acct_uuid, acct_qbo, pe)
             conn = get_conn(); cur = conn.cursor()
@@ -4322,23 +4467,24 @@ def check_connection():
 
 @app.route("/sync", methods=["POST"])
 def sync():
+    """Starts the sync and returns straight away; the page banner follows it."""
     back = request.form.get("back")
     try:
-        full = request.form.get("full") == "1"
-        n, detail, mode, timing = sync_from_quickbooks(full=full)
-        window = _sync_since()
-        scope = f"since {window}" if window else "all history"
-        msg = (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
-               f"Records fetched: {detail}.")
-        if back:
-            msg = "Books refreshed from QuickBooks and re-matched." + (f" {detail.split('. ', 1)[1]}" if ". " in detail else "")
+        started = start_sync(request.form.get("full") == "1", session.get("username"))
+        msg = None if started else "A QuickBooks sync is already running; its progress is shown at the top of the page."
     except Exception as e:
-        msg = f"Sync failed: {e}"
+        msg = f"Couldn't start the sync: {e}"
     if back:
-        session["detail_msg"] = msg
+        if msg: session["detail_msg"] = msg
         return redirect(url_for("detail", name=back))
-    session["sync_msg"] = msg
+    if msg: session["sync_msg"] = msg
     return redirect(url_for("dashboard"))
+
+
+@app.route("/sync/status")
+def sync_status():
+    job = sync_job()
+    return {"state": job.get("state") or "none", "step": job.get("step") or "", "msg": job.get("msg") or ""}
 
 
 if __name__ == "__main__":

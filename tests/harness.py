@@ -110,6 +110,7 @@ class _Shared:
 
 def share_connection(app_module, c):
     app_module.get_conn = lambda: _Shared(c)
+    app_module.SYNC_IN_BACKGROUND = False   # a thread can't share the one connection; run syncs inline
 
 
 def setup(accounts_sql):

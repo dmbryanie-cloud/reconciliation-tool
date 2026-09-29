@@ -56,8 +56,8 @@ def patch():
     A.qbo_cdc_deleted = lambda t, e, cs: ({}, False); A.qbo_post = fake_post
     A.qbo_is_connected = lambda: True
     real_sync = A.sync_from_quickbooks
-    def counting_sync(full=False):
-        STATE["syncs"] += 1; return real_sync(full)
+    def counting_sync(full=False, progress=None):
+        STATE["syncs"] += 1; return real_sync(full, progress)
     A.sync_from_quickbooks = counting_sync
 patch()
 

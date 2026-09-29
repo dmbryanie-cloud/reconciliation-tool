@@ -8,7 +8,8 @@ throwaway in-memory Postgres. **No suite ever talks to QuickBooks** — every Qu
 | Suite | Covers |
 |---|---|
 | `suite_reconciliation.py` | Statement import (date/amount formats, duplicate rows, running balances, OFX), the balance proof, carry-forward of outstanding items, footing and continuity checks, sign-off gating and override |
-| `suite_sync_deletions.py` | Sync: CDC deletions, moved and voided transactions, restored transactions, full-resync safety guard, company change, stale watermarks, CDC cap |
+| `suite_sync_deletions.py` | Sync: CDC deletions, moved and voided transactions, restored transactions, full-resync safety guard, company change, stale watermarks, CDC cap, a due full re-pull never run inside an upload or balance fetch |
+| `suite_background_sync.py` | Sync running in a background thread: the request returns mid-download, progress banner and status endpoint (its script run in Node), one sync at a time, uploads and balance fetches stay out of a running sync, a sync lost to a restart shown as stopped and restartable, failures reported |
 | `suite_review_writeback.py` | Suggested matches waiting for review, books from QuickBooks, chart-of-accounts cache, write-back (single, bulk, retries, double-click protection), learned suggestions, the one-time migration |
 | `suite_manual_match.py` | Matching by hand (1-1, many-1, 1-many), differences in the balance proof, undo, validation, learning from hand-made matches, the duplicate guard on write-back |
 | `suite_ui.py` | The account page's own JavaScript run in a simulated browser (jsdom): manual-match totals, closest-amount sorting, search, "Match it instead", bulk-record confirmation |
