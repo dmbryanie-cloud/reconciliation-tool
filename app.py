@@ -380,6 +380,12 @@ def import_accounts_from_qbo(token):
     except Exception:
         return 0
     _store_coa(accts)
+    try:
+        ci = qbo_query("CompanyInfo", token)
+        if ci and ci[0].get("CompanyName"):
+            set_config("company_name", ci[0]["CompanyName"])   # letterhead on printed reports
+    except Exception:
+        pass
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='account';")
     cols = {r[0] for r in cur.fetchall()}
@@ -698,7 +704,7 @@ try:
                     created_by text, created_at timestamptz NOT NULL DEFAULT now());""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS payee_correction (id serial PRIMARY KEY, org_id uuid NOT NULL,
                     payee text NOT NULL, category text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());""")
-    for _col, _typ in (("money_out", "boolean"), ("vendor", "text"), ("vendor_ref", "text")):
+    for _col, _typ in (("money_out", "boolean"), ("vendor", "text"), ("vendor_ref", "text"), ("currency", "text")):
         _cur.execute(f"ALTER TABLE payee_correction ADD COLUMN IF NOT EXISTS {_col} {_typ};")
     _cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
     _cur.execute("SELECT 1 FROM app_config WHERE key='migr_proposed_v1';")
@@ -764,9 +770,14 @@ class PostingMemory:
       2. bank lines matched to a QuickBooks transaction (bank wording -> how it was posted)
       3. QuickBooks history by payee name
     """
-    def __init__(self, cur):
+    def __init__(self, cur, currency=None):
+        """currency: learn only from postings on accounts in this currency, so a USD bank
+        charge is suggested from USD postings and a UGX one from UGX postings."""
         self.entries, self.index = [], {}
-        cur.execute("SELECT payee, category, money_out, vendor, vendor_ref FROM payee_correction;")
+        ccy_ok = "(%(ccy)s::text IS NULL OR a.currency = %(ccy)s)"
+        args = {"ccy": currency}
+        cur.execute("""SELECT payee, category, money_out, vendor, vendor_ref FROM payee_correction
+                       WHERE %(ccy)s::text IS NULL OR currency IS NULL OR currency = %(ccy)s;""", args)
         for desc, cat, out, vendor, ref in cur.fetchall():
             self._add(1, desc, out, cat, vendor, ref, 1)
         cur.execute("""SELECT sl.description, sl.amount, a.type, bt.category, bt.counterparty, bt.counterparty_ref
@@ -775,13 +786,13 @@ class PostingMemory:
                        JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
                        JOIN account a ON a.account_id=bt.account_id
                        WHERE m.status='confirmed' AND (m.match_type IN ('exact','fuzzy') OR m.created_by='user')
-                         AND bt.category IS NOT NULL AND NOT bt.is_deleted;""")
+                         AND bt.category IS NOT NULL AND NOT bt.is_deleted AND """ + ccy_ok + ";", args)
         for desc, amt, atype, cat, cp, ref in cur.fetchall():
             self._add(2, desc, _money_out(amt, atype), cat, cp, ref, 1)
         cur.execute("""SELECT bt.counterparty, bt.category, bt.counterparty_ref, a.type, bt.amount > 0, count(*)
                        FROM book_txn bt JOIN account a ON a.account_id=bt.account_id
                        WHERE bt.category IS NOT NULL AND coalesce(trim(bt.counterparty),'') <> '' AND NOT bt.is_deleted
-                       GROUP BY 1, 2, 3, 4, 5;""")
+                         AND """ + ccy_ok + " GROUP BY 1, 2, 3, 4, 5;", args)
         for cp, cat, ref, atype, pos, n in cur.fetchall():
             self._add(3, cp, pos if atype == "credit_card" else not pos, cat, cp, ref, n)
 
@@ -1170,6 +1181,18 @@ button:hover{opacity:.92}
 @app.context_processor
 def _inject_contact():
     return {"contact_email": CONTACT_EMAIL}
+
+
+@app.template_filter("acct")
+def _acct(x):
+    """Accounting style: negatives in brackets."""
+    if x is None:
+        return ""
+    try:
+        v = Decimal(x)
+    except Exception:
+        return str(x)
+    return f"({abs(v):,.2f})" if v < 0 else f"{v:,.2f}"
 
 
 @app.template_filter("money")
@@ -2439,6 +2462,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% else %}<button type=button class=btn-go disabled style="opacity:.45;cursor:not-allowed" title="{{ 'Review the suggested matches first' if n_pending else 'Balance the reconciliation first' }}">Sign off this reconciliation</button>{% if n_pending %} <a href="#sec-review" class=hint style="color:var(--warn);font-weight:600">{{ n_pending }} suggested match{{ '' if n_pending==1 else 'es' }} to review first</a>{% endif %}{% endif %}
 <a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
 <a href="{{ url_for('qbo_import_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download for QuickBooks (CSV)</a>
+<a href="{{ url_for('report', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px" target=_blank rel=noopener>Print reconciliation report</a>
 {% if session.is_admin and not signed_off and (rec.status!='balanced' or n_pending) %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
 <form method=post action="{{ url_for('signoff', name=name) }}" class=balform><input type=hidden name=override value=1>
 <div><label>Reason (recorded with the sign-off)</label><input name=note required style="width:340px;max-width:100%"></div>
@@ -2645,6 +2669,8 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
       against the wrong bank, so that account shows a book entry its statement will
       never confirm.
 
+    Only accounts in the same currency are compared: a UGX line and a USD line of the
+    same number are a coincidence, not a transfer (each bank's charges stay on that bank).
     Suggestions only. Nothing here auto-matches or writes anything back.
     """
     if not unmatched_lines:
@@ -2665,10 +2691,11 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
                               AND sl.amount = -un.amt
                               AND sl.posted_date BETWEEN un.d - %s AND un.d + %s
         JOIN account a ON a.account_id = s.account_id
+                      AND a.currency = (SELECT currency FROM account WHERE account_id = %s)
         WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
                           JOIN match m ON m.match_id = msl.match_id
                           WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');
-    """, (ids, dts, amts, acct_uuid, window, window))
+    """, (ids, dts, amts, acct_uuid, window, window, acct_uuid))
     for lid, nm, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append(
             {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who,
@@ -2684,11 +2711,12 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
                         AND bt.amount = un.amt
                         AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
         JOIN account a ON a.account_id = bt.account_id
+                      AND a.currency = (SELECT currency FROM account WHERE account_id = %s)
         WHERE coalesce(bt.is_void, false) = false AND coalesce(bt.is_deleted, false) = false
           AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
                           JOIN match m ON m.match_id = mbt.match_id
                           WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed');
-    """, (ids, dts, amts, acct_uuid, window, window))
+    """, (ids, dts, amts, acct_uuid, window, window, acct_uuid))
     for lid, nm, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append(
             {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who,
@@ -2708,7 +2736,9 @@ def _latest_statement(cur, acct_uuid):
 def book_pool(cur, acct_uuid, sid, p_start, p_end):
     """Book transactions a statement can clear: those dated in its period, plus older ones still
     outstanding (brought forward) since the account's first signed-off period. Anything already
-    cleared on another signed-off statement is excluded, so it can't be matched twice."""
+    cleared on an EARLIER signed-off statement is excluded, so it can't be matched twice -- while
+    a past period still shows the items that were outstanding at its end, even if a later
+    period has since cleared them."""
     cur.execute("""SELECT min(period_start) FROM statement
                    WHERE account_id=%s AND signed_off_at IS NOT NULL AND statement_id<>%s AND period_start < %s;""",
                 (acct_uuid, sid, p_start))
@@ -2721,8 +2751,9 @@ def book_pool(cur, acct_uuid, sid, p_start, p_end):
                                      JOIN match m ON m.match_id=mbt.match_id
                                      JOIN statement s ON s.statement_id=m.statement_id
                                      WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed'
-                                       AND s.statement_id<>%s AND s.signed_off_at IS NOT NULL)
-                   ORDER BY bt.posted_date;""", (acct_uuid, floor, p_end, sid))
+                                       AND s.statement_id<>%s AND s.signed_off_at IS NOT NULL
+                                       AND s.period_start < %s)
+                   ORDER BY bt.posted_date;""", (acct_uuid, floor, p_end, sid, p_start))
     return cur.fetchall()
 
 
@@ -2818,7 +2849,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                      "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])}
                     for mid, delta, by, at in umatches]
     unmatched_lines = [l for l in lines if l[0] not in ml]
-    mem = PostingMemory(cur) if unmatched_lines else None
+    cur.execute("SELECT currency FROM account WHERE account_id=%s;", (acct_uuid,))
+    acct_ccy = (cur.fetchone() or [None])[0]
+    mem = PostingMemory(cur, acct_ccy) if unmatched_lines else None
     coa = load_coa(cur)
     wb = {}
     if unmatched_lines:
@@ -2862,6 +2895,151 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"]} for a in coa]).replace("<", "\\u003c"))}
+
+
+REPORT_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Bank reconciliation · {{ name }} · {{ r.p_end }}</title>
+<style>
+:root{--ink:#16202e;--muted:#667085;--line:#d0d5dd;--soft:#f2f4f7;--ok:#047857;--bad:#b42318;--warn:#92400e}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:#e9edf2;margin:0;font-size:13px;line-height:1.45}
+.toolbar{max-width:210mm;margin:16px auto 0;display:flex;gap:10px;justify-content:space-between;align-items:center;padding:0 16px;flex-wrap:wrap}
+.toolbar a{color:var(--muted);text-decoration:none;font-size:14px}
+.toolbar button{background:#16202e;color:#fff;border:0;border-radius:9px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer}
+.sheet{background:#fff;max-width:210mm;margin:12px auto 32px;padding:15mm 14mm;box-shadow:0 2px 10px rgba(16,24,40,.12);position:relative;overflow:hidden}
+.draft{position:absolute;top:38%;left:0;right:0;text-align:center;font-size:110px;font-weight:800;letter-spacing:.1em;color:rgba(180,35,24,.07);transform:rotate(-22deg);pointer-events:none}
+.co{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
+h1{font-size:21px;margin:2px 0 0;letter-spacing:-.01em}
+.meta{display:grid;grid-template-columns:repeat(4,auto);justify-content:start;gap:3px 26px;margin:14px 0 18px;padding:10px 12px;background:var(--soft);border-radius:6px}
+.meta dt{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}.meta dd{margin:0 0 4px;font-weight:600}
+table{width:100%;border-collapse:collapse}
+td{padding:3px 6px;vertical-align:top}
+td.a{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;width:110px}
+td.d{white-space:nowrap;width:78px;color:var(--muted)}
+tr.head td{font-weight:700;padding-top:12px}
+tr.item td{font-size:12px;color:#344054}
+tr.item td:first-child{padding-left:22px}
+tr.none td{font-size:12px;color:var(--muted);font-style:italic;padding-left:22px}
+tr.sub td.a{border-top:1px solid var(--line)}
+tr.tot td{font-weight:700;border-top:1px solid var(--ink);border-bottom:3px double var(--ink);padding:6px}
+tr.gap td{height:10px}
+.bf{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:3px;padding:0 3px;margin-left:4px}
+.result{margin:18px 0 6px;padding:10px 12px;border-radius:6px;font-weight:700;display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}
+.result.balanced{background:#d7f3e3;color:var(--ok)}.result.out{background:#fbe2de;color:var(--bad)}.result.incomplete{background:var(--soft);color:var(--muted)}
+.note{font-size:12px;margin:6px 0;padding:7px 10px;border-radius:6px;background:#fffbeb;color:var(--warn);border:1px solid #fde68a}
+.note.bad{background:#fbe2de;color:var(--bad);border-color:#f5c2bb}
+.facts{font-size:12px;color:var(--muted);margin:10px 0 0}
+.sign{display:grid;grid-template-columns:1fr 1fr;gap:34px;margin-top:30px;page-break-inside:avoid}
+.sign .who{font-weight:600;min-height:18px}
+.sign .line{border-top:1px solid var(--ink);padding-top:4px;margin-top:4px;font-size:11px;color:var(--muted)}
+footer{margin-top:22px;padding-top:8px;border-top:1px solid var(--line);font-size:10.5px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+@media print{body{background:#fff}.toolbar{display:none}.sheet{margin:0;box-shadow:none;padding:0;max-width:none}tr{page-break-inside:avoid}@page{size:A4;margin:14mm}}
+@media (max-width:640px){.sheet{padding:18px 14px}.meta{grid-template-columns:repeat(2,auto)}td.d{display:none}}
+</style></head><body>
+<div class=toolbar><a href="{{ url_for('detail', name=name) }}">&larr; Back to {{ name }}</a><button type=button onclick="window.print()">Print / Save as PDF</button></div>
+<div class=sheet>
+{% if not r.signed_at %}<div class=draft>DRAFT</div>{% endif %}
+<div class=co>{{ company or 'Bank reconciliation' }}</div>
+<h1>Bank reconciliation statement</h1>
+<dl class=meta>
+<div><dt>Account</dt><dd>{{ name }}</dd></div>
+<div><dt>Currency</dt><dd>{{ ccy or '—' }}</dd></div>
+<div><dt>Period</dt><dd>{{ r.p_start }} to {{ r.p_end }}</dd></div>
+<div><dt>Status</dt><dd>{% if r.signed_at %}Signed off{% else %}Draft — not signed off{% endif %}</dd></div>
+</dl>
+{% set cc = atype=='credit_card' %}
+<table>
+<tr class=head><td colspan=2>Balance per {{ 'card' if cc else 'bank' }} statement at {{ r.p_end }}</td><td class=a></td><td class=a>{% if r.closing is none %}not entered{% else %}{{ r.closing|acct }}{% endif %}</td></tr>
+<tr class=head><td colspan=4>Add: {{ 'charges in the books, not yet on the statement' if cc else 'deposits in transit (in the books, not yet on the statement)' }}</td></tr>
+{% for t in r.in_items %}<tr class=item><td>{{ t[3] }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=d>{{ t[1] }}</td><td class=a>{{ t[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
+<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.out_in|acct }}</td></tr>
+<tr class=head><td colspan=4>Less: {{ 'payments and refunds in the books, not yet on the statement' if cc else 'outstanding payments (in the books, not yet presented)' }}</td></tr>
+{% for t in r.out_items %}<tr class=item><td>{{ t[3] }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=d>{{ t[1] }}</td><td class=a>{{ t[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
+<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.out_out|acct }}</td></tr>
+<tr class=tot><td colspan=3>Adjusted {{ 'card' if cc else 'bank' }} balance</td><td class=a>{% if r.adj_bank is none %}—{% else %}{{ r.adj_bank|acct }}{% endif %}</td></tr>
+<tr class=gap><td colspan=4></td></tr>
+<tr class=head><td colspan=2>Balance per books (QuickBooks) at {{ r.p_end }}</td><td class=a></td><td class=a>{% if r.book is none %}not entered{% else %}{{ r.book|acct }}{% endif %}</td></tr>
+<tr class=head><td colspan=4>Add / (less): on the statement, not yet in the books</td></tr>
+{% for l in r.unrec_items %}<tr class=item><td>{{ l[3] }}</td><td class=d>{{ l[1] }}</td><td class=a>{{ l[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
+<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.unrec|acct }}</td></tr>
+<tr class=head><td colspan=4>Add / (less): amount differences on matched items</td></tr>
+{% for m in r.delta_items %}<tr class=item><td>{{ m.desc }}</td><td class=d>{{ m.date }}</td><td class=a>{{ m.delta|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
+<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.match_adj|acct }}</td></tr>
+<tr class=tot><td colspan=3>Adjusted book balance</td><td class=a>{% if r.adj_book is none %}—{% else %}{{ r.adj_book|acct }}{% endif %}</td></tr>
+</table>
+<div class="result {{ r.status }}">
+{% if r.status=='balanced' %}<span>&#10003; Reconciled — adjusted {{ 'card' if cc else 'bank' }} and book balances agree</span><span>Difference 0.00</span>
+{% elif r.status=='out' %}<span>Not reconciled — out of balance</span><span>Difference {{ r.rec_diff|acct }}</span>
+{% else %}<span>Incomplete — the {{ r.missing }} {{ 'is' if ' and ' not in r.missing else 'are' }} not entered</span><span>—</span>{% endif %}
+</div>
+{% if r.foot_diff %}<div class="note bad">The statement doesn't add up: opening {{ r.opening|acct }} + movements {{ r.moves|acct }} = {{ (r.opening + r.moves)|acct }}, but the closing balance is {{ r.closing|acct }}.</div>
+{% elif r.foot_diff is not none and r.opening_src != 'derived' %}<div class=facts>Statement check: opening balance {{ r.opening|acct }} + movements {{ r.moves|acct }} = closing balance {{ r.closing|acct }} &#10003;</div>{% endif %}
+{% if r.n_pending %}<div class=note>{{ r.n_pending }} suggested match{{ '' if r.n_pending==1 else 'es' }} not yet reviewed; {{ 'it is' if r.n_pending==1 else 'they are' }} treated as unmatched above.</div>{% endif %}
+{% if r.n_gone %}<div class="note bad">{{ r.n_gone }} matched book transaction{{ '' if r.n_gone==1 else 's' }} {{ 'has' if r.n_gone==1 else 'have' }} since been deleted, voided or moved in QuickBooks.</div>{% endif %}
+{% if r.snap_diff is not none and r.rec_diff is not none and r.snap_diff != r.rec_diff %}<div class=note>Recalculated from current data. When signed off on {{ r.signed_at.strftime('%Y-%m-%d') }} the difference was {{ r.snap_diff|acct }}; the books or matches have changed since.</div>{% endif %}
+{% if r.signoff_note %}<div class="note bad">Signed off while not reconciled. Reason given: {{ r.signoff_note }}</div>{% endif %}
+<div class=facts>{{ r.n_lines }} statement line{{ '' if r.n_lines==1 else 's' }}: {{ r.n_auto }} matched automatically, {{ r.n_confirmed }} confirmed suggestion{{ '' if r.n_confirmed==1 else 's' }}, {{ r.n_manual }} matched by hand, {{ r.unrec_items|length }} not in the books.{% if r.bf_count %} {{ r.bf_count }} outstanding item{{ '' if r.bf_count==1 else 's' }} brought forward (b/f) from earlier periods.{% endif %}</div>
+<div class=sign>
+<div><div class=who>{% if r.signed_at %}{{ r.signed_by }}, {{ r.signed_at.strftime('%d %b %Y') }}{% endif %}</div><div class=line>Prepared and signed off by · date</div></div>
+<div><div class=who></div><div class=line>Reviewed by · signature · date</div></div>
+</div>
+<footer><span>Amounts in {{ ccy or 'account currency' }}. Brackets are negative.</span><span>Generated {{ now }} EAT · Reconciliation Tool</span></footer>
+</div></body></html>"""
+
+
+def build_report(cur, acct_uuid, stmt):
+    """Everything the reconciliation statement shows, for any statement of the account."""
+    sid = stmt[0]
+    r = reconcile(cur, acct_uuid, stmt)
+    r.update({"p_start": stmt[1], "p_end": stmt[2],
+              "in_items": [t for t in r["un_books"] if t[2] > 0],
+              "out_items": [t for t in r["un_books"] if t[2] < 0],
+              "unrec_items": [l for l in r["un_lines"] if l[2] != 0]})
+    cur.execute("""SELECT match_id, match_type, confidence, created_by FROM match
+                   WHERE statement_id=%s AND status='confirmed';""", (sid,))
+    ms = cur.fetchall()
+    r["n_manual"] = sum(1 for m in ms if m[3] == "user")
+    r["n_auto"] = sum(1 for m in ms if m[3] != "user" and m[1] == "exact" and (m[2] or 0) >= 1)
+    r["n_confirmed"] = len(ms) - r["n_manual"] - r["n_auto"]
+    sls, bts = match_sides(cur, [m[0] for m in ms])
+    items = []
+    for m in ms:
+        a, b = sls.get(str(m[0]), []), bts.get(str(m[0]), [])
+        delta = sum((x[1] for x in a), Decimal(0)) - sum((x[1] for x in b), Decimal(0))
+        if delta:
+            items.append({"date": a[0][0] if a else None, "delta": delta,
+                          "desc": (a[0][2] if a else "") + (f" — books: {b[0][2]} {_acct(b[0][1])}" if b else "")})
+    r["delta_items"] = sorted(items, key=lambda x: str(x["date"]))
+    cur.execute("SELECT signed_off_at, signed_off_by, signoff_note, snap_diff FROM statement WHERE statement_id=%s;", (sid,))
+    r["signed_at"], r["signed_by"], r["signoff_note"], r["snap_diff"] = cur.fetchone()
+    return r
+
+
+@app.route("/account/<name>/report")
+def report(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close(); return "Unknown account", 404
+    acct_uuid, atype, ccy = row
+    want = request.args.get("s")
+    if want:
+        try:
+            uuid.UUID(want)
+        except ValueError:
+            cur.close(); conn.close(); return "No such reconciliation", 404
+        cur.execute(f"SELECT {STMT_COLS} FROM statement WHERE account_id=%s AND statement_id=%s;", (acct_uuid, want))
+        stmt = cur.fetchone()
+    else:
+        stmt = _latest_statement(cur, acct_uuid)
+    if not stmt:
+        cur.close(); conn.close(); return "No such reconciliation", 404
+    r = build_report(cur, acct_uuid, stmt)
+    cur.close(); conn.close()
+    return render_template_string(REPORT_TEMPLATE, name=name, atype=atype, ccy=ccy, r=r,
+                                  company=get_config("company_name"),
+                                  now=datetime.now(EAT).strftime("%d %b %Y, %H:%M"))
 
 
 BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
@@ -3128,8 +3306,8 @@ def record(name):
                           ON CONFLICT (account_id, source_txn_type, source_txn_id) DO NOTHING;""",
                        (ORG_ID, acct_uuid, new_id, entity, d, book_amt, ccy or "USD", desc, payee or None, acc["fqn"], used_ref))
         # Every recorded line teaches the suggestion engine (strongest tier).
-        k2.execute("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref)
-                      VALUES (%s,%s,%s,%s,%s,%s);""", (ORG_ID, desc, acc["fqn"], out, payee or None, used_ref))
+        k2.execute("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref, currency)
+                      VALUES (%s,%s,%s,%s,%s,%s,%s);""", (ORG_ID, desc, acc["fqn"], out, payee or None, used_ref, ccy))
         c2.commit(); k2.close(); c2.close()
         done += 1
     if done:
@@ -3346,7 +3524,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <div class=sub>Past reconciliations for this account{% if ccy %} · {{ ccy }}{% endif %}</div>
 {% if stmts %}
 <table>
-<thead><tr><th>Period</th><th>Reconciled on</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th><th>Status</th></tr></thead>
+<thead><tr><th>Period</th><th>Reconciled on</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th><th>Status</th><th></th></tr></thead>
 <tbody>
 {% for s in stmts %}<tr>
 <td>{{ s.period_start }} → {{ s.period_end }}</td>
@@ -3355,6 +3533,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <td>{% if s.exc is not none %}{{ s.exc }}{% else %}—{% endif %}</td>
 <td class=a>{% if s.diff is not none %}{{ s.diff|money }}{% else %}—{% endif %}</td>
 <td>{% if s.signed %}<span class="pill signed">Signed off {{ s.signed.strftime('%Y-%m-%d') }}</span>{% if s.note %}<br><span class=bad style="font-size:12px;white-space:normal">Unbalanced — {{ s.note }}</span>{% endif %}{% else %}<span class="pill open">In progress</span>{% endif %}</td>
+<td><a href="{{ url_for('report', name=name, s=s.id) }}" target=_blank rel=noopener style="color:var(--accent);font-weight:600;font-size:13px">Report</a></td>
 </tr>{% endfor %}
 </tbody></table>
 <div class=sub style="font-size:12.5px;margin-top:6px">Match counts and difference are snapshots taken when each period was signed off.</div>
@@ -3377,12 +3556,12 @@ def history(name):
     except Exception:
         pass
     cur.execute("""SELECT period_start, period_end, created_at, signed_off_at,
-                          snap_exact, snap_fuzzy, snap_m2o, snap_exc, snap_diff, signoff_note
+                          snap_exact, snap_fuzzy, snap_m2o, snap_exc, snap_diff, signoff_note, statement_id
                    FROM statement WHERE account_id=%s ORDER BY created_at DESC;""", (acct_uuid,))
     stmts = []
-    for ps, pe, created, signed, ex, fz, m2, exc, diff, note in cur.fetchall():
+    for ps, pe, created, signed, ex, fz, m2, exc, diff, note, sid in cur.fetchall():
         stmts.append({"period_start": ps, "period_end": pe, "created": created, "signed": signed,
-                      "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff, "note": note})
+                      "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff, "note": note, "id": sid})
     cur.close(); conn.close()
     return render_template_string(HISTORY_TEMPLATE, name=name, ccy=ccy, stmts=stmts)
 

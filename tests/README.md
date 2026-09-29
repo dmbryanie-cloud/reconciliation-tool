@@ -12,6 +12,7 @@ throwaway in-memory Postgres. **No suite ever talks to QuickBooks** — every Qu
 | `suite_review_writeback.py` | Suggested matches waiting for review, books from QuickBooks, chart-of-accounts cache, write-back (single, bulk, retries, double-click protection), learned suggestions, the one-time migration |
 | `suite_manual_match.py` | Matching by hand (1-1, many-1, 1-many), differences in the balance proof, undo, validation, learning from hand-made matches, the duplicate guard on write-back |
 | `suite_ui.py` | The account page's own JavaScript run in a simulated browser (jsdom): manual-match totals, closest-amount sorting, search, "Match it instead", bulk-record confirmation |
+| `suite_report.py` | The printable reconciliation statement (draft/signed, itemised outstanding and unrecorded items, differences, override notes), past periods after later ones are signed off, keeping UGX and USD separate in transfer checks and suggestions |
 | `suite_security.py` | CSRF tokens on every POST form, refusal of missing/forged/other-session tokens, session cookie flags |
 
 ## Running

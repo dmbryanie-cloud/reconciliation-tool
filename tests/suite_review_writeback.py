@@ -211,6 +211,9 @@ check("after reset, bulk records both", len(POSTS) == n + 2)
 # tier 1: the user's own choice wins next time
 k = c.cursor(); mem = A.PostingMemory(k); c.rollback()
 s1 = mem.suggest("AIRTEL DATA BUNDLE 55", True)
+check("recorded choices remember the account's currency",
+      q1("SELECT count(*) FROM payee_correction WHERE currency='UGX'")[0] >= 1
+      and q1("SELECT count(*) FROM payee_correction WHERE currency IS NULL")[0] == 0)
 check("tier 1: your recorded choice is suggested next time", s1 and s1["cat"] == "Telephone" and s1["tier"] == 1 and s1["payee"] == "Airtel Uganda")
 
 # credit card: charges recordable (as CreditCard purchase), payments not
