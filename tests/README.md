@@ -32,6 +32,12 @@ python tests/suite_sync_deletions.py # one suite on its own
 `run_all.py` starts the test database (PGlite on port 54329, override with `TEST_PG_PORT`),
 runs each suite in its own process, stops the database, and exits non-zero if anything failed.
 
+## CI
+
+`.github/workflows/tests.yml` runs `python tests/run_all.py` on GitHub Actions (Python 3.11,
+Node 24) for every push to `main` and every pull request, and can be started by hand from the
+Actions tab. It needs no secrets.
+
 ## Notes
 
 - Each suite drops and recreates the `public` schema in the **test** database only. The

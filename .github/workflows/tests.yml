@@ -1,0 +1,44 @@
+name: Tests
+
+# Runs the end-to-end suites (tests/run_all.py) against a throwaway in-memory Postgres.
+# Needs no secrets: no suite talks to QuickBooks or Supabase.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"   # matches pyproject.toml
+          cache: pip
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install the test database (PGlite)
+        working-directory: tests
+        run: npm ci
+
+      - name: Run test suites
+        run: python tests/run_all.py
