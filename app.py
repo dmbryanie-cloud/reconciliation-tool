@@ -14,7 +14,7 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta, date
 from flask import Flask, render_template_string, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
-from markupsafe import escape
+from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
@@ -252,11 +252,12 @@ def _h_purchase(e, acct, atype):
 
 def _h_deposit(e, acct, atype):
     if e.get("DepositToAccountRef", {}).get("value") != acct: return None
-    cat = None
+    cat = who = None
     for ln in e.get("Line", []):
         det = ln.get("DepositLineDetail")
-        if det: cat = det.get("AccountRef", {}).get("name"); break
-    return _D(e.get("TotalAmt")), None, e.get("PrivateNote"), cat
+        if det:
+            cat = det.get("AccountRef", {}).get("name"); who = (det.get("Entity") or {}).get("name"); break
+    return _D(e.get("TotalAmt")), who, e.get("PrivateNote"), cat
 
 def _h_transfer(e, acct, atype):
     if e.get("ToAccountRef", {}).get("value") == acct:
@@ -309,6 +310,18 @@ def _h_ccpayment(e, acct, atype):
         return -amt, "Credit card payment", e.get("PrivateNote"), e.get("BankAccountRef", {}).get("name")
     return None
 
+def _entity_ref(e):
+    """'Type:Id' of the transaction's payee, so a write-back can name the same vendor/customer."""
+    for key, default in (("EntityRef", "Vendor"), ("VendorRef", "Vendor"), ("CustomerRef", "Customer")):
+        r = e.get(key) or {}
+        if r.get("value"):
+            return f"{r.get('type') or default}:{r['value']}"
+    for ln in e.get("Line", []):
+        r = (ln.get("DepositLineDetail") or {}).get("Entity") or {}
+        if r.get("value"):
+            return f"{r.get('type') or 'Customer'}:{r['value']}"
+    return None
+
 def _account_refs(etype, e):
     if etype == "Purchase":
         return [e.get("AccountRef", {}).get("value")]
@@ -339,12 +352,26 @@ QBO_HANDLERS = {"Purchase": _h_purchase, "Deposit": _h_deposit, "Transfer": _h_t
 # back the sync watermark forever.
 QBO_OPTIONAL = {"CreditCardPayment"}
 
+def _store_coa(accts):
+    """Cache the chart of accounts so write-back can offer real accounts without a QBO call per page."""
+    rows = [(str(a["Id"]), a.get("Name"), a.get("FullyQualifiedName") or a.get("Name"), a.get("AccountType"),
+             a.get("Classification"), bool(a.get("Active", True)), (a.get("CurrencyRef") or {}).get("value"))
+            for a in accts if a.get("Id")]
+    if not rows:
+        return
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM qbo_coa;")
+    execute_values(cur, "INSERT INTO qbo_coa (qbo_id, name, fqn, account_type, classification, active, currency) VALUES %s", rows)
+    conn.commit(); cur.close(); conn.close()
+
+
 def import_accounts_from_qbo(token):
     """Discover Bank and Credit Card accounts from the connected QBO company and upsert them."""
     try:
         accts = qbo_query("Account", token)
     except Exception:
         return 0
+    _store_coa(accts)
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='account';")
     cols = {r[0] for r in cur.fetchall()}
@@ -488,6 +515,29 @@ def _removal_fallout(cur, removed):
     return open_, signed
 
 
+def _open_statement_ids():
+    """Latest statement per account, where it isn't signed off yet."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT statement_id FROM (SELECT DISTINCT ON (account_id) statement_id, signed_off_at FROM statement
+                   ORDER BY account_id, created_at DESC) t WHERE signed_off_at IS NULL;""")
+    ids = [r[0] for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return ids
+
+
+def last_sync_label():
+    stamp = get_config("last_sync_at")
+    try:
+        t = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return t.astimezone(EAT).strftime("%d %b %Y, %H:%M")
+    except Exception:
+        return None
+
+
+def qbo_is_connected():
+    return bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", "")) and get_config("qbo_conn") != "disconnected"
+
+
 def _sync_age_days(stamp):
     try:
         t = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
@@ -503,7 +553,7 @@ def sync_from_quickbooks(full=False):
     # Watermark: only pull records QBO says changed since our last good sync.
     # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
     # A newly handled entity type needs one full pull, or its older records never arrive.
-    ent_sig = ",".join(sorted(QBO_HANDLERS))
+    ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|refs1"   # bump the suffix to force one full re-pull
     changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
         else get_config("last_sync_at")
     notes = []
@@ -561,19 +611,20 @@ def sync_from_quickbooks(full=False):
                 rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
                              e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
                              e.get("DocNumber"), cat, "unknown",
-                             e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0))
+                             e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0, _entity_ref(e)))
     t1 = time.time()
     if rows:
         execute_values(cur, """
             INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
                                   posted_date, amount, currency, description, counterparty,
-                                  reference, category, cleared_status, last_modified, is_void)
+                                  reference, category, cleared_status, last_modified, is_void, counterparty_ref)
             VALUES %s
             ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
               posted_date=EXCLUDED.posted_date, amount=EXCLUDED.amount, currency=EXCLUDED.currency,
               description=EXCLUDED.description, counterparty=EXCLUDED.counterparty,
               reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified,
-              is_void=EXCLUDED.is_void, is_deleted=false, updated_at=now();
+              is_void=EXCLUDED.is_void, is_deleted=false, updated_at=now(),
+              counterparty_ref=EXCLUDED.counterparty_ref;
         """, rows, page_size=500)
     total = len(rows)
     realm, synced_realm = qbo_realm(), get_config("synced_realm")
@@ -585,7 +636,8 @@ def sync_from_quickbooks(full=False):
         removed, warns = _apply_removals(cur, rows, cache, fetched, deleted, changed_since is None, since)
     reopen, signed_hit = _removal_fallout(cur, removed)
     conn.commit(); cur.close(); conn.close()
-    for sid in reopen:   # open reconciliations: re-match without the removed transactions
+    # Fresh books: re-match every open reconciliation (the user's review decisions are kept).
+    for sid in set(reopen) | set(_open_statement_ids()):
         run_matcher(sid)
     if removed:
         notes.append(f"flagged {len(removed)} transaction{'' if len(removed)==1 else 's'} deleted or moved in QuickBooks"
@@ -628,6 +680,27 @@ try:
                        ("snap_exc", "int"), ("snap_diff", "numeric")):
         _cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {_col} {_typ};")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_book_txn_amt_date ON book_txn (amount, posted_date);")
+    _cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS counterparty_ref text;")   # e.g. 'Vendor:56'
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_coa (qbo_id text PRIMARY KEY, name text, fqn text,
+                    account_type text, classification text, active boolean, currency text);""")
+    # One row per statement line ever sent to QuickBooks: stops a double click or a retry
+    # from posting the same line twice to the company file.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS writeback_log (line_id uuid PRIMARY KEY, status text NOT NULL,
+                    qbo_type text, qbo_id text, account_fqn text, payee text, error text,
+                    created_by text, created_at timestamptz NOT NULL DEFAULT now());""")
+    _cur.execute("""CREATE TABLE IF NOT EXISTS payee_correction (id serial PRIMARY KEY, org_id uuid NOT NULL,
+                    payee text NOT NULL, category text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());""")
+    for _col, _typ in (("money_out", "boolean"), ("vendor", "text"), ("vendor_ref", "text")):
+        _cur.execute(f"ALTER TABLE payee_correction ADD COLUMN IF NOT EXISTS {_col} {_typ};")
+    _cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
+    _cur.execute("SELECT 1 FROM app_config WHERE key='migr_proposed_v1';")
+    if not _cur.fetchone():
+        # Suggestions used to be saved as confirmed. Put the ones on open reconciliations back
+        # up for review; signed-off periods are left as they were signed.
+        _cur.execute("""UPDATE match SET status='proposed'
+                        WHERE status='confirmed' AND (match_type IN ('fuzzy','manual','many_to_one') OR confidence < 1)
+                          AND statement_id IN (SELECT statement_id FROM statement WHERE signed_off_at IS NULL);""")
+        _cur.execute("INSERT INTO app_config (key, value) VALUES ('migr_proposed_v1', 'done');")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_line_amt_date ON statement_line (amount, posted_date);")
     _c.commit(); _cur.close(); _c.close()
 except Exception as e:
@@ -637,7 +710,9 @@ except Exception as e:
 # ---------------- learned categorization (memory) ----------------
 _STOPWORDS = {"and","the","of","inc","llc","ltd","co","corp","company",
               "services","service","pos","debit","purchase","payment",
-              "card","visa","ach","ppd","tst"}
+              "card","visa","ach","ppd","tst",
+              # bank-narrative noise
+              "ref","txn","trx","trn","chq","no","from","to","for","via","being","limited","pmt"}
 
 def _normalize(name):
     if not name: return ""
@@ -645,7 +720,9 @@ def _normalize(name):
     return re.sub(r"\s+", " ", s).strip()
 
 def _mtokens(name):
-    return [t for t in _normalize(name).split() if len(t) > 1 and not t.isdigit() and t not in _STOPWORDS]
+    # Drop reference numbers (anything with 3+ digits) along with the noise words.
+    return [t for t in _normalize(name).split()
+            if len(t) > 1 and sum(ch.isdigit() for ch in t) < 3 and t not in _STOPWORDS]
 
 def _tok_match(a, b):
     return a == b or (len(a) >= 3 and len(b) >= 3 and (a.startswith(b) or b.startswith(a)))
@@ -654,122 +731,178 @@ def _coverage(known, inn):
     if not known: return 0.0
     return sum(1 for k in known if any(_tok_match(k, i) for i in inn)) / len(known)
 
-def ensure_corrections_table():
+def _money_out(amount, atype):
+    """Credit cards: a charge (positive) is money out. Banks: a withdrawal (negative) is."""
+    return amount > 0 if atype == "credit_card" else amount < 0
+
+
+def _similarity(a, b):
+    """Two-way token overlap (Dice), counting prefix matches like SUPERMKT ~ SUPERMARKET."""
+    if not a or not b:
+        return 0.0
+    hits = sum(1 for x in a if any(_tok_match(x, y) for y in b)) + sum(1 for y in b if any(_tok_match(x, y) for x in a))
+    return hits / (len(a) + len(b))
+
+
+LEARN_MIN_SCORE = 0.5
+TIER_TEXT = {1: "you recorded a similar line", 2: "similar bank lines were posted", 3: "this payee is usually posted"}
+
+
+class PostingMemory:
+    """Suggests an account and payee for a bank line from how the books treated similar lines.
+
+    Three tiers, strongest first -- the first tier with a good match wins:
+      1. lines recorded from this app (the user picked the account)
+      2. bank lines matched to a QuickBooks transaction (bank wording -> how it was posted)
+      3. QuickBooks history by payee name
+    """
+    def __init__(self, cur):
+        self.entries, self.index = [], {}
+        cur.execute("SELECT payee, category, money_out, vendor, vendor_ref FROM payee_correction;")
+        for desc, cat, out, vendor, ref in cur.fetchall():
+            self._add(1, desc, out, cat, vendor, ref, 1)
+        cur.execute("""SELECT sl.description, sl.amount, a.type, bt.category, bt.counterparty, bt.counterparty_ref
+                       FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id
+                       JOIN statement_line sl ON sl.line_id=msl.line_id
+                       JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                       JOIN account a ON a.account_id=bt.account_id
+                       WHERE m.status='confirmed' AND m.match_type IN ('exact','fuzzy')
+                         AND bt.category IS NOT NULL AND NOT bt.is_deleted;""")
+        for desc, amt, atype, cat, cp, ref in cur.fetchall():
+            self._add(2, desc, _money_out(amt, atype), cat, cp, ref, 1)
+        cur.execute("""SELECT bt.counterparty, bt.category, bt.counterparty_ref, a.type, bt.amount > 0, count(*)
+                       FROM book_txn bt JOIN account a ON a.account_id=bt.account_id
+                       WHERE bt.category IS NOT NULL AND coalesce(trim(bt.counterparty),'') <> '' AND NOT bt.is_deleted
+                       GROUP BY 1, 2, 3, 4, 5;""")
+        for cp, cat, ref, atype, pos, n in cur.fetchall():
+            self._add(3, cp, pos if atype == "credit_card" else not pos, cat, cp, ref, n)
+
+    def _add(self, tier, text, out, cat, payee, ref, n):
+        toks = _mtokens(text)
+        if not toks or not cat:
+            return
+        i = len(self.entries)
+        self.entries.append((tier, toks, out, cat, payee, ref, n, text))
+        for t in set(toks):
+            self.index.setdefault(t[:3], []).append(i)
+
+    def suggest(self, desc, money_out):
+        toks = _mtokens(desc)
+        if not toks:
+            return None
+        cands = set()
+        for t in toks:
+            cands.update(self.index.get(t[:3], ()))
+        tiers = {}
+        for i in cands:
+            tier, etoks, out, cat, payee, ref, n, text = self.entries[i]
+            if out is not None and out != money_out:
+                continue
+            sc = _similarity(toks, etoks)
+            if sc >= LEARN_MIN_SCORE:
+                tiers.setdefault(tier, []).append((sc, self.entries[i]))
+        for tier in (1, 2, 3):
+            hits = tiers.get(tier)
+            if not hits:
+                continue
+            votes, best, count = Counter(), {}, Counter()
+            for sc, e in hits:
+                votes[e[3]] += sc * sc * e[6]
+                count[e[3]] += e[6]
+                if e[3] not in best or sc > best[e[3]][0]:
+                    best[e[3]] = (sc, e)
+            cat, v = votes.most_common(1)[0]
+            sc, e = best[cat]
+            payees = Counter()
+            for s2, e2 in hits:
+                if e2[3] == cat and e2[4]:
+                    payees[(e2[4], e2[5])] += s2 * e2[6]
+            (payee, ref) = payees.most_common(1)[0][0] if payees else (None, None)
+            n = count[cat]
+            because = (f"{TIER_TEXT[tier]} to {cat}" + (f" ({n}×)" if n > 1 else "")
+                       + (f" — like '{e[7][:40]}'" if tier < 3 else f" — '{e[7][:40]}'"))
+            return {"cat": cat, "conf": round(v / sum(votes.values()) * sc, 2), "payee": payee, "payee_ref": ref,
+                    "because": because, "tier": tier}
+        return None
+
+
+POST_EXCLUDE = {"Bank", "Credit Card", "Accounts Receivable", "Accounts Payable"}
+
+
+def load_coa(cur):
+    """Postable accounts from the cached chart of accounts."""
+    cur.execute("SELECT qbo_id, name, fqn, account_type FROM qbo_coa WHERE coalesce(active, true) ORDER BY fqn;")
+    return [{"id": i, "name": n, "fqn": f or n, "type": t} for i, n, f, t in cur.fetchall() if t not in POST_EXCLUDE]
+
+
+def resolve_coa(coa, category):
+    """QuickBooks refs carry either the full name (Automobile:Fuel) or the leaf name."""
+    if not category:
+        return None
+    for key in ("fqn", "name"):
+        for a in coa:
+            if a[key] == category:
+                return a
+    leaf = category.split(":")[-1]
+    return next((a for a in coa if a["name"] == leaf), None)
+
+
+def qbo_post(token, entity, body):
+    req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/{entity.lower()}",
+                                 data=json.dumps(body).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def qbo_record_line(token, acct_qbo, atype, money_out, target_id, amount_abs, txn_date, desc, payee, payee_ref):
+    """Create the QuickBooks transaction for one bank line. Returns (entity, new id, payee_ref used)."""
+    note = (f"{payee} — " if payee else "") + f"Recorded from bank reconciliation: {desc}"
+    amt = float(amount_abs)
+    if money_out:
+        entity = "Purchase"
+        body = {"AccountRef": {"value": acct_qbo}, "PaymentType": "CreditCard" if atype == "credit_card" else "Cash",
+                "TxnDate": str(txn_date), "PrivateNote": note[:4000],
+                "Line": [{"DetailType": "AccountBasedExpenseLineDetail", "Amount": amt, "Description": desc[:4000],
+                          "AccountBasedExpenseLineDetail": {"AccountRef": {"value": target_id}}}]}
+        if payee_ref and ":" in payee_ref:
+            rtype, rid = payee_ref.split(":", 1)
+            if rtype in ("Vendor", "Customer", "Employee"):
+                body["EntityRef"] = {"value": rid, "type": rtype}
+    else:
+        entity = "Deposit"
+        body = {"DepositToAccountRef": {"value": acct_qbo}, "TxnDate": str(txn_date), "PrivateNote": note[:4000],
+                "Line": [{"DetailType": "DepositLineDetail", "Amount": amt, "Description": desc[:4000],
+                          "DepositLineDetail": {"AccountRef": {"value": target_id}}}]}
+    try:
+        res = qbo_post(token, entity, body)
+    except urllib.error.HTTPError as e:
+        # A 400 means nothing was created. If a payee was attached (it may since have been made
+        # inactive or merged), record the line without it rather than fail.
+        if e.code == 400 and "EntityRef" in body:
+            body.pop("EntityRef")
+            res = qbo_post(token, entity, body)
+        else:
+            raise
+    return entity, str((res.get(entity) or {}).get("Id") or ""), payee_ref if "EntityRef" in body else None
+
+
+def _claim_writeback(line_id, user):
+    """Reserve a line for writing. Refuses if it's already done or an attempt is in flight --
+    an interrupted attempt stays blocked until someone confirms it didn't reach QuickBooks."""
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS payee_correction (
-        id serial PRIMARY KEY, org_id uuid NOT NULL, payee text NOT NULL,
-        category text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());""")
+    cur.execute("""INSERT INTO writeback_log (line_id, status, created_by) VALUES (%s, 'pending', %s)
+                   ON CONFLICT (line_id) DO UPDATE SET status='pending', error=NULL, created_at=now(),
+                     created_by=EXCLUDED.created_by
+                   WHERE writeback_log.status='failed' RETURNING line_id;""", (line_id, user))
+    ok = cur.fetchone() is not None
     conn.commit(); cur.close(); conn.close()
-
-def record_correction(payee, category):
-    ensure_corrections_table()
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO payee_correction (org_id, payee, category) VALUES (%s,%s,%s);", (ORG_ID, payee, category))
-    conn.commit(); cur.close(); conn.close()
-
-def build_memory():
-    ensure_corrections_table()
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""SELECT lower(trim(counterparty)), category FROM book_txn
-                   WHERE category IS NOT NULL AND counterparty IS NOT NULL AND trim(counterparty)<>'';""")
-    hist_rows = cur.fetchall()
-    cur.execute("SELECT lower(trim(payee)), category FROM payee_correction ORDER BY created_at;")
-    corr_rows = cur.fetchall()
-    cur.close(); conn.close()
-    byp = {}
-    for p, c in hist_rows: byp.setdefault(p, Counter())[c] += 1
-    history = {}
-    for p, counts in byp.items():
-        total = sum(counts.values()); bc, bn = counts.most_common(1)[0]
-        history[p] = (bc, bn / total, total)
-    corrections = {}
-    for p, c in corr_rows: corrections[p] = c
-    return {"history": history, "corrections": corrections}
-
-def _best_match(keys, payee):
-    in_toks, in_norm = _mtokens(payee), _normalize(payee)
-    best_key, best = None, 0.0
-    for key in keys:
-        kt = _mtokens(key)
-        if not kt: continue
-        score = max(_coverage(kt, in_toks), SequenceMatcher(None, in_norm, _normalize(key)).ratio())
-        if score > best: best_key, best = key, score
-    return best_key, best
-
-def suggest_category(memory, payee, threshold=0.6, fuzzy=True):
-    if not payee: return None, 0.0, None, 0.0, None
-    key = payee.strip().lower()
-    corr, hist = memory["corrections"], memory["history"]
-    if key in corr: return corr[key], 1.0, key, 1.0, "your correction"
-    if fuzzy:
-        bk, score = _best_match(corr.keys(), payee)
-        if bk and score >= threshold: return corr[bk], 1.0, bk, score, "your correction"
-    if key in hist:
-        c, conf, _ = hist[key]; return c, conf, key, 1.0, "history"
-    if fuzzy:
-        bk, score = _best_match(hist.keys(), payee)
-        if bk and score >= threshold:
-            c, conf, _ = hist[bk]; return c, conf, bk, score, "history"
-    return None, 0.0, None, 0.0, None
+    return ok
 
 
 # ---------------- QuickBooks write-back (expenses + deposits) ----------------
-def _expense_accounts(token):
-    return [a for a in qbo_query("Account", token) if a.get("AccountType") == "Expense"]
-
-def _resolve_account(category, expense_accts):
-    by_name = {a["Name"]: a["Id"] for a in expense_accts}
-    by_fqn = {a.get("FullyQualifiedName", a["Name"]): a["Id"] for a in expense_accts}
-    default = next((a for a in expense_accts if "office" in a["Name"].lower() or "misc" in a["Name"].lower()),
-                   expense_accts[0] if expense_accts else None)
-    if category and category in by_fqn: return by_fqn[category], category
-    if category and category in by_name: return by_name[category], category
-    if category:
-        leaf = category.split(":")[-1]
-        if leaf in by_name: return by_name[leaf], leaf
-    return (default["Id"], default["Name"]) if default else (None, None)
-
-def create_purchase(token, paid_from_qbo, expense_id, amount_abs, txn_date, note, payment_type="Cash"):
-    body = {"AccountRef": {"value": paid_from_qbo}, "PaymentType": payment_type,
-            "TxnDate": txn_date, "PrivateNote": note,
-            "Line": [{"DetailType": "AccountBasedExpenseLineDetail", "Amount": amount_abs,
-                      "AccountBasedExpenseLineDetail": {"AccountRef": {"value": expense_id}}}]}
-    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/purchase"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
-
-def _income_accounts(token):
-    return [a for a in qbo_query("Account", token) if a.get("AccountType") in ("Income", "Other Income")]
-
-def _resolve_income(category, income_accts):
-    by_name = {a["Name"]: a["Id"] for a in income_accts}
-    by_fqn = {a.get("FullyQualifiedName", a["Name"]): a["Id"] for a in income_accts}
-    default = next((a for a in income_accts if any(k in a["Name"].lower() for k in ("sales", "income", "service", "fee"))),
-                   income_accts[0] if income_accts else None)
-    if category and category in by_fqn: return by_fqn[category], category
-    if category and category in by_name: return by_name[category], category
-    if category:
-        leaf = category.split(":")[-1]
-        if leaf in by_name: return by_name[leaf], leaf
-    return (default["Id"], default["Name"]) if default else (None, None)
-
-def create_deposit(token, deposit_to_qbo, income_id, amount_abs, txn_date, note):
-    body = {"DepositToAccountRef": {"value": deposit_to_qbo}, "TxnDate": txn_date, "PrivateNote": note,
-            "Line": [{"Amount": amount_abs, "DetailType": "DepositLineDetail",
-                      "DepositLineDetail": {"AccountRef": {"value": income_id}}}]}
-    url = f"{QBO_BASE}/v3/company/{qbo_realm()}/deposit"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
-
-
 def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
     """Register balance of a bank/card account at the end of `as_of`, in the account's currency.
 
@@ -883,6 +1016,13 @@ tbody tr:hover{background:#f7f9fb}
 .balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 .balform input{width:170px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;font-variant-numeric:tabular-nums}
 .tag.bf{background:var(--none-soft);color:var(--none)}
+.tag.pending{background:var(--warn-soft);color:var(--warn)}
+.hint{color:var(--muted);font-size:12px;line-height:1.4;white-space:normal}
+.rectbl td{vertical-align:top}
+.rectbl select,.rectbl input.payee{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:230px;background:#fff}
+.rectbl select{width:230px}.rectbl input.payee{width:150px}
+.booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px}
+.btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
 @media (max-width:760px){
   .tiles{grid-template-columns:repeat(2,1fr)}
@@ -1807,13 +1947,20 @@ def run_matcher(statement_id):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, period_start, period_end FROM statement WHERE statement_id=%s;", (statement_id,))
     acct_uuid, p_start, p_end = cur.fetchone()
-    # Remember what the user rejected, so re-running the engine (after a books import,
-    # write-back, etc.) doesn't resurrect those pairings as confirmed.
-    cur.execute("""SELECT m.match_type,
+    # Keep the user's decisions across re-runs (sync, write-back, books import):
+    #   confirmed suggestions are pinned first, so nothing else can claim their lines;
+    #   rejected pairings are never proposed again, and stay listed as rejected.
+    cur.execute("""SELECT m.match_type, m.confidence, m.status, m.amount_delta,
                           array(SELECT line_id::text FROM match_statement_line WHERE match_id=m.match_id),
-                          array(SELECT txn_id::text FROM match_book_txn WHERE match_id=m.match_id)
-                   FROM match m WHERE m.statement_id=%s AND m.status='rejected';""", (statement_id,))
-    rejected = {(mt, frozenset(ls), frozenset(ts)) for mt, ls, ts in cur.fetchall()}
+                          array(SELECT txn_id::text FROM match_book_txn WHERE match_id=m.match_id),
+                          m.confirmed_by, m.confirmed_at
+                   FROM match m WHERE m.statement_id=%s AND m.status IN ('confirmed','rejected');""", (statement_id,))
+    pinned, rejected = [], {}
+    for mt, conf, st, delta, ls, ts, by, at in cur.fetchall():
+        if st == "rejected":
+            rejected[(mt, frozenset(ls), frozenset(ts))] = (mt, conf, delta, ls, ts, by, at)
+        elif mt != "exact" or (conf is not None and conf < 1):
+            pinned.append((mt, conf, delta, ls, ts, by, at))
     cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match_book_txn WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match WHERE statement_id=%s;", (statement_id,))
@@ -1822,15 +1969,28 @@ def run_matcher(statement_id):
     txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
     used, matched_lines, matches = set(), set(), []
-    def add(lids, tids, mt, conf, delta):
-        matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids))
+    def add(lids, tids, mt, conf, delta, status=None, by=None, at=None):
+        # Only an exact amount on (nearly) the same date is safe to accept unseen.
+        status = status or ("confirmed" if mt == "exact" and conf >= 1 else "proposed")
+        matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids, status, by, at))
+    def ok(mt, lids, tids):
+        return (mt, frozenset(map(str, lids)), frozenset(map(str, tids))) not in rejected
+
+    line_ids = {str(l[0]) for l in lines}; pool_ids = {str(t[0]) for t in txns}
+    for mt, conf, delta, ls, ts, by, at in pinned:
+        if set(ls) <= line_ids and set(ts) <= pool_ids and not (set(ts) & used) and not (set(ls) & matched_lines):
+            add(ls, ts, mt, float(conf or 0), delta, "confirmed", by, at)
+            used.update(ts); matched_lines.update(ls)
+    used = {str(u) for u in used}; matched_lines = {str(m) for m in matched_lines}
+    lines = [(str(a), b, c, d) for a, b, c, d in lines]
+    txns = [(str(a), b, c, d) for a, b, c, d in txns]
 
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
     for l_id, ld, la, lw in lines:
         best = None
         for t_id, td, ta, tw in txns:
-            if t_id in used or la != ta:
+            if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
                 continue
             gap = abs((ld - td).days)
             if gap <= DATE_TOLERANCE_DAYS and (best is None or gap < best[0]):
@@ -1846,7 +2006,7 @@ def run_matcher(statement_id):
             continue
         best = None
         for t_id, td, ta, tw in txns:
-            if t_id in used or la != ta:
+            if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
                 continue
             lag = (ld - td).days
             if DATE_TOLERANCE_DAYS < lag <= CLEARING_WINDOW_DAYS and (best is None or lag < best[0]):
@@ -1861,7 +2021,8 @@ def run_matcher(statement_id):
         for t_id, td, ta, tw in txns:
             if t_id in used:
                 continue
-            if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
+            if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= DATE_TOLERANCE_DAYS \
+                    and ok("fuzzy", [l_id], [t_id]):
                 add([l_id], [t_id], "fuzzy", 0.6, la - ta); used.add(t_id); matched_lines.add(l_id); break
 
     # pass 3: many-to-one, BOTH directions (bounded; candidates sorted by date-closeness)
@@ -1875,7 +2036,7 @@ def run_matcher(statement_id):
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
                 for combo in itertools.combinations(cands, k):
-                    if sum((c[1] for c in combo), Decimal(0)) == la:
+                    if sum((c[1] for c in combo), Decimal(0)) == la and ok("many_to_one", [l_id], [c[0] for c in combo]):
                         found = combo; break
                 if found:
                     break
@@ -1893,7 +2054,7 @@ def run_matcher(statement_id):
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
                 for combo in itertools.combinations(cands, k):
-                    if sum((c[1] for c in combo), Decimal(0)) == ta:
+                    if sum((c[1] for c in combo), Decimal(0)) == ta and ok("many_to_one", [c[0] for c in combo], [t_id]):
                         found = combo; break
                 if found:
                     break
@@ -1912,17 +2073,20 @@ def run_matcher(statement_id):
         for t_id, td, ta, tw in txns:
             if t_id in used:
                 continue
-            if la == -ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
+            if la == -ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS and ok("manual", [l_id], [t_id]):
                 add([l_id], [t_id], "manual", 0.5, 0)
                 used.add(t_id); matched_lines.add(l_id); break
+
+    # Rejected pairings stay on record (so they can be restored) but claim nothing.
+    for mt, conf, delta, ls, ts, by, at in rejected.values():
+        if set(ls) <= line_ids and set(ts) <= pool_ids:
+            add(ls, ts, mt, float(conf or 0), delta, "rejected", by, at)
 
     # bulk insert (few round-trips instead of hundreds)
     if matches:
         execute_values(cur,
-            "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta) VALUES %s",
-            [(m[0], ORG_ID, statement_id,
-              "rejected" if (m[1], frozenset(map(str, m[4])), frozenset(map(str, m[5]))) in rejected else "confirmed",
-              m[1], m[2], m[3]) for m in matches])
+            "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta, confirmed_by, confirmed_at) VALUES %s",
+            [(m[0], ORG_ID, statement_id, m[6], m[1], m[2], m[3], m[7], m[8]) for m in matches])
         msl = [(m[0], lid) for m in matches for lid in m[4]]
         if msl:
             execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", msl)
@@ -1941,7 +2105,7 @@ def account_summary(cur, acct_uuid, name, atype, currency=None):
     s = _latest_statement(cur, acct_uuid)
     if not s: return {"name": name, "type": atype, "status": "none", "currency": currency}
     sid, ps, pe, signed = s[:4]
-    cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status<>'rejected' GROUP BY match_type;", (sid,))
+    cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status='confirmed' GROUP BY match_type;", (sid,))
     mc = dict(cur.fetchall())
     rec = reconcile(cur, acct_uuid, s)
     exc = len(rec["un_lines"]) + len(rec["un_books"])
@@ -2036,7 +2200,9 @@ if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
 schedule('Loading...');});
 document.addEventListener('submit',function(e){
+if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
+if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
 if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
 else if(act.indexOf('/import_books')>-1)t='Importing your books...';
 else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
@@ -2064,8 +2230,7 @@ def dashboard():
     n_signed = sum(1 for r in rows if r["status"] == "signed")
     tot_exc = sum(r.get("exc", 0) for r in rows)
     sync_msg = session.pop("sync_msg", None)
-    _has_token = bool(_get_stored_refresh() or os.environ.get("QBO_REFRESH_TOKEN", ""))
-    qbo_connected = _has_token and get_config("qbo_conn") != "disconnected"
+    qbo_connected = qbo_is_connected()
     return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed, n_hidden=n_hidden,
                                   tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
 
@@ -2089,9 +2254,20 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div><label>Period end (statement date)</label><input type=date name=period_end></div>
 </div>
 <div class=muted style="font-size:12px">Leave blank if the file has a running-balance column (CSV) or a ledger balance (OFX) — they're read automatically. Opening defaults to last signed-off closing. Set the period end to the statement date: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></form>
-<form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
-<div class=u-label>Books from QuickBooks (CSV export) · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
-<input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
+<div class=u-label>Books</div>
+{% if qbo_connected and qbo_linked %}
+<form method=post action="{{ url_for('sync') }}" class=booksrc><input type=hidden name=back value="{{ name }}">
+<span>&#10003; Read straight from QuickBooks{% if last_sync %} · last synced {{ last_sync }}{% endif %}</span>
+<button type=submit class=btn-sm>Refresh from QuickBooks</button></form>
+<div class=hint style="margin-top:4px">Uploading a statement refreshes the books automatically — no export needed.</div>
+<details style="margin-top:10px"><summary class=muted style="cursor:pointer;font-size:12.5px">Offline? Import a QuickBooks CSV export instead</summary>
+{% else %}
+<div class=hint style="margin-bottom:8px">{% if not qbo_connected %}<a href="{{ url_for('connect') }}" style="color:var(--accent);font-weight:600">Connect QuickBooks</a> to read books directly, or import a CSV export:{% else %}This account isn't linked to a QuickBooks account — import a CSV export:{% endif %}</div>
+{% endif %}
+<form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="margin-top:8px">
+<div class=u-label>QuickBooks CSV export · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
+<input type=file name=books accept=.csv required> <button type=submit class=btn-sm>Import books</button></form>
+{% if qbo_connected and qbo_linked %}</details>{% endif %}
 {% if session.is_admin %}
 <div style="margin-top:15px;border-top:1px solid var(--line-soft);padding-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
 <form method=post action="{{ url_for('clear_account', name=name) }}" onsubmit="return confirm('Clear ALL statements and book transactions for this account? This removes old synced or imported data so you can start fresh offline. This cannot be undone.');" style="display:inline">
@@ -2105,7 +2281,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if has_results %}
 <div class=tiles id=dtiles>
 <button class="tile" data-target="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7"/></svg></span><span class=t-label>Exact</span></div><div class=t-val>{{ n_exact }}</div></button>
-<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>Discrepancies</span></div><div class=t-val>{{ n_fuzzy }}</div></button>
+<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>To review</span></div><div class="t-val {{ 'warn' if n_pending else '' }}">{{ n_pending }}</div></button>
 <button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="8" height="8" rx="1.5"/><rect x="13" y="12.5" width="8" height="8" rx="1.5"/><path d="M13 7.5h3a2 2 0 0 1 2 2v3"/></svg></span><span class=t-label>Batched</span></div><div class=t-val>{{ n_m2o }}</div></button>
 <button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
 <button class="tile" data-target="sec-balance"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Unreconciled</span></div><div class=t-val style="color:{{ '#047857' if rec.status=='balanced' else ('#b42318' if rec.status=='out' else '#667085') }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</div></button>
@@ -2154,27 +2330,28 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
 <form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterward.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
-{% elif rec.status=='balanced' %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>
-{% else %}<button type=button class=btn-go disabled style="opacity:.45;cursor:not-allowed" title="Balance the reconciliation first">Sign off this reconciliation</button>{% endif %}
+{% elif rec.status=='balanced' and not n_pending %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>
+{% else %}<button type=button class=btn-go disabled style="opacity:.45;cursor:not-allowed" title="{{ 'Review the suggested matches first' if n_pending else 'Balance the reconciliation first' }}">Sign off this reconciliation</button>{% if n_pending %} <a href="#sec-review" class=hint style="color:var(--warn);font-weight:600">{{ n_pending }} suggested match{{ '' if n_pending==1 else 'es' }} to review first</a>{% endif %}{% endif %}
 <a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
 <a href="{{ url_for('qbo_import_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download for QuickBooks (CSV)</a>
-{% if session.is_admin and not signed_off and rec.status!='balanced' %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
+{% if session.is_admin and not signed_off and (rec.status!='balanced' or n_pending) %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
 <form method=post action="{{ url_for('signoff', name=name) }}" class=balform><input type=hidden name=override value=1>
 <div><label>Reason (recorded with the sign-off)</label><input name=note required style="width:340px;max-width:100%"></div>
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Sign off unbalanced</button></form></details>{% endif %}
 </div>
 {% if reviewable %}
-<h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
-{% if n_signflip %}<div class=sub style="margin:-4px 0 12px">{{ n_signflip }} opposite-sign proposal{{ '' if n_signflip==1 else 's' }} below (same amount, flipped sign) — confirm the real matches, reject the rest.</div>{% endif %}
-<table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
+<h2 id=sec-review style="font-size:15px">Suggested matches{% if n_pending %} — {{ n_pending }} to review{% endif %}</h2>
+<div class=sub style="margin:-4px 0 12px">These aren't counted until you confirm them.{% if n_signflip %} {{ n_signflip }} {{ 'is an' if n_signflip==1 else 'are' }} opposite-sign pairing{{ '' if n_signflip==1 else 's' }} (same amount, flipped sign) — usually a transfer entered the wrong way round.{% endif %}</div>
+{% if n_pending > 1 %}<form method=post action="{{ url_for('review_all', name=name) }}" style="margin:0 0 4px" onsubmit="return confirm('Confirm all {{ n_pending }} suggested matches?');"><button type=submit class=btn-sm>Confirm all {{ n_pending }}</button></form>{% endif %}
+<table><tr><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
-<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched')) }}</span></td>
-<td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched total')) }}</span></td>
+<td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
-<td>{% if r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
-<td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}">
-{% if r.status=='rejected' %}<input type=hidden name=status value=confirmed><button type=submit class=btn-sm>Restore</button>
-{% else %}<input type=hidden name=status value=rejected><button type=submit class=btn-sm>Reject</button>{% endif %}
+<td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
+<td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}" class=btnrow>
+{% if r.status=='proposed' %}<button type=submit name=status value=confirmed class=btn-sm>Confirm</button><button type=submit name=status value=rejected class=btn-sm>Reject</button>
+{% else %}<button type=submit name=status value=proposed class=btn-sm>Undo</button>{% endif %}
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
@@ -2183,30 +2360,48 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
-{% if writebacks %}
-<h2 style="font-size:15px">{% if atype=='credit_card' %}Unrecorded charges{% else %}Unrecorded expenses{% endif %} — add to QuickBooks ({{ writebacks|length }})</h2>
-<table><tr><th>Date</th><th>Payee</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
-{% for w in writebacks %}<tr>
+{% if writebacks or deposits %}
+<h2 id=sec-record style="font-size:15px">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
+<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement.</div>
+<form method=post action="{{ url_for('record', name=name) }}" id=recform>
+<table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
+{% for w in writebacks + deposits %}<tr>
+<td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.acct_id %}checked{% endif %}>{% endif %}</td>
 <td>{{ w.date }}</td>
-<td>{{ w.who }}{% if w.matched and w.matched != w.who.strip().lower() %}<br><span style="color:#73726c;font-size:12px">recognized '{{ w.matched }}' {{ "%.0f"|format(w.score*100) }}%</span>{% endif %}</td>
+<td style="white-space:normal;max-width:280px">{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}</td>
 <td class=a>{{ w.amount|money }}</td>
-<td><form method=post action="{{ url_for('writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-<input type=text name=category value="{{ w.cat or '' }}" placeholder="category" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
-<button type=submit class=btn-sm>Create</button>
-{% if w.source %}<span style="color:#73726c;font-size:12px">via {{ w.source }}{% if w.conf %} · {{ "%.0f"|format(w.conf*100) }}%{% endif %}</span>{% endif %}
-</form></td>
-</tr>{% endfor %}</table>
+{% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px">I checked — it's not in QuickBooks</button></td>
+{% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
+{% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
+{% else %}
+<td><select name="acct_{{ w.line_id }}" class=acct data-dir="{{ 'out' if w.out else 'in' }}" data-sel="{{ w.acct_id or '' }}" aria-label="Account"></select>{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
+<td><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class=payee aria-label="Payee"><input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
+<td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm>Record</button></td>
 {% endif %}
-{% if deposits %}
-<h2 style="font-size:15px">{% if atype=='credit_card' %}Unrecorded payments &amp; refunds{% else %}Unrecorded deposits — add to QuickBooks{% endif %} ({{ deposits|length }})</h2>
-<table><tr><th>Date</th><th>Source</th><th class=a>Amount</th><th>Record in QuickBooks</th></tr>
-{% for w in deposits %}<tr>
-<td>{{ w.date }}</td><td>{{ w.who }}</td><td class=a>{{ w.amount|money }}</td>
-<td>{% if atype=='credit_card' %}<span style="color:var(--muted);font-size:12.5px">Record as a card payment or refund in QuickBooks</span>{% else %}<form method=post action="{{ url_for('deposit_writeback', name=name, line_id=w.line_id) }}" onsubmit="var b=this.querySelector('button');b.textContent='Creating…';b.disabled=true;" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-<input type=text name=category placeholder="income account" style="padding:6px 8px;border:1px solid #d8d7d2;border-radius:6px;font-size:13px;width:180px">
-<button type=submit class=btn-sm>Create</button>
-</form>{% endif %}</td>
 </tr>{% endfor %}</table>
+<button type=submit name=bulk value=1 class=btn>Record selected in QuickBooks</button>
+</form>
+<script id=coa-data type=application/json>{{ coa_json }}</script>
+<script>(function(){
+var el=document.getElementById('coa-data');if(!el)return;var coa=[];try{coa=JSON.parse(el.textContent)}catch(e){}
+var order={out:['Expense','Cost of Goods Sold','Other Expense'],'in':['Income','Other Income']};
+var groups={};coa.forEach(function(a){(groups[a.t]=groups[a.t]||[]).push(a)});
+document.querySelectorAll('select.acct').forEach(function(s){
+  var pref=order[s.getAttribute('data-dir')]||[],sel=s.getAttribute('data-sel');
+  var o=document.createElement('option');o.value='';o.textContent='— choose account —';s.appendChild(o);
+  Object.keys(groups).sort(function(a,b){var x=pref.indexOf(a),y=pref.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x-y||a.localeCompare(b)}).forEach(function(t){
+    var g=document.createElement('optgroup');g.label=t;
+    groups[t].forEach(function(a){var op=document.createElement('option');op.value=a.id;op.textContent=a.n;if(a.id===sel)op.selected=true;g.appendChild(op)});
+    s.appendChild(g)});
+  s.addEventListener('change',function(){var cb=s.closest('tr').querySelector('.rsel');if(cb&&s.value)cb.checked=true});
+});
+var all=document.getElementById('selall');if(all)all.addEventListener('change',function(){document.querySelectorAll('.rsel').forEach(function(c){c.checked=all.checked})});
+var f=document.getElementById('recform');
+if(f)f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='bulk')return;
+  var n=0,t=0;document.querySelectorAll('.rsel:checked').forEach(function(c){n++;t+=Math.abs(parseFloat(c.getAttribute('data-amt'))||0)});
+  if(!n){e.preventDefault();return}
+  if(!confirm('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString(undefined,{minimumFractionDigits:2})+' in QuickBooks?'))e.preventDefault();});
+})();</script>
 {% endif %}
 {% if n_xfer %}<h2 id=sec-exceptions style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 nothing is matched or written back. Confirm each one before acting. If a pair is a genuine transfer, record it once as a Transfer in QuickBooks, not as two separate transactions.</div>
@@ -2239,7 +2434,9 @@ if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
 schedule('Loading...');});
 document.addEventListener('submit',function(e){
+if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Working...';
+if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
 if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
 else if(act.indexOf('/import_books')>-1)t='Importing your books...';
 else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
@@ -2299,7 +2496,7 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
         JOIN account a ON a.account_id = s.account_id
         WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
                           JOIN match m ON m.match_id = msl.match_id
-                          WHERE msl.line_id = sl.line_id AND m.status <> 'rejected');
+                          WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');
     """, (ids, dts, amts, acct_uuid, window, window))
     for lid, nm, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append(
@@ -2319,7 +2516,7 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
         WHERE coalesce(bt.is_void, false) = false AND coalesce(bt.is_deleted, false) = false
           AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
                           JOIN match m ON m.match_id = mbt.match_id
-                          WHERE mbt.txn_id = bt.txn_id AND m.status <> 'rejected');
+                          WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed');
     """, (ids, dts, amts, acct_uuid, window, window))
     for lid, nm, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append(
@@ -2352,7 +2549,7 @@ def book_pool(cur, acct_uuid, sid, p_start, p_end):
                      AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
                                      JOIN match m ON m.match_id=mbt.match_id
                                      JOIN statement s ON s.statement_id=m.statement_id
-                                     WHERE mbt.txn_id=bt.txn_id AND m.status<>'rejected'
+                                     WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed'
                                        AND s.statement_id<>%s AND s.signed_off_at IS NOT NULL)
                    ORDER BY bt.posted_date;""", (acct_uuid, floor, p_end, sid))
     return cur.fetchall()
@@ -2370,16 +2567,18 @@ def reconcile(cur, acct_uuid, stmt):
     cur.execute("SELECT line_id, posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE statement_id=%s ORDER BY posted_date;", (sid,))
     lines = cur.fetchall()
     pool = book_pool(cur, acct_uuid, sid, ps, pe)
-    cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
+    cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status='confirmed';", (sid,))
     ml = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
+    cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status='confirmed';", (sid,))
     mt = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND status='proposed';", (sid,))
+    n_pending = cur.fetchone()[0]
     cur.execute("""SELECT d FROM (
                      SELECT (SELECT coalesce(sum(sl.amount),0) FROM match_statement_line msl
                                JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=m.match_id)
                           - (SELECT coalesce(sum(bt.amount),0) FROM match_book_txn mbt
                                JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=m.match_id) AS d
-                     FROM match m WHERE m.statement_id=%s AND m.status<>'rejected') q WHERE d<>0;""", (sid,))
+                     FROM match m WHERE m.statement_id=%s AND m.status='confirmed') q WHERE d<>0;""", (sid,))
     deltas = [r[0] for r in cur.fetchall()]
     cur.execute("""SELECT count(*) FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
                    JOIN book_txn bt ON bt.txn_id=mbt.txn_id
@@ -2399,7 +2598,7 @@ def reconcile(cur, acct_uuid, stmt):
          "out_in": sum((t[2] for t in un_books if t[2] > 0), Z), "n_out_in": sum(1 for t in un_books if t[2] > 0),
          "out_out": sum((t[2] for t in un_books if t[2] < 0), Z), "n_out_out": sum(1 for t in un_books if t[2] < 0),
          "unrec": sum((l[2] for l in un_lines), Z), "n_unrec": len(un_lines),
-         "match_adj": sum(deltas, Z), "n_match_adj": len(deltas), "n_gone": n_gone}
+         "match_adj": sum(deltas, Z), "n_match_adj": len(deltas), "n_gone": n_gone, "n_pending": n_pending}
     r["foot_diff"] = (opening + moves - closing) if (opening is not None and closing is not None) else None
     prev = _prev_signed_closing(cur, acct_uuid, ps, sid)
     r["prev_closing"], r["prev_end"] = (prev[0], prev[1]) if prev else (None, None)
@@ -2415,7 +2614,7 @@ def reconcile(cur, acct_uuid, stmt):
     return r
 
 
-def compute_detail(cur, acct_uuid, atype="bank"):
+def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     s = _latest_statement(cur, acct_uuid)
     if not s: return {"has_results": False}
     sid, ps, pe, signed = s[:4]
@@ -2425,16 +2624,16 @@ def compute_detail(cur, acct_uuid, atype="bank"):
                    coalesce(sl.counterparty, sl.description,''), bt.amount FROM match m
                    JOIN match_statement_line msl ON msl.match_id=m.match_id JOIN statement_line sl ON sl.line_id=msl.line_id
                    JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
-                   WHERE m.statement_id=%s AND m.match_type IN ('exact','fuzzy') AND m.status<>'rejected' ORDER BY sl.posted_date;""", (sid,))
+                   WHERE m.statement_id=%s AND m.match_type IN ('exact','fuzzy') AND m.status='confirmed' ORDER BY sl.posted_date;""", (sid,))
     matched = cur.fetchall()
-    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='many_to_one' AND status<>'rejected';", (sid,))
+    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='many_to_one' AND status='confirmed';", (sid,))
     n_m2o = cur.fetchone()[0]
-    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='manual' AND status<>'rejected';", (sid,))
+    cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='manual' AND status='proposed';", (sid,))
     n_signflip = cur.fetchone()[0]
     reviewable = []
     cur.execute("""SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s
                    AND (match_type IN ('fuzzy','many_to_one','manual') OR (match_type='exact' AND confidence < 1))
-                   ORDER BY match_type;""", (sid,))
+                   ORDER BY status='proposed' DESC, match_type;""", (sid,))
     rmatches = cur.fetchall()
     rids = [str(r[0]) for r in rmatches]
     sls_by, bts_by = {}, {}
@@ -2450,20 +2649,32 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     for mid, mtype, status, delta in rmatches:
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])})
-    mem = build_memory()
+    unmatched_lines = [l for l in lines if l[0] not in ml]
+    mem = PostingMemory(cur) if unmatched_lines else None
+    coa = load_coa(cur)
+    wb = {}
+    if unmatched_lines:
+        cur.execute("SELECT line_id, status, qbo_id FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
+                    ([str(l[0]) for l in unmatched_lines],))
+        wb = {str(r[0]): (r[1], r[2]) for r in cur.fetchall()}
     writebacks, deposits, on_stmt_in = [], [], []
-    for (lid, dd, a, who) in [l for l in lines if l[0] not in ml]:
-        # Credit cards invert the sign: a charge (positive) is the "money out" recorded as an expense;
-        # a payment/refund (negative) is the money-in side. Banks are the reverse.
-        money_out = (a > 0) if atype == "credit_card" else (a < 0)
-        if money_out:
-            cat, conf, matched_p, score, source = suggest_category(mem, who, fuzzy=False)
-            writebacks.append({"line_id": lid, "date": dd, "amount": a, "who": who,
-                               "cat": cat, "conf": conf, "matched": matched_p, "score": score, "source": source})
-        elif a != 0:
-            deposits.append({"line_id": lid, "date": dd, "amount": a, "who": who})
-        else:
-            on_stmt_in.append((lid, dd, a, who))
+    for (lid, dd, a, who) in unmatched_lines:
+        if a == 0:
+            on_stmt_in.append((lid, dd, a, who)); continue
+        out = _money_out(a, atype)
+        sug = mem.suggest(who, out)
+        acct = resolve_coa(coa, sug["cat"]) if sug else None
+        why_not = (None if acct_qbo and coa else
+                   "Connect this account to QuickBooks to record it" if not acct_qbo else
+                   "Sync with QuickBooks once to load your accounts")
+        if atype == "credit_card" and not out:
+            why_not = "Card payment or refund — record it in QuickBooks as a transfer or refund"
+        status, qbo_id = wb.get(str(lid), (None, None))
+        item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
+                "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
+                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done") else None,
+                "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not}
+        (writebacks if out else deposits).append(item)
     _unmatched = [l for l in lines if l[0] not in ml]
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
     try:
@@ -2476,7 +2687,9 @@ def compute_detail(cur, acct_uuid, atype="bank"):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
-            "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"]}
+            "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
+            "n_pending": rec["n_pending"],
+            "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"]} for a in coa]).replace("<", "\\u003c"))}
 
 
 BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
@@ -2491,9 +2704,10 @@ def detail(name):
     if not row:
         cur.close(); conn.close(); return "Unknown account", 404
     acct_uuid, atype, ccy, acct_qbo = row
-    d = compute_detail(cur, acct_uuid, atype)
+    d = compute_detail(cur, acct_uuid, atype, acct_qbo)
     cur.close(); conn.close()
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
+                                  qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None), **d)
 
 
@@ -2526,12 +2740,19 @@ def upload(name):
     f = request.files.get("statement")
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
+    refreshed = ""
+    if qbo_is_connected():
+        try:
+            sync_from_quickbooks()   # books straight from QuickBooks, so matching sees today's entries
+            refreshed = " Books refreshed from QuickBooks."
+        except Exception as e:
+            refreshed = f" (Couldn't refresh books from QuickBooks: {e} — matched against the last sync.)"
     try:
         opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
         sid, n, skipped = ingest_file(f.read().decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
                                       _form_date("period_start"), _form_date("period_end"))
         note = run_matcher(sid)
-        session["detail_msg"] = f"Loaded {n} statement lines and reconciled." + _skipped_note(skipped) + (f" {note}" if note else "")
+        session["detail_msg"] = f"Loaded {n} statement lines and reconciled." + refreshed + _skipped_note(skipped) + (f" {note}" if note else "")
     except Exception as e:
         return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
@@ -2564,15 +2785,133 @@ def import_books(name):
     return redirect(url_for("detail", name=name))
 
 
+def _after_review(sid):
+    run_matcher(sid)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
+    conn.commit(); cur.close(); conn.close()
+
+
 @app.route("/account/<name>/review/<match_id>", methods=["POST"])
 def review_match(name, match_id):
     new_status = request.form.get("status")
-    if new_status in ("confirmed", "rejected"):
+    if new_status in ("confirmed", "rejected", "proposed"):
         conn = get_conn(); cur = conn.cursor()
-        cur.execute("UPDATE match SET status=%s WHERE match_id=%s;", (new_status, match_id))
-        cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=(SELECT statement_id FROM match WHERE match_id=%s);", (match_id,))
+        cur.execute("""UPDATE match SET status=%s, confirmed_by=%s, confirmed_at=now(), updated_at=now()
+                       WHERE match_id=%s AND statement_id IN (SELECT s.statement_id FROM statement s
+                         JOIN account a ON a.account_id=s.account_id WHERE a.name=%s)
+                       RETURNING statement_id;""", (new_status, session.get("name"), match_id, name))
+        row = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+        if row:
+            _after_review(row[0])
+    return redirect(url_for("detail", name=name) + "#sec-review")
+
+
+@app.route("/account/<name>/review_all", methods=["POST"])
+def review_all(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    n = 0
+    if s:
+        cur.execute("""UPDATE match SET status='confirmed', confirmed_by=%s, confirmed_at=now(), updated_at=now()
+                       WHERE statement_id=%s AND status='proposed';""", (session.get("name"), s[0]))
+        n = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    if s and n:
+        _after_review(s[0])
+        session["detail_msg"] = f"Confirmed {n} suggested match{'' if n == 1 else 'es'}."
+    return redirect(url_for("detail", name=name) + "#sec-review")
+
+
+@app.route("/account/<name>/record", methods=["POST"])
+def record(name):
+    """Record selected unmatched bank lines in QuickBooks (Purchase for money out, Deposit for money in)."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    arow = cur.fetchone()
+    if not arow:
+        cur.close(); conn.close(); return "Unknown account", 404
+    acct_uuid, acct_qbo, atype, ccy = arow
+    ids = [request.form["only"]] if request.form.get("only") else request.form.getlist("sel")
+    s = _latest_statement(cur, acct_uuid)
+    if not ids or not s or not acct_qbo:
+        cur.close(); conn.close()
+        session["detail_msg"] = "Nothing to record." if acct_qbo else "This account isn't linked to QuickBooks."
+        return redirect(url_for("detail", name=name) + "#sec-record")
+    coa = {a["id"]: a for a in load_coa(cur)}
+    cur.execute("""SELECT sl.line_id, sl.posted_date, sl.amount, coalesce(sl.description,'') FROM statement_line sl
+                   WHERE sl.statement_id=%s AND sl.line_id = ANY(%s::uuid[])
+                     AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                                     WHERE msl.line_id=sl.line_id AND m.status='confirmed')
+                   ORDER BY sl.posted_date;""", (s[0], ids))
+    lines = cur.fetchall()
+    cur.close(); conn.close()
+    done, problems, skipped = 0, [], 0
+    token = None
+    for lid, d, amt, desc in lines:
+        lid = str(lid)
+        label = f"{d} {desc[:30]}"
+        acc = coa.get(request.form.get(f"acct_{lid}") or "")
+        out = _money_out(amt, atype)
+        if not acc:
+            problems.append(f"{label}: choose an account"); continue
+        if atype == "credit_card" and not out:
+            problems.append(f"{label}: card payments/refunds aren't recorded from here"); continue
+        payee = (request.form.get(f"payee_{lid}") or "").strip()
+        # Only reuse the learned payee ID if the user kept the suggested payee name.
+        ref = request.form.get(f"pref_{lid}") or None
+        if payee != (request.form.get(f"psug_{lid}") or "").strip():
+            ref = None
+        if not _claim_writeback(lid, session.get("name")):
+            skipped += 1; continue
+        try:
+            token = token or qbo_token()
+            entity, new_id, used_ref = qbo_record_line(token, acct_qbo, atype, out, acc["id"], abs(amt), d, desc, payee, ref)
+        except Exception as e:
+            err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
+            c2 = get_conn(); k2 = c2.cursor()
+            k2.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id=%s;", (err, lid))
+            c2.commit(); k2.close(); c2.close()
+            problems.append(f"{label}: QuickBooks said {err}"); continue
+        c2 = get_conn(); k2 = c2.cursor()
+        k2.execute("""UPDATE writeback_log SET status='done', qbo_type=%s, qbo_id=%s, account_fqn=%s, payee=%s
+                      WHERE line_id=%s;""", (entity, new_id or None, acc["fqn"], payee or None, lid))
+        if new_id:
+            book_amt = abs(amt) if (atype == "credit_card" or not out) else -abs(amt)
+            k2.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
+                              currency, description, counterparty, reference, category, cleared_status, last_modified,
+                              counterparty_ref)
+                          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,'unknown',now(),%s)
+                          ON CONFLICT (account_id, source_txn_type, source_txn_id) DO NOTHING;""",
+                       (ORG_ID, acct_uuid, new_id, entity, d, book_amt, ccy or "USD", desc, payee or None, acc["fqn"], used_ref))
+        # Every recorded line teaches the suggestion engine (strongest tier).
+        k2.execute("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref)
+                      VALUES (%s,%s,%s,%s,%s,%s);""", (ORG_ID, desc, acc["fqn"], out, payee or None, used_ref))
+        c2.commit(); k2.close(); c2.close()
+        done += 1
+    if done:
+        _after_review(s[0])
+    msg = f"Recorded {done} transaction{'' if done == 1 else 's'} in QuickBooks." if done else ""
+    if skipped:
+        msg += f" Skipped {skipped} already recorded or in progress."
+    if problems:
+        msg += " Not recorded: " + "; ".join(problems[:5]) + (" …" if len(problems) > 5 else "")
+    session["detail_msg"] = msg.strip() or "Nothing to record."
+    return redirect(url_for("detail", name=name) + "#sec-record")
+
+
+@app.route("/account/<name>/record_reset", methods=["POST"])
+def record_reset(name):
+    """After an interrupted write-back, the user checked QuickBooks and it isn't there: allow a retry."""
+    lid = request.form.get("reset")
+    if lid:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""UPDATE writeback_log SET status='failed', error='cleared by ' || %s
+                       WHERE line_id=%s AND status='pending';""", (session.get("name") or "user", lid))
         conn.commit(); cur.close(); conn.close()
-    return redirect(url_for("detail", name=name))
+    return redirect(url_for("detail", name=name) + "#sec-record")
 
 
 @app.route("/account/<name>/balances", methods=["POST"])
@@ -2646,6 +2985,11 @@ def signoff(name):
             rec = d["rec"]
             note = (request.form.get("note") or "").strip()
             override = session.get("is_admin") and request.form.get("override") == "1" and note
+            if rec["n_pending"] and not override:
+                session["detail_msg"] = (f"Not signed off: {rec['n_pending']} suggested match"
+                                         f"{'' if rec['n_pending'] == 1 else 'es'} still need a confirm or reject.")
+                cur.close(); conn.close()
+                return redirect(url_for("detail", name=name) + "#sec-review")
             if rec["status"] != "balanced" and not override:
                 why = (f"it needs a {rec['missing']}" if rec["status"] == "incomplete"
                        else f"the adjusted balances are out by {_money(rec['rec_diff'])}" if rec["rec_diff"]
@@ -2661,7 +3005,7 @@ def signoff(name):
             except Exception:
                 conn.rollback()
             cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by=%s, signoff_note=%s WHERE statement_id=%s;",
-                        (session.get("name") or "you", note if rec["status"] != "balanced" else None, sid))
+                        (session.get("name") or "you", note if (rec["status"] != "balanced" or rec["n_pending"]) else None, sid))
             conn.commit()
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
@@ -2679,119 +3023,6 @@ def reopen(name):
             cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
             conn.commit()
     cur.close(); conn.close()
-    return redirect(url_for("detail", name=name))
-
-
-@app.route("/account/<name>/writeback/<line_id>", methods=["POST"])
-def writeback(name, line_id):
-    chosen = (request.form.get("category") or "").strip()
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
-    arow = cur.fetchone()
-    if not arow:
-        cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, acct_qbo, atype, ccy = arow
-    cur.execute("""SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
-                   FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
-                   WHERE sl.line_id=%s AND s.account_id=%s;""", (line_id, acct_uuid))
-    lrow = cur.fetchone()
-    cur.close(); conn.close()
-    if not lrow:
-        return redirect(url_for("detail", name=name))
-    d, amount, who = lrow
-    try:
-        token = qbo_token()
-        expense_accts = _expense_accounts(token)
-        acct_id, label = _resolve_account(chosen, expense_accts)
-        if not acct_id:
-            return f"No expense account found to categorize under. <br><a href='{url_for('detail', name=name)}'>Back</a>"
-        is_cc = atype == "credit_card"
-        result = create_purchase(token, acct_qbo, acct_id, float(abs(amount)), str(d), f"Reconciliation write-back: {who}",
-                                 payment_type="CreditCard" if is_cc else "Cash")
-        new_id = (result.get("Purchase") or {}).get("Id")
-        sug = suggest_category(build_memory(), who)[0]
-        if chosen and chosen != (sug or ""):
-            record_correction(who, label)
-        conn = get_conn(); cur = conn.cursor()
-        if new_id:
-            cur.execute("""
-                INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
-                                      posted_date, amount, currency, description, counterparty,
-                                      reference, category, cleared_status, last_modified)
-                VALUES (%s,%s,%s,'Purchase',%s,%s,%s,%s,%s,NULL,%s,'unknown',now())
-                ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
-                  amount=EXCLUDED.amount, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
-            """, (ORG_ID, acct_uuid, new_id, d, abs(amount) if is_cc else -abs(amount), ccy or "USD", who, who, label))
-        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
-        srow = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-        if srow:
-            note = run_matcher(srow[0])
-            if note:
-                session["detail_msg"] = note
-            c2 = get_conn(); cu2 = c2.cursor()
-            cu2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
-            c2.commit(); cu2.close(); c2.close()
-    except urllib.error.HTTPError as e:
-        try: body = e.read().decode()[:300]
-        except Exception: body = ""
-        return f"QuickBooks rejected it (HTTP {e.code}): {escape(body)} <br><a href='{url_for('detail', name=name)}'>Back</a>"
-    except Exception as e:
-        return f"Write-back failed: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
-    return redirect(url_for("detail", name=name))
-
-
-@app.route("/account/<name>/deposit/<line_id>", methods=["POST"])
-def deposit_writeback(name, line_id):
-    chosen = (request.form.get("category") or "").strip()
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
-    arow = cur.fetchone()
-    if not arow:
-        cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, acct_qbo, atype, ccy = arow
-    if atype != "bank":
-        cur.close(); conn.close(); return redirect(url_for("detail", name=name))
-    cur.execute("""SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
-                   FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
-                   WHERE sl.line_id=%s AND s.account_id=%s;""", (line_id, acct_uuid))
-    lrow = cur.fetchone()
-    cur.close(); conn.close()
-    if not lrow:
-        return redirect(url_for("detail", name=name))
-    d, amount, who = lrow
-    try:
-        token = qbo_token()
-        income_accts = _income_accounts(token)
-        inc_id, label = _resolve_income(chosen, income_accts)
-        if not inc_id:
-            return f"No income account found to record the deposit against. <br><a href='{url_for('detail', name=name)}'>Back</a>"
-        result = create_deposit(token, acct_qbo, inc_id, float(abs(amount)), str(d), f"Reconciliation deposit: {who}")
-        new_id = (result.get("Deposit") or {}).get("Id")
-        conn = get_conn(); cur = conn.cursor()
-        if new_id:
-            cur.execute("""
-                INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
-                                      posted_date, amount, currency, description, counterparty,
-                                      reference, category, cleared_status, last_modified)
-                VALUES (%s,%s,%s,'Deposit',%s,%s,%s,%s,%s,NULL,%s,'unknown',now())
-                ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
-                  amount=EXCLUDED.amount, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
-            """, (ORG_ID, acct_uuid, new_id, d, abs(amount), ccy or "USD", who or "Deposit", who, label))
-        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
-        srow = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-        if srow:
-            note = run_matcher(srow[0])
-            if note:
-                session["detail_msg"] = note
-            c2 = get_conn(); cu2 = c2.cursor()
-            cu2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
-            c2.commit(); cu2.close(); c2.close()
-    except urllib.error.HTTPError as e:
-        try: body = e.read().decode()[:300]
-        except Exception: body = ""
-        return f"QuickBooks rejected it (HTTP {e.code}): {escape(body)} <br><a href='{url_for('detail', name=name)}'>Back</a>"
-    except Exception as e:
-        return f"Deposit write-back failed: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
 
 
@@ -2856,9 +3087,9 @@ def exceptions_csv(name):
     wtr.writerow(["Source", "Date", "Description", "Amount", "Direction", "Suggested category"])
     if d.get("has_results"):
         for wb in d.get("writebacks", []):
-            wtr.writerow(["Bank statement", wb["date"], wb["who"], wb["amount"], "Money out", wb.get("cat") or ""])
+            wtr.writerow(["Bank statement", wb["date"], wb["who"], wb["amount"], "Money out", (wb.get("sug") or {}).get("cat") or ""])
         for dp in d.get("deposits", []):
-            wtr.writerow(["Bank statement", dp["date"], dp["who"], dp["amount"], "Money in", ""])
+            wtr.writerow(["Bank statement", dp["date"], dp["who"], dp["amount"], "Money in", (dp.get("sug") or {}).get("cat") or ""])
         for (lid, dd, a, who) in d.get("on_stmt", []):
             wtr.writerow(["Bank statement", dd, who, a, ("Money in" if a > 0 else "Money out"), ""])
         for (tid, dd, a, who) in d.get("in_books", []):
@@ -3143,15 +3374,22 @@ def check_connection():
 
 @app.route("/sync", methods=["POST"])
 def sync():
+    back = request.form.get("back")
     try:
         full = request.form.get("full") == "1"
         n, detail, mode, timing = sync_from_quickbooks(full=full)
         window = _sync_since()
         scope = f"since {window}" if window else "all history"
-        session["sync_msg"] = (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
-                               f"Records fetched: {detail}.")
+        msg = (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
+               f"Records fetched: {detail}.")
+        if back:
+            msg = "Books refreshed from QuickBooks and re-matched." + (f" {detail.split('. ', 1)[1]}" if ". " in detail else "")
     except Exception as e:
-        session["sync_msg"] = f"Sync failed: {e}"
+        msg = f"Sync failed: {e}"
+    if back:
+        session["detail_msg"] = msg
+        return redirect(url_for("detail", name=back))
+    session["sync_msg"] = msg
     return redirect(url_for("dashboard"))
 
 
