@@ -38,8 +38,9 @@ for p in (purchase("501", 45000, "2026-08-10", "Shell Uganda", "56", "Automobile
     QBO["Purchase"][p["Id"]] = p
 POSTS, STATE = [], {"fail": None, "entity_400": False, "syncs": 0}
 
-def fake_query(entity, token, since=None, changed_since=None):
-    return COA if entity == "Account" else list(QBO.get(entity, {}).values())
+def fake_query(entity, token, since=None, changed_since=None, each=None):
+    recs = COA if entity == "Account" else list(QBO.get(entity, {}).values())
+    return each(recs) if each else recs
 def fake_post(token, entity, body):
     POSTS.append((entity, json.loads(json.dumps(body))))
     if STATE["fail"]:

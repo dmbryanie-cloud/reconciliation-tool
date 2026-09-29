@@ -26,9 +26,15 @@ def purchase(i, acct, amt, d="2026-09-10", who="Vendor"):
     QBO["Purchase"][i] = {"Id": i, "AccountRef": {"value": acct}, "TotalAmt": amt, "TxnDate": d,
                           "EntityRef": {"name": who}, "MetaData": {"LastUpdatedTime": "2026-09-20T10:00:00-07:00"}}
 
-def fake_query(entity, token, since=None, changed_since=None):
+def fake_query(entity, token, since=None, changed_since=None, each=None):
     STATE["queries"].append((entity, changed_since))
-    return list(QBO[entity].values())            # (the fake ignores the watermark: returns everything)
+    recs = list(QBO[entity].values())            # (the fake ignores the watermark: returns everything)
+    if not each:
+        return recs
+    out = []
+    for i in range(0, len(recs), 2):             # small pages, like QuickBooks' paging
+        out.extend(each(recs[i:i + 2]))
+    return out
 
 def fake_cdc(token, entities, changed_since):
     STATE["cdc_calls"] += 1
@@ -177,5 +183,26 @@ _, mode = sync()
 check("capped CDC forces the next sync to be full", mode == "full")
 _, mode = sync()
 check("…and then back to incremental", mode.startswith("changes since"))
+
+# 14. a full re-pull takes minutes on a real company: never inside an upload or a balance fetch
+A.qbo_is_connected = lambda: True
+A.set_config("sync_force_full", "1")
+check("full sync reported as due", A.sync_full_due() is True)
+q0 = len(STATE["queries"])
+r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+            "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data", follow_redirects=True)
+page = r.get_data(as_text=True)
+check("upload while a full sync is due doesn't sync", len(STATE["queries"]) == q0)
+check("…still loads and matches the statement", "Loaded 3 statement lines" in page)
+check("…and says why books weren't refreshed", "full QuickBooks sync is due" in page)
+r = cl.post("/account/Stanbic/balances", data={"action": "fetch_book"}, follow_redirects=True)
+check("balance fetch refused while a full sync is due", len(STATE["queries"]) == q0
+      and "full QuickBooks sync is due first" in r.get_data(as_text=True))
+_, mode = sync()
+check("the Sync button runs the full pull", mode == "full" and A.sync_full_due() is False)
+q0 = len(STATE["queries"])
+cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+        "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
+check("after it, uploads refresh books again", len(STATE["queries"]) > q0)
 
 sys.exit(T.summary())

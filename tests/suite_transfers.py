@@ -162,8 +162,10 @@ check("sync reads card transfers the right way round", A._h_transfer(
     and A._h_transfer({"FromAccountRef": {"value": "41"}, "ToAccountRef": {"value": "35"}, "Amount": 10}, "41", "credit_card")[0] == D(10))
 before = {a: book(a) for a in (UGX, CEN, VISA)}
 META = {"LastUpdatedTime": "2026-09-28T10:00:00-07:00"}
-A.qbo_query = lambda entity, token, since=None, changed_since=None: (
-    COA if entity == "Account" else [{**t, "MetaData": META} for t in QBO] if entity == "Transfer" else [])
+def _q(entity, token, since=None, changed_since=None, each=None):
+    recs = COA if entity == "Account" else [{**t, "MetaData": META} for t in QBO] if entity == "Transfer" else []
+    return each(recs) if each else recs
+A.qbo_query = _q
 A.qbo_cdc_deleted = lambda t, e, cs: ({}, False)
 A.sync_from_quickbooks(full=True)
 after = {a: book(a) for a in (UGX, CEN, VISA)}

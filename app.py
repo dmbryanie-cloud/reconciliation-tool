@@ -216,13 +216,15 @@ def _sync_since():
     m = (m - 1) % 12 + 1
     return f"{y:04d}-{m:02d}-01"
 
-def qbo_query(entity, token, since=None, changed_since=None):
+def qbo_query(entity, token, since=None, changed_since=None, each=None):
     """Query a QBO entity, following STARTPOSITION paging until exhausted.
 
     QuickBooks caps ANY single query at 1000 rows. The previous version sent
     MAXRESULTS 1000 with no paging, so any entity with more than 1000 records
     was silently truncated -- no error, no warning. For a reconciliation tool
     that surfaces as phantom "unrecorded" items on the bank side.
+
+    `each`, if given, turns every page into what's kept (the raw pages are dropped as they go).
     """
     out = []
     start = 1
@@ -240,7 +242,7 @@ def qbo_query(entity, token, since=None, changed_since=None):
         req.add_header("Accept", "application/json")
         with urllib.request.urlopen(req) as resp:
             batch = json.loads(resp.read()).get("QueryResponse", {}).get(entity, [])
-        out.extend(batch)
+        out.extend(each(batch) if each else batch)
         if len(batch) < QBO_PAGE_SIZE:
             break
         start += QBO_PAGE_SIZE
@@ -489,18 +491,16 @@ def _apply_removals(cur, rows, cache, fetched, deleted, full_mode, since):
                        AND NOT is_deleted;""", (etype, ids))
         removed.update(r[0] for r in cur.fetchall())
     current = {(str(r[1]), r[3], str(r[2])) for r in rows}   # (account, type, id) as QBO has them now
-    for etype, ents in cache.items():
-        ids = [str(e.get("Id")) for e in ents if e.get("Id")]
+    for etype, ids in cache.items():   # cache: the ids QBO returned per type
         if not ids:
             continue
         cur.execute("""SELECT txn_id, account_id, source_txn_id FROM book_txn
                        WHERE source_txn_type=%s AND source_txn_id = ANY(%s) AND NOT is_deleted;""", (etype, ids))
         removed.update(t for t, a, i in cur.fetchall() if (str(a), etype, i) not in current)
     if full_mode:
-        for etype, ents in cache.items():
+        for etype, ids in cache.items():
             if fetched.get(etype, -1) < 0:
                 continue   # a failed pull says nothing about what exists
-            ids = [str(e.get("Id")) for e in ents if e.get("Id")]
             cur.execute("""SELECT txn_id FROM book_txn
                            WHERE source_txn_type=%s AND NOT is_deleted AND NOT (source_txn_id = ANY(%s))
                              AND (%s::date IS NULL OR posted_date >= %s::date);""", (etype, ids, since, since))
@@ -562,12 +562,9 @@ def _sync_age_days(stamp):
         return 10 ** 6
 
 
-def sync_from_quickbooks(full=False):
-    token = qbo_token()
-    import_accounts_from_qbo(token)
-    since = _sync_since()
+def _sync_plan(full=False):
+    """(changed_since, ent_sig, notes) for the next sync; changed_since None means a full pull."""
     # Watermark: only pull records QBO says changed since our last good sync.
-    # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
     # A newly handled entity type needs one full pull, or its older records never arrive.
     ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|refs2"   # bump the suffix to force one full re-pull (refs2: card transfer signs)
     changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
@@ -577,14 +574,72 @@ def sync_from_quickbooks(full=False):
         # Deletions older than the change feed's reach can only be found by a full pull.
         changed_since = None
         notes.append(f"last sync was over {CDC_MAX_DAYS} days ago, so this was a full sync to catch deletions")
+    return changed_since, ent_sig, notes
+
+
+def sync_full_due():
+    """True when the next sync must re-download everything. That takes minutes on a real company,
+    so it's only run from the Sync button, never inside another request (an upload would time out)."""
+    return _sync_plan()[0] is None
+
+
+def _book_rows(etype, handler, ents, by_qbo):
+    """book_txn rows for the tracked accounts these QuickBooks records touch."""
+    rows = []
+    for e in ents:
+        seen = set()
+        for ref in _account_refs(etype, e):
+            if not ref:
+                continue
+            ref = str(ref)
+            if ref in seen or ref not in by_qbo:
+                continue
+            seen.add(ref)
+            acct_uuid, atype = by_qbo[ref]
+            try:
+                res = handler(e, ref, atype)
+            except Exception:
+                continue
+            if not res:
+                continue
+            amount, cp, desc, cat = res
+            # QBO voids by zeroing the amounts; keep the row but out of matching.
+            rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
+                         e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
+                         e.get("DocNumber"), cat, "unknown",
+                         e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0, _entity_ref(e)))
+    return rows
+
+
+def sync_from_quickbooks(full=False):
+    token = qbo_token()
+    import_accounts_from_qbo(token)
+    since = _sync_since()
+    changed_since, ent_sig, notes = _sync_plan(full)
+    # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S-00:00")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
+    conn.commit()
+    cur.execute("SELECT account_id, source_account_id, name, type FROM account ORDER BY type, name;")
+    by_qbo = {}
+    for acct_uuid, acct_qbo, name, atype in cur.fetchall():
+        if acct_qbo:
+            by_qbo[str(acct_qbo)] = (acct_uuid, atype)
+    cur.close(); conn.close()   # not held open through the fetch, which can take minutes
     t0 = time.time()
-    cache = {}
-    fetched = {}
-    for etype in QBO_HANDLERS:
+    # Each page becomes book rows as it arrives and only its ids are kept: a full pull of a
+    # large company never holds every raw record in memory at once.
+    rows, cache, fetched = [], {}, {}
+    for etype, handler in QBO_HANDLERS.items():
+        got = []
+        def keep(batch, etype=etype, handler=handler, got=got):
+            got.extend(_book_rows(etype, handler, batch, by_qbo))
+            return [str(e["Id"]) for e in batch if e.get("Id")]
         try:
-            cache[etype] = qbo_query(etype, token, since=since, changed_since=changed_since)
+            cache[etype] = qbo_query(etype, token, since=since, changed_since=changed_since, each=keep)
             fetched[etype] = len(cache[etype])
+            rows.extend(got)
         except urllib.error.HTTPError:
             cache[etype] = []
             fetched[etype] = -1  # -1 marks a failed pull, distinct from a genuine zero
@@ -597,37 +652,6 @@ def sync_from_quickbooks(full=False):
             notes.append("couldn't read deletions from QuickBooks; they'll be checked on the next sync")
     fetch_secs = time.time() - t0
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
-    conn.commit()
-    cur.execute("SELECT account_id, source_account_id, name, type FROM account ORDER BY type, name;")
-    by_qbo = {}
-    for acct_uuid, acct_qbo, name, atype in cur.fetchall():
-        if acct_qbo:
-            by_qbo[str(acct_qbo)] = (acct_uuid, atype)
-    rows = []
-    for etype, handler in QBO_HANDLERS.items():
-        for e in cache[etype]:
-            seen = set()
-            for ref in _account_refs(etype, e):
-                if not ref:
-                    continue
-                ref = str(ref)
-                if ref in seen or ref not in by_qbo:
-                    continue
-                seen.add(ref)
-                acct_uuid, atype = by_qbo[ref]
-                try:
-                    res = handler(e, ref, atype)
-                except Exception:
-                    continue
-                if not res:
-                    continue
-                amount, cp, desc, cat = res
-                # QBO voids by zeroing the amounts; keep the row but out of matching.
-                rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
-                             e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
-                             e.get("DocNumber"), cat, "unknown",
-                             e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0, _entity_ref(e)))
     t1 = time.time()
     if rows:
         execute_values(cur, """
@@ -3472,7 +3496,11 @@ def upload(name):
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
     refreshed = ""
-    if qbo_is_connected():
+    if qbo_is_connected() and sync_full_due():
+        refreshed = (" Books not refreshed: a full QuickBooks sync is due and takes several minutes, so it isn't run"
+                     " during an upload. Use Sync from QuickBooks on the dashboard; the statement was matched"
+                     " against the last sync until then.")
+    elif qbo_is_connected():
         try:
             sync_from_quickbooks()   # books straight from QuickBooks, so matching sees today's entries
             refreshed = " Books refreshed from QuickBooks."
@@ -3846,6 +3874,8 @@ def balances(name):
             cur.close(); conn.close()
             if not acct_qbo:
                 raise ValueError("This account isn't linked to a QuickBooks account.")
+            if sync_full_due():
+                raise ValueError("A full QuickBooks sync is due first. Run Sync from QuickBooks on the dashboard, then try again.")
             sync_from_quickbooks(full=False)   # the calculation needs fresh transactions
             bal = qbo_book_balance_at(qbo_token(), acct_uuid, acct_qbo, pe)
             conn = get_conn(); cur = conn.cursor()
