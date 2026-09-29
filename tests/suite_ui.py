@@ -18,7 +18,8 @@ check = T.check
 
 A.qbo_is_connected = lambda: False
 cur.execute("""INSERT INTO qbo_coa (qbo_id, name, fqn, account_type, active)
-               VALUES ('83','Office Supplies','Office Supplies','Expense',true), ('90','Sales','Sales','Income',true)""")
+               VALUES ('83','Office Supplies','Office Supplies','Expense',true), ('90','Sales','Sales','Income',true),
+                      ('36','Centenary','Centenary','Bank',true)""")
 for tid, d, amt, who in (("b1", "2026-09-04", 100000, "Cust A"), ("b2", "2026-09-04", 199000, "Cust B"),
                          ("b3", "2026-09-09", -50000, "Savings transfer"), ("b4", "2026-10-05", -80000, "Supplier X"),
                          ("b5", "2026-09-01", -70000, "Supplier Y"), ("b6", "2026-09-14", -12000, "Airtel"),

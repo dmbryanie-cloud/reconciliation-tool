@@ -13,6 +13,7 @@ throwaway in-memory Postgres. **No suite ever talks to QuickBooks** — every Qu
 | `suite_manual_match.py` | Matching by hand (1-1, many-1, 1-many), differences in the balance proof, undo, validation, learning from hand-made matches, the duplicate guard on write-back |
 | `suite_ui.py` | The account page's own JavaScript run in a simulated browser (jsdom): manual-match totals, closest-amount sorting, search, "Match it instead", bulk-record confirmation |
 | `suite_report.py` | The printable reconciliation statement (draft/signed, itemised outstanding and unrecorded items, differences, override notes), past periods after later ones are signed off, keeping UGX and USD separate in transfer checks and suggestions |
+| `suite_transfers.py` | Recording money moved between your own accounts as one QuickBooks Transfer: from the record table, as a pair seen on two statements (both lines matched), card payments from a bank; same currency only; refusals (signed off, already matched, CSRF); the next sync brings the same rows back without duplicates |
 | `suite_security.py` | CSRF tokens on every POST form, refusal of missing/forged/other-session tokens, session cookie flags |
 
 ## Running

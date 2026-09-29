@@ -268,10 +268,12 @@ def _h_deposit(e, acct, atype):
     return _D(e.get("TotalAmt")), who, e.get("PrivateNote"), cat
 
 def _h_transfer(e, acct, atype):
+    # Cards count what's owed: a transfer in pays the card down, one out (cash advance) adds to it.
+    sign = -1 if atype == "credit_card" else 1
     if e.get("ToAccountRef", {}).get("value") == acct:
-        return _D(e.get("Amount")), "Transfer in", e.get("PrivateNote"), e.get("FromAccountRef", {}).get("name")
+        return sign * _D(e.get("Amount")), "Transfer in", e.get("PrivateNote"), e.get("FromAccountRef", {}).get("name")
     if e.get("FromAccountRef", {}).get("value") == acct:
-        return -_D(e.get("Amount")), "Transfer out", e.get("PrivateNote"), e.get("ToAccountRef", {}).get("name")
+        return -sign * _D(e.get("Amount")), "Transfer out", e.get("PrivateNote"), e.get("ToAccountRef", {}).get("name")
     return None
 
 def _h_billpayment(e, acct, atype):
@@ -567,7 +569,7 @@ def sync_from_quickbooks(full=False):
     # Watermark: only pull records QBO says changed since our last good sync.
     # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
     # A newly handled entity type needs one full pull, or its older records never arrive.
-    ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|refs1"   # bump the suffix to force one full re-pull
+    ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|refs2"   # bump the suffix to force one full re-pull (refs2: card transfer signs)
     changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
         else get_config("last_sync_at")
     notes = []
@@ -866,6 +868,23 @@ def resolve_coa(coa, category):
     return next((a for a in coa if a["name"] == leaf), None)
 
 
+def transfer_targets(cur, acct_qbo, atype, currency):
+    """Your other bank (and card) accounts a line can be recorded as a transfer to or from.
+    Same currency only -- UGX money moves between UGX accounts, USD between USD. A card is
+    paid from a bank, so card lines only offer banks."""
+    types = ["Bank"] if atype == "credit_card" else ["Bank", "Credit Card"]
+    cur.execute("""SELECT qbo_id, name, fqn, account_type FROM qbo_coa
+                   WHERE coalesce(active, true) AND account_type = ANY(%s) AND qbo_id <> %s
+                     AND (%s::text IS NULL OR currency IS NULL OR currency = %s) ORDER BY fqn;""",
+                (types, acct_qbo or "", currency, currency))
+    return [{"id": i, "name": n, "fqn": f or n, "type": t, "xfer": True} for i, n, f, t in cur.fetchall()]
+
+
+def transfer_ends(this_qbo, other_qbo, amount, atype):
+    """(from, to) QuickBooks ids for a transfer that explains `amount` on this account's statement."""
+    return (this_qbo, other_qbo) if _money_out(amount, atype) else (other_qbo, this_qbo)
+
+
 def qbo_post(token, entity, body):
     req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/{entity.lower()}",
                                  data=json.dumps(body).encode(), method="POST")
@@ -906,6 +925,44 @@ def qbo_record_line(token, acct_qbo, atype, money_out, target_id, amount_abs, tx
         else:
             raise
     return entity, str((res.get(entity) or {}).get("Id") or ""), payee_ref if "EntityRef" in body else None
+
+
+def qbo_record_transfer(token, from_qbo, to_qbo, amount_abs, txn_date, desc):
+    """One QuickBooks Transfer between two of your own accounts. Returns (entity, new id, the entity)."""
+    body = {"FromAccountRef": {"value": from_qbo}, "ToAccountRef": {"value": to_qbo}, "Amount": float(amount_abs),
+            "TxnDate": str(txn_date), "PrivateNote": f"Recorded from bank reconciliation: {desc}"[:4000]}
+    res = qbo_post(token, "Transfer", body)
+    ent = res.get("Transfer") or {}
+    return "Transfer", str(ent.get("Id") or ""), ent or body
+
+
+def store_transfer(cur, new_id, ent, txn_date, desc, names):
+    """Put a just-recorded Transfer into the books of every tracked account it touches, exactly as
+    the next sync will (same key, so no duplicate). Returns {account_uuid: txn_id}."""
+    ent = {**ent, "FromAccountRef": {**ent.get("FromAccountRef", {}), "name": names.get(ent["FromAccountRef"]["value"])},
+           "ToAccountRef": {**ent.get("ToAccountRef", {}), "name": names.get(ent["ToAccountRef"]["value"])}}
+    ids = [ent["FromAccountRef"]["value"], ent["ToAccountRef"]["value"]]
+    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE source_account_id = ANY(%s);", (ids,))
+    out = {}
+    for acct_uuid, qid, atype, ccy in cur.fetchall():
+        amt, who, _note, cat = _h_transfer(ent, qid, atype)
+        cur.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
+                          currency, description, counterparty, category, cleared_status, last_modified)
+                       VALUES (%s,%s,%s,'Transfer',%s,%s,%s,%s,%s,%s,'unknown',now())
+                       ON CONFLICT (account_id, source_txn_type, source_txn_id) DO NOTHING RETURNING txn_id;""",
+                    (ORG_ID, acct_uuid, new_id, txn_date, amt, ccy or "USD", desc, who, cat))
+        r = cur.fetchone()
+        if r:
+            out[str(acct_uuid)] = str(r[0])
+    return out
+
+
+def rematch_open(cur, account_uuids):
+    """Re-run matching on these accounts' latest statements, unless signed off (leave those alone)."""
+    for a in account_uuids:
+        s = _latest_statement(cur, a)
+        if s and not s[3]:
+            run_matcher(s[0])
 
 
 DUP_WINDOW_DAYS = 45   # how far apart a bank line and its QuickBooks twin can plausibly be dated
@@ -2491,7 +2548,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
 <h2 id=sec-record style="font-size:15px">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
-<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement.</div>
+<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. Money moved between your own accounts: pick the other account under <em>Transfer</em> and it's recorded as one transfer (same currency only).</div>
 <form method=post action="{{ url_for('record', name=name) }}" id=recform>
 <table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
 {% for w in writebacks + deposits %}<tr>
@@ -2506,7 +2563,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
-<td><select name="acct_{{ w.line_id }}" class=acct data-dir="{{ 'out' if w.out else 'in' }}" data-sel="{{ w.acct_id or '' }}" aria-label="Account"></select>{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
+<td><select name="acct_{{ w.line_id }}" class=acct data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}" aria-label="Account"></select>{% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
 <td><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class=payee aria-label="Payee">{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm>Record</button></td>
 {% endif %}
@@ -2517,14 +2574,17 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <script>(function(){
 var el=document.getElementById('coa-data');if(!el)return;var coa=[];try{coa=JSON.parse(el.textContent)}catch(e){}
 var order={out:['Expense','Cost of Goods Sold','Other Expense'],'in':['Income','Other Income']};
-var groups={};coa.forEach(function(a){(groups[a.t]=groups[a.t]||[]).push(a)});
+var groups={},xfer=[];coa.forEach(function(a){if(a.x)xfer.push(a);else(groups[a.t]=groups[a.t]||[]).push(a)});
+function opt(g,a,sel){var op=document.createElement('option');op.value=a.id;op.textContent=a.n;if(a.id===sel)op.selected=true;g.appendChild(op)}
 document.querySelectorAll('select.acct').forEach(function(s){
-  var pref=order[s.getAttribute('data-dir')]||[],sel=s.getAttribute('data-sel');
-  var o=document.createElement('option');o.value='';o.textContent='— choose account —';s.appendChild(o);
-  Object.keys(groups).sort(function(a,b){var x=pref.indexOf(a),y=pref.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x-y||a.localeCompare(b)}).forEach(function(t){
+  var dir=s.getAttribute('data-dir'),pref=order[dir]||[],sel=s.getAttribute('data-sel');
+  var o=document.createElement('option');o.value='';o.textContent=dir==='xfer'?'— paid from which bank? —':'— choose account —';s.appendChild(o);
+  if(dir!=='xfer')Object.keys(groups).sort(function(a,b){var x=pref.indexOf(a),y=pref.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x-y||a.localeCompare(b)}).forEach(function(t){
     var g=document.createElement('optgroup');g.label=t;
-    groups[t].forEach(function(a){var op=document.createElement('option');op.value=a.id;op.textContent=a.n;if(a.id===sel)op.selected=true;g.appendChild(op)});
+    groups[t].forEach(function(a){opt(g,a,sel)});
     s.appendChild(g)});
+  if(xfer.length){var g=document.createElement('optgroup');g.label=dir==='out'?'Transfer to your account':dir==='in'?'Transfer from your account':'Transfer from your bank';
+    xfer.forEach(function(a){opt(g,a,sel)});s.appendChild(g)}
   s.addEventListener('change',function(){var cb=s.closest('tr').querySelector('.rsel');if(cb&&s.value)cb.checked=true});
 });
 var all=document.getElementById('selall');if(all)all.addEventListener('change',function(){document.querySelectorAll('.rsel').forEach(function(c){c.checked=all.checked})});
@@ -2598,12 +2658,12 @@ update(false);
 {% endif %}
 {% endif %}
 {% if n_xfer %}<h2 id=sec-exceptions style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
-<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 nothing is matched or written back. Confirm each one before acting. If a pair is a genuine transfer, record it once as a Transfer in QuickBooks, not as two separate transactions.</div>
+<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it.</div>
 <table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
 <tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td>
 <td><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
-<td style="font-size:12px;color:var(--muted)">{{ c.note }}</td></tr>
+<td style="font-size:12px;color:var(--muted)">{{ c.note }}{% if c.rule == 'unrecorded' %}<br>{% if not acct_linked or not c.other_linked %}Both accounts must be linked to QuickBooks to record it here.{% elif signed_off or c.other_signed %}A statement is signed off \u2014 reopen it to record this.{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" style="margin-top:6px" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}</td></tr>
 {% endfor %}{% endif %}{% endfor %}</table>{% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
@@ -2680,43 +2740,51 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
     amts = [l[2] for l in unmatched_lines]
     out = {}
 
-    # Rule 1: unmatched statement line on another account, opposite sign
-    cur.execute("""
+    # Signs mean direction differently per account type: on a bank, positive is money in; on a
+    # card, positive is a charge. So a bank paying a card shows as -X on BOTH statements.
+    # `flow` turns each amount into "money into this account" before comparing.
+    cur.execute("SELECT type FROM account WHERE account_id=%s;", (acct_uuid,))
+    m_this = -1 if (cur.fetchone() or [None])[0] == "credit_card" else 1
+    flow = "(CASE WHEN a.type = 'credit_card' THEN -1 ELSE 1 END)"
+
+    # Rule 1: unmatched statement line on another account, money moving the opposite way
+    cur.execute(f"""
         WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
         SELECT un.line_id, a.name, sl.posted_date, sl.amount,
-               coalesce(sl.counterparty, sl.description, '')
+               coalesce(sl.counterparty, sl.description, ''), sl.line_id, s.signed_off_at, a.source_account_id
         FROM un
         JOIN statement s ON s.account_id <> %s
-        JOIN statement_line sl ON sl.statement_id = s.statement_id
-                              AND sl.amount = -un.amt
-                              AND sl.posted_date BETWEEN un.d - %s AND un.d + %s
         JOIN account a ON a.account_id = s.account_id
                       AND a.currency = (SELECT currency FROM account WHERE account_id = %s)
+        JOIN statement_line sl ON sl.statement_id = s.statement_id
+                              AND sl.amount * {flow} = -un.amt * %s
+                              AND sl.posted_date BETWEEN un.d - %s AND un.d + %s
         WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
                           JOIN match m ON m.match_id = msl.match_id
                           WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');
-    """, (ids, dts, amts, acct_uuid, window, window, acct_uuid))
-    for lid, nm, d, a, who in cur.fetchall():
+    """, (ids, dts, amts, acct_uuid, acct_uuid, m_this, window, window))
+    for lid, nm, d, a, who, other_lid, other_signed, other_qbo in cur.fetchall():
         out.setdefault(str(lid), []).append(
             {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who,
+             "line_id": str(other_lid), "other_signed": bool(other_signed), "other_linked": bool(other_qbo),
              "note": "Opposite entry on another bank statement, not recorded in QuickBooks either side."})
 
-    # Rule 2: unmatched BOOK transaction on another account, same sign
-    cur.execute("""
+    # Rule 2: unmatched BOOK transaction on another account, money moving the same way
+    cur.execute(f"""
         WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
         SELECT un.line_id, a.name, bt.posted_date, bt.amount,
                coalesce(bt.counterparty, bt.description, '')
         FROM un
         JOIN book_txn bt ON bt.account_id <> %s
-                        AND bt.amount = un.amt
                         AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
         JOIN account a ON a.account_id = bt.account_id
                       AND a.currency = (SELECT currency FROM account WHERE account_id = %s)
+                      AND bt.amount * {flow} = un.amt * %s
         WHERE coalesce(bt.is_void, false) = false AND coalesce(bt.is_deleted, false) = false
           AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
                           JOIN match m ON m.match_id = mbt.match_id
                           WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed');
-    """, (ids, dts, amts, acct_uuid, window, window, acct_uuid))
+    """, (ids, dts, amts, acct_uuid, window, window, acct_uuid, m_this))
     for lid, nm, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append(
             {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who,
@@ -2853,6 +2921,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     acct_ccy = (cur.fetchone() or [None])[0]
     mem = PostingMemory(cur, acct_ccy) if unmatched_lines else None
     coa = load_coa(cur)
+    xt = transfer_targets(cur, acct_qbo, atype, acct_ccy) if coa else []
     wb = {}
     if unmatched_lines:
         cur.execute("SELECT line_id, status, qbo_id FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
@@ -2866,17 +2935,20 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             on_stmt_in.append((lid, dd, a, who)); continue
         out = _money_out(a, atype)
         sug = mem.suggest(who, out)
-        acct = resolve_coa(coa, sug["cat"]) if sug else None
+        # A card payment can only be a transfer from a bank (refunds are recorded in QuickBooks).
+        xfer_only = atype == "credit_card" and not out
+        acct = resolve_coa(xt if xfer_only else coa + xt, sug["cat"]) if sug else None
         why_not = (None if acct_qbo and coa else
                    "Connect this account to QuickBooks to record it" if not acct_qbo else
                    "Sync with QuickBooks once to load your accounts")
-        if atype == "credit_card" and not out:
+        if xfer_only and not why_not and not xt:
             why_not = "Card payment or refund — record it in QuickBooks as a transfer or refund"
         status, qbo_id = wb.get(str(lid), (None, None))
         item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
                 "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
                 "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done") else None,
-                "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not,
+                "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not, "xfer_only": xfer_only,
+                "is_xfer": bool(acct and acct.get("xfer")),
                 "dups": dups.get(str(lid), [])[:3]}
         item["dup_matchable"] = next((x["txn_id"] for x in item["dups"] if x["txn_id"] in pool_ids), None)
         (writebacks if out else deposits).append(item)
@@ -2894,7 +2966,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
-            "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"]} for a in coa]).replace("<", "\\u003c"))}
+            "acct_linked": bool(acct_qbo),
+            "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"], "x": 1 if a.get("xfer") else 0}
+                                           for a in coa + xt]).replace("<", "\\u003c"))}
 
 
 REPORT_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -3241,7 +3315,8 @@ def unmatch(name, match_id):
 
 @app.route("/account/<name>/record", methods=["POST"])
 def record(name):
-    """Record selected unmatched bank lines in QuickBooks (Purchase for money out, Deposit for money in)."""
+    """Record selected unmatched bank lines in QuickBooks: Purchase for money out, Deposit for money in,
+    or a Transfer when the chosen account is another of your own bank/card accounts."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     arow = cur.fetchone()
@@ -3255,6 +3330,10 @@ def record(name):
         session["detail_msg"] = "Nothing to record." if acct_qbo else "This account isn't linked to QuickBooks."
         return redirect(url_for("detail", name=name) + "#sec-record")
     coa = {a["id"]: a for a in load_coa(cur)}
+    xt = {a["id"]: a for a in transfer_targets(cur, acct_qbo, atype, ccy)}
+    names = {a["id"]: a["name"] for a in xt.values()}
+    cur.execute("SELECT name FROM qbo_coa WHERE qbo_id=%s;", (acct_qbo,))
+    names[acct_qbo] = (cur.fetchone() or [name])[0]
     cur.execute("""SELECT sl.line_id, sl.posted_date, sl.amount, coalesce(sl.description,'') FROM statement_line sl
                    WHERE sl.statement_id=%s AND sl.line_id = ANY(%s::uuid[])
                      AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
@@ -3264,16 +3343,18 @@ def record(name):
     dups = possible_duplicates(cur, acct_uuid, lines)
     cur.close(); conn.close()
     done, problems, skipped = 0, [], 0
-    token = None
+    token, touched = None, set()
     for lid, d, amt, desc in lines:
         lid = str(lid)
         label = f"{d} {desc[:30]}"
-        acc = coa.get(request.form.get(f"acct_{lid}") or "")
+        pick = request.form.get(f"acct_{lid}") or ""
+        acc = coa.get(pick) or xt.get(pick)
         out = _money_out(amt, atype)
         if not acc:
             problems.append(f"{label}: choose an account"); continue
-        if atype == "credit_card" and not out:
-            problems.append(f"{label}: card payments/refunds aren't recorded from here"); continue
+        is_xfer = bool(acc.get("xfer"))
+        if atype == "credit_card" and not out and not is_xfer:
+            problems.append(f"{label}: choose the bank the card was paid from (refunds are recorded in QuickBooks)"); continue
         if dups.get(lid) and not request.form.get(f"dupok_{lid}"):
             x = dups[lid][0]
             problems.append(f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
@@ -3287,7 +3368,12 @@ def record(name):
             skipped += 1; continue
         try:
             token = token or qbo_token()
-            entity, new_id, used_ref = qbo_record_line(token, acct_qbo, atype, out, acc["id"], abs(amt), d, desc, payee, ref)
+            if is_xfer:
+                frm, to = transfer_ends(acct_qbo, acc["id"], amt, atype)
+                entity, new_id, ent = qbo_record_transfer(token, frm, to, abs(amt), d, desc)
+                payee, used_ref = "", None
+            else:
+                entity, new_id, used_ref = qbo_record_line(token, acct_qbo, atype, out, acc["id"], abs(amt), d, desc, payee, ref)
         except Exception as e:
             err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
             c2 = get_conn(); k2 = c2.cursor()
@@ -3297,7 +3383,10 @@ def record(name):
         c2 = get_conn(); k2 = c2.cursor()
         k2.execute("""UPDATE writeback_log SET status='done', qbo_type=%s, qbo_id=%s, account_fqn=%s, payee=%s
                       WHERE line_id=%s;""", (entity, new_id or None, acc["fqn"], payee or None, lid))
-        if new_id:
+        if new_id and is_xfer:
+            ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(amt)}
+            touched.update(a for a in store_transfer(k2, new_id, ent, d, desc, names) if a != str(acct_uuid))
+        elif new_id:
             book_amt = abs(amt) if (atype == "credit_card" or not out) else -abs(amt)
             k2.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
                               currency, description, counterparty, reference, category, cleared_status, last_modified,
@@ -3312,6 +3401,8 @@ def record(name):
         done += 1
     if done:
         _after_review(s[0])
+    if touched:   # the other side of each transfer can clear on its own statement straight away
+        c2 = get_conn(); k2 = c2.cursor(); rematch_open(k2, touched); k2.close(); c2.close()
     msg = f"Recorded {done} transaction{'' if done == 1 else 's'} in QuickBooks." if done else ""
     if skipped:
         msg += f" Skipped {skipped} already recorded or in progress."
@@ -3319,6 +3410,98 @@ def record(name):
         msg += " Not recorded: " + "; ".join(problems[:5]) + (" …" if len(problems) > 5 else "")
     session["detail_msg"] = msg.strip() or "Nothing to record."
     return redirect(url_for("detail", name=name) + "#sec-record")
+
+
+@app.route("/account/<name>/transfer", methods=["POST"])
+def record_transfer(name):
+    """Money visibly left one of your accounts and arrived at another, and neither side is in
+    QuickBooks: record ONE Transfer and match both bank lines to it."""
+    back = redirect(url_for("detail", name=name) + "#sec-exceptions")
+    lid, other = request.form.get("line") or "", request.form.get("other") or ""
+    try:
+        uuid.UUID(lid); uuid.UUID(other)
+    except ValueError:
+        session["detail_msg"] = "Nothing to record."; return back
+    conn = get_conn(); cur = conn.cursor()
+    q = """SELECT sl.line_id, sl.posted_date, sl.amount, coalesce(sl.description,''), s.statement_id, s.signed_off_at,
+                  a.account_id, a.source_account_id, a.type, a.currency, a.name,
+                  EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                          WHERE msl.line_id=sl.line_id AND m.status='confirmed')
+           FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+           JOIN account a ON a.account_id=s.account_id WHERE sl.line_id=%s;"""
+    cur.execute(q, (lid,)); me = cur.fetchone()
+    cur.execute(q, (other,)); them = cur.fetchone()
+    problem = None
+    if not me or not them or me[10] != name:
+        problem = "Those bank lines weren't found. Reload and try again."
+    elif me[6] == them[6] or (me[9] or "") != (them[9] or ""):
+        problem = "A transfer needs two different accounts in the same currency."
+    elif me[11] or them[11]:
+        problem = "One of those bank lines is already matched."
+    elif me[5] or them[5]:
+        problem = "A statement is signed off. Reopen it to record this transfer."
+    elif not me[7] or not them[7]:
+        problem = "Both accounts must be linked to QuickBooks."
+    elif (me[2] * (-1 if me[8] == "credit_card" else 1)) != -(them[2] * (-1 if them[8] == "credit_card" else 1)):
+        problem = "The two lines aren't the same money moving in opposite directions."
+    if problem:
+        cur.close(); conn.close(); session["detail_msg"] = problem; return back
+    frm, to = transfer_ends(me[7], them[7], me[2], me[8])
+    out_line = me if frm == me[7] else them   # dated when the money left
+    d, desc = out_line[1], out_line[3]
+    if not _claim_writeback(str(me[0]), session.get("name")):
+        cur.close(); conn.close(); session["detail_msg"] = "Already recorded or in progress."; return back
+    if not _claim_writeback(str(them[0]), session.get("name")):
+        cur.execute("UPDATE writeback_log SET status='failed', error='released' WHERE line_id=%s;", (str(me[0]),))
+        conn.commit(); cur.close(); conn.close()
+        session["detail_msg"] = "The other bank line is already recorded or in progress."; return back
+    try:
+        entity, new_id, ent = qbo_record_transfer(qbo_token(), frm, to, abs(me[2]), d, desc)
+    except Exception as e:
+        err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
+        cur.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id = ANY(%s::uuid[]);",
+                    (err, [str(me[0]), str(them[0])]))
+        conn.commit(); cur.close(); conn.close()
+        session["detail_msg"] = f"Not recorded: QuickBooks said {err}"; return back
+    cur.execute("SELECT qbo_id, name FROM qbo_coa WHERE qbo_id = ANY(%s);", ([frm, to],))
+    names = dict(cur.fetchall())
+    names.setdefault(me[7], me[10]); names.setdefault(them[7], them[10])
+    cur.execute("""UPDATE writeback_log SET status='done', qbo_type=%s, qbo_id=%s, account_fqn=%s WHERE line_id=%s;""",
+                (entity, new_id or None, names.get(them[7]), str(me[0])))
+    cur.execute("""UPDATE writeback_log SET status='done', qbo_type=%s, qbo_id=%s, account_fqn=%s WHERE line_id=%s;""",
+                (entity, new_id or None, names.get(me[7]), str(them[0])))
+    booked = {}
+    if new_id:
+        ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(me[2])}
+        booked = store_transfer(cur, new_id, ent, d, desc, names)
+    conn.commit()
+    # Match each bank line to its side of the transfer, as if the user had matched it by hand --
+    # if that side is one its statement can clear (dated within reach of the period).
+    matched = 0
+    for row in (me, them):
+        tid, sid = booked.get(str(row[6])), row[4]
+        if not tid:
+            continue
+        cur.execute("SELECT period_start, period_end FROM statement WHERE statement_id=%s;", (sid,))
+        ps, pe = cur.fetchone()
+        if tid not in {str(t[0]) for t in book_pool(cur, row[6], sid, ps, pe)}:
+            continue
+        mid = str(uuid.uuid4())
+        cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
+                                          created_by, confirmed_by, confirmed_at)
+                       VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""",
+                    (mid, ORG_ID, sid, session.get("name") or "user"))
+        cur.execute("INSERT INTO match_statement_line (match_id, line_id) VALUES (%s,%s);", (mid, str(row[0])))
+        cur.execute("INSERT INTO match_book_txn (match_id, txn_id) VALUES (%s,%s);", (mid, tid))
+        matched += 1
+    conn.commit(); cur.close(); conn.close()
+    for sid in {me[4], them[4]}:
+        _after_review(sid)
+    session["detail_msg"] = (f"Recorded a transfer of {_money(abs(me[2]))} from {names.get(frm)} to {names.get(to)} "
+                             f"in QuickBooks" + (f" (#{new_id})" if new_id else "") +
+                             (" and matched both bank lines." if matched == 2 else
+                              ". It will match on the next refresh."))
+    return back
 
 
 @app.route("/account/<name>/record_reset", methods=["POST"])

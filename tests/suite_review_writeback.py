@@ -216,11 +216,11 @@ check("recorded choices remember the account's currency",
       and q1("SELECT count(*) FROM payee_correction WHERE currency IS NULL")[0] == 0)
 check("tier 1: your recorded choice is suggested next time", s1 and s1["cat"] == "Telephone" and s1["tier"] == 1 and s1["payee"] == "Airtel Uganda")
 
-# credit card: charges recordable (as CreditCard purchase), payments not
+# credit card: charges recordable (as CreditCard purchase), payments only as a transfer from a bank
 cl.post("/account/Visa/upload", data={"statement": (io.BytesIO(b"Date,Description,Amount\n2026-09-03,AMAZON WEB SERVICES,55000\n2026-09-10,PAYMENT THANK YOU,-100000\n"), "v.csv"),
         "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 page = cl.get("/account/Visa").data.decode()
-check("card payment explained, not recordable", "Card payment or refund" in page)
+check("card payment offered as a transfer from a bank", "Card payment: choose the bank it was paid from" in page and "Card payment or refund" not in page)
 Lc = lid("AMAZON WEB SERVICES")
 cl.post("/account/Visa/record", data={"only": Lc, f"acct_{Lc}": "82"})
 ent, body = POSTS[-1]

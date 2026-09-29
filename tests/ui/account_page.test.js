@@ -24,6 +24,9 @@ const go = () => d.getElementById("mmgo");
 check("no script errors on load", errors.length === 0);
 check("record-table account pickers filled from the chart of accounts",
       [...d.querySelectorAll("select.acct")].every(s => s.options.length >= 3));
+check("transfer group offered last in every picker, with your other bank",
+      [...d.querySelectorAll("select.acct")].every(s => { const g = [...s.querySelectorAll("optgroup")].pop();
+        return g && /^Transfer (to|from) your account$/.test(g.label) && g.textContent.includes("Centenary"); }));
 check("button starts disabled", go().disabled && /Tick at least one/.test(sum()));
 
 tick("mml", "DEPOSIT CASH");
