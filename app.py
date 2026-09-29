@@ -20,6 +20,7 @@ import json, base64, urllib.request, urllib.parse, urllib.error
 DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
+CLEARING_WINDOW_DAYS = 31  # a cheque/payment can hit the bank this long after it's booked
 GROUP_WINDOW_DAYS = 60
 MAX_GROUP = 5         # max items combined in a batch
 M2O_MAX_LINES = 1000  # skip combinatorial pass above this many unmatched items
@@ -290,11 +291,31 @@ def _h_journalentry(e, acct, atype):
             cat = det.get("AccountRef", {}).get("name")
     return (net, "Journal entry", e.get("PrivateNote"), cat) if hit else None
 
+def _h_salesreceipt(e, acct, atype):
+    if e.get("DepositToAccountRef", {}).get("value") != acct: return None
+    return _D(e.get("TotalAmt")), e.get("CustomerRef", {}).get("name"), e.get("PrivateNote"), None
+
+def _h_refundreceipt(e, acct, atype):
+    if e.get("DepositToAccountRef", {}).get("value") != acct: return None
+    amt = _D(e.get("TotalAmt"))
+    return (amt if atype == "credit_card" else -amt), e.get("CustomerRef", {}).get("name"), e.get("PrivateNote"), None
+
+def _h_ccpayment(e, acct, atype):
+    # Paying the card: money leaves the bank, and the card balance owed goes down.
+    amt = _D(e.get("Amount"))
+    if e.get("BankAccountRef", {}).get("value") == acct:
+        return -amt, "Credit card payment", e.get("PrivateNote"), e.get("CreditCardAccountRef", {}).get("name")
+    if e.get("CreditCardAccountRef", {}).get("value") == acct:
+        return -amt, "Credit card payment", e.get("PrivateNote"), e.get("BankAccountRef", {}).get("name")
+    return None
+
 def _account_refs(etype, e):
     if etype == "Purchase":
         return [e.get("AccountRef", {}).get("value")]
-    if etype in ("Deposit", "Payment"):
+    if etype in ("Deposit", "Payment", "SalesReceipt", "RefundReceipt"):
         return [e.get("DepositToAccountRef", {}).get("value")]
+    if etype == "CreditCardPayment":
+        return [e.get("BankAccountRef", {}).get("value"), e.get("CreditCardAccountRef", {}).get("value")]
     if etype == "Transfer":
         return [e.get("ToAccountRef", {}).get("value"), e.get("FromAccountRef", {}).get("value")]
     if etype == "BillPayment":
@@ -311,7 +332,12 @@ def _account_refs(etype, e):
 
 
 QBO_HANDLERS = {"Purchase": _h_purchase, "Deposit": _h_deposit, "Transfer": _h_transfer,
-                "BillPayment": _h_billpayment, "Payment": _h_payment, "JournalEntry": _h_journalentry}
+                "BillPayment": _h_billpayment, "Payment": _h_payment, "JournalEntry": _h_journalentry,
+                "SalesReceipt": _h_salesreceipt, "RefundReceipt": _h_refundreceipt,
+                "CreditCardPayment": _h_ccpayment}
+# Newer entity; some companies/API versions reject the query. A failure here shouldn't hold
+# back the sync watermark forever.
+QBO_OPTIONAL = {"CreditCardPayment"}
 
 def import_accounts_from_qbo(token):
     """Discover Bank and Credit Card accounts from the connected QBO company and upsert them."""
@@ -374,7 +400,9 @@ def sync_from_quickbooks(full=False):
     since = _sync_since()
     # Watermark: only pull records QBO says changed since our last good sync.
     # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
-    changed_since = None if full else get_config("last_sync_at")
+    # A newly handled entity type needs one full pull, or its older records never arrive.
+    ent_sig = ",".join(sorted(QBO_HANDLERS))
+    changed_since = None if (full or get_config("sync_entities") != ent_sig) else get_config("last_sync_at")
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S-00:00")
     t0 = time.time()
     cache = {}
@@ -433,10 +461,11 @@ def sync_from_quickbooks(full=False):
     total = len(rows)
     conn.commit(); cur.close(); conn.close()
     insert_secs = time.time() - t1
-    clean = all(v >= 0 for v in fetched.values())
+    clean = all(v >= 0 for k, v in fetched.items() if k not in QBO_OPTIONAL)
     if clean:
         set_config("last_sync_at", started_at)   # only advance if every entity pulled OK
-    detail = ", ".join(f"{k} {'FAILED' if v < 0 else v}" for k, v in fetched.items())
+        set_config("sync_entities", ent_sig)
+    detail = ", ".join(f"{k} {('unavailable' if k in QBO_OPTIONAL else 'FAILED') if v < 0 else v}" for k, v in fetched.items())
     mode = "full" if changed_since is None else f"changes since {changed_since[:16].replace('T', ' ')}"
     timing = f"fetch {fetch_secs:.0f}s, save {insert_secs:.0f}s"
     if not clean:
@@ -450,6 +479,13 @@ try:
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_at timestamptz;")
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_by text;")
     _cur.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;")
+    # Balance reconciliation. A *_source of NULL means "not known yet"; otherwise one of
+    # user / file / carried (previous signed-off closing) / derived (closing - movements) / qbo.
+    for _col, _typ in (("opening_source", "text"), ("closing_source", "text"), ("book_balance", "numeric"),
+                       ("book_balance_source", "text"), ("signoff_note", "text"),
+                       ("snap_exact", "int"), ("snap_fuzzy", "int"), ("snap_m2o", "int"),
+                       ("snap_exc", "int"), ("snap_diff", "numeric")):
+        _cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {_col} {_typ};")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_book_txn_amt_date ON book_txn (amount, posted_date);")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_line_amt_date ON statement_line (amount, posted_date);")
     _c.commit(); _cur.close(); _c.close()
@@ -552,8 +588,8 @@ def _resolve_account(category, expense_accts):
         if leaf in by_name: return by_name[leaf], leaf
     return (default["Id"], default["Name"]) if default else (None, None)
 
-def create_purchase(token, paid_from_qbo, expense_id, amount_abs, txn_date, note):
-    body = {"AccountRef": {"value": paid_from_qbo}, "PaymentType": "Cash",
+def create_purchase(token, paid_from_qbo, expense_id, amount_abs, txn_date, note, payment_type="Cash"):
+    body = {"AccountRef": {"value": paid_from_qbo}, "PaymentType": payment_type,
             "TxnDate": txn_date, "PrivateNote": note,
             "Line": [{"DetailType": "AccountBasedExpenseLineDetail", "Amount": amount_abs,
                       "AccountBasedExpenseLineDetail": {"AccountRef": {"value": expense_id}}}]}
@@ -591,6 +627,35 @@ def create_deposit(token, deposit_to_qbo, income_id, amount_abs, txn_date, note)
     req.add_header("Accept", "application/json")
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
+
+
+def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
+    """Register balance of a bank/card account at the end of `as_of`, in the account's currency.
+
+    QuickBooks only exposes the *current* balance per account, so step back from it by the synced
+    transactions dated after `as_of`. That's exact as long as sync is fresh and reaches back to
+    `as_of` -- the caller syncs first, and this refuses dates before the sync window.
+    """
+    since = _sync_since()
+    if since and str(as_of) < since:
+        raise ValueError(f"The period ends before the sync window ({since}). Enter the book balance by hand, "
+                         f"or raise SYNC_MONTHS.")
+    q = f"SELECT * FROM Account WHERE Id = '{acct_qbo}'"
+    req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q))
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        accts = json.loads(resp.read()).get("QueryResponse", {}).get("Account", [])
+    if not accts:
+        raise ValueError("QuickBooks didn't return this account.")
+    current = _D(accts[0].get("CurrentBalance"))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT coalesce(sum(amount),0) FROM book_txn
+                   WHERE account_id=%s AND posted_date > %s AND source_txn_type <> 'CSV'
+                     AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false;""", (acct_uuid, as_of))
+    later = cur.fetchone()[0]
+    cur.close(); conn.close()
+    return current - later
 
 
 # ---------------- shared styling ----------------
@@ -661,10 +726,27 @@ tbody tr:hover{background:#f7f9fb}
 .u-label{font-size:13px;color:var(--muted);margin-bottom:7px;font-weight:550}
 .upload input[type=file]{font-size:13px}
 .exc th{background:#fdf2ef;color:var(--bad)}
+.recgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.recgrid table{margin:0}
+.rec td{white-space:normal}
+.rec tr.tot td{font-weight:650;background:#fafbfc;border-top:1px solid var(--line)}
+.rec .src{color:var(--muted);font-size:12px;font-weight:400}
+.recres{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:14px 0 8px;padding:14px 18px;border-radius:var(--radius);font-weight:600;font-variant-numeric:tabular-nums}
+.recres.balanced{background:var(--ok-soft);color:var(--ok)}
+.recres.out{background:var(--bad-soft);color:var(--bad)}
+.recres.incomplete{background:var(--none-soft);color:var(--none)}
+.recnote{font-size:13px;padding:9px 13px;border-radius:9px;margin:8px 0;line-height:1.5}
+.recnote.bad{background:var(--bad-soft);color:var(--bad)}
+.recnote.warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a}
+.balform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:12px 0 4px}
+.balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.balform input{width:170px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;font-variant-numeric:tabular-nums}
+.tag.bf{background:var(--none-soft);color:var(--none)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
 @media (max-width:760px){
   .tiles{grid-template-columns:repeat(2,1fr)}
   .cards{grid-template-columns:repeat(2,1fr)}
+  .recgrid{grid-template-columns:1fr}
   .wrap{padding:22px 15px 48px}
   h1{font-size:22px}
   .nav{padding:13px 16px}
@@ -1248,7 +1330,8 @@ def logout():
 def _detect_dayfirst(samples):
     # Decide day-first vs month-first for slash/dash dates by scanning the column.
     for s in samples:
-        s = (s or "").strip().split()[0]
+        s = (s or "").strip()
+        s = s.split()[0] if s else s
         m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-]\d{2,4}$", s)
         if not m:
             continue
@@ -1263,7 +1346,8 @@ def parse_date(s, dayfirst=True):
     s = (s or "").strip()
     if not s:
         raise ValueError("empty date")
-    s = s.split()[0]  # drop any trailing time portion
+    s = re.sub(r"[ T]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\s*([AaPp][Mm])?$", "", s).strip()  # drop a trailing time
+    s = re.sub(r"\s+", " ", s)
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -1286,11 +1370,33 @@ def parse_date(s, dayfirst=True):
     raise ValueError(f"Unrecognized date: {s}")
 
 def parse_amount(s):
-    s = s.strip().replace("$", "").replace(",", "")
-    neg = s.startswith("(") and s.endswith(")")
-    if neg: s = s[1:-1]
+    s = s.strip().replace(",", "").replace(" ", "")
+    s = re.sub(r"^[A-Za-z]{3}(?=[-(\d.])|[$€£]", "", s)   # currency code / symbol prefix, e.g. UGX1000
+    neg = False
+    suffix = re.search(r"(DR|CR|D|C)\.?$", s, flags=re.IGNORECASE)
+    if suffix:
+        neg = suffix.group(1).upper() in ("DR", "D")
+        s = s[:suffix.start()]
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1]
+    if s.endswith("-"):
+        neg, s = True, s[:-1]
     v = Decimal(s)
     return -v if neg else v
+
+
+def _dedupe_keys(rows):
+    """Stable per-row keys. Identical rows (same date, amount and description — e.g. two
+    bank charges on one day) are genuinely separate transactions, so the n-th repeat gets
+    its own key instead of being collapsed into the first."""
+    counts = Counter()
+    for r in rows:
+        if r.get("fitid"):
+            yield r["fitid"]
+            continue
+        base = f"{r['date']}|{r['amount']}|{(r.get('desc') or '').lower()}"
+        n = counts[base]; counts[base] += 1
+        yield hashlib.sha256((base if n == 0 else f"{base}|{n}").encode()).hexdigest()[:32]
 
 def find_key(fieldnames, *cands):
     lookup = {(f or "").strip().lower(): f for f in fieldnames}
@@ -1330,6 +1436,14 @@ def _sub_col(fns, *cands):
                 return orig
     return None
 
+class _Rows(list):
+    """Parsed rows, plus the dates of rows that had a date but couldn't be parsed,
+    and any opening/closing balance the file itself states."""
+    def __init__(self, *a):
+        super().__init__(*a); self.skipped = []; self.opening = self.closing = None
+        self.period_start = self.period_end = None
+
+
 def _parse_ledger(text, want_category=False):
     reader = _ledger_reader(text)
     fns = reader.fieldnames or []
@@ -1339,11 +1453,12 @@ def _parse_ledger(text, want_category=False):
     crk = _sub_col(fns, "credit", "deposit")
     nk = _sub_col(fns, "payee", "description", "name", "memo", "narrative")
     ck = _sub_col(fns, "split", "category") if want_category else None
+    bk = None if want_category else _sub_col(fns, "running balance", "balance")
     if not dk or not (ak or dr or crk):
         raise ValueError(f"Couldn't find a Date column and an Amount (or Debit/Credit, Payment/Deposit) column. Found columns: {fns}")
     raw = list(reader)
     dayfirst = _detect_dayfirst([r.get(dk) or "" for r in raw])
-    rows = []
+    rows = _Rows()
     for r in raw:
         ds = (r.get(dk) or "").strip()
         if not ds:
@@ -1351,33 +1466,70 @@ def _parse_ledger(text, want_category=False):
         try:
             d = parse_date(ds, dayfirst=dayfirst)
         except ValueError:
-            continue
+            rows.skipped.append(ds); continue
         if ak and (r.get(ak) or "").strip():
             try:
                 amount = parse_amount(r[ak])
             except Exception:
-                continue
+                rows.skipped.append(ds); continue
         else:
             try:
                 deb = abs(parse_amount(r[dr])) if (dr and (r.get(dr) or "").strip()) else Decimal(0)
                 cre = abs(parse_amount(r[crk])) if (crk and (r.get(crk) or "").strip()) else Decimal(0)
             except Exception:
-                continue
+                rows.skipped.append(ds); continue
             amount = cre - deb
         if amount == 0:
             continue
         desc = (r.get(nk) or "").strip() if nk else ""
         row = {"date": d, "amount": amount, "desc": desc}
+        if bk and (r.get(bk) or "").strip():
+            try:
+                row["balance"] = parse_amount(r[bk])
+            except Exception:
+                pass
         if want_category:
             row["category"] = ((r.get(ck) or "").strip() or None) if ck else None
         rows.append(row)
     return rows
 
 def parse_csv(text):
-    return _parse_ledger(text, want_category=False)
+    rows = _parse_ledger(text, want_category=False)
+    rows.opening, rows.closing = _balances_from_running(rows)
+    return rows
+
+
+def _balances_from_running(rows):
+    """Opening/closing balance from a running-balance column, whichever way the file is sorted.
+
+    Ascending files satisfy bal[i] = bal[i-1] + amt[i]; newest-first files satisfy
+    bal[i-1] = bal[i] + amt[i-1]. Whichever holds for most adjacent pairs wins."""
+    rb = [r for r in rows if "balance" in r]
+    if len(rb) < 2 or len(rb) != len(rows):
+        return None, None
+    asc = sum(1 for a, b in zip(rb, rb[1:]) if b["balance"] == a["balance"] + b["amount"])
+    desc = sum(1 for a, b in zip(rb, rb[1:]) if a["balance"] == b["balance"] + a["amount"])
+    if max(asc, desc) * 2 < len(rb) - 1:
+        return None, None
+    if asc >= desc:
+        return rb[0]["balance"] - rb[0]["amount"], rb[-1]["balance"]
+    return rb[-1]["balance"] - rb[-1]["amount"], rb[0]["balance"]
 
 def parse_ofx(text):
-    rows = []
+    rows = _Rows()
+    lb = re.search(r"<LEDGERBAL>.*?<BALAMT>([^<\r\n]+)", text, flags=re.IGNORECASE | re.DOTALL)
+    try:
+        rows.closing = Decimal(lb.group(1).strip().replace(",", "")) if lb else None
+    except Exception:
+        rows.closing = None
+    rows.opening = None
+    for attr, tag_ in (("period_start", "DTSTART"), ("period_end", "DTEND")):
+        mm = re.search(r"<BANKTRANLIST>.*?<" + tag_ + r">(\d{8})", text, flags=re.IGNORECASE | re.DOTALL)
+        if mm:
+            try:
+                setattr(rows, attr, datetime.strptime(mm.group(1), "%Y%m%d").date())
+            except ValueError:
+                pass
     for part in re.split(r"<STMTTRN>", text, flags=re.IGNORECASE)[1:]:
         block = re.split(r"</STMTTRN>", part, flags=re.IGNORECASE)[0]
         def tag(nm):
@@ -1392,7 +1544,46 @@ def parse_ofx(text):
                      "fitid": tag("FITID")})
     return rows
 
-def _save_statement(rows, account_name, source_format):
+def _prev_signed_closing(cur, acct_uuid, before, exclude_sid=None):
+    """Closing balance of the latest signed-off statement ending before `before`, if it's known."""
+    cur.execute("""SELECT closing_balance, period_end FROM statement
+                   WHERE account_id=%s AND signed_off_at IS NOT NULL AND closing_source IS NOT NULL
+                     AND period_end < %s AND statement_id IS DISTINCT FROM %s
+                   ORDER BY period_end DESC LIMIT 1;""", (acct_uuid, before, exclude_sid))
+    return cur.fetchone()
+
+
+def _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src, exclude_sid=None):
+    """Fill in whatever balance wasn't supplied. Closing is never derived from movements -- that
+    would make the statement add up by construction and hide a missing line."""
+    if opening is None:
+        prev = _prev_signed_closing(cur, acct_uuid, p_start, exclude_sid)
+        if prev:
+            opening, o_src = prev[0], "carried"
+        elif closing is not None:
+            opening, o_src = closing - moves, "derived"
+    return opening, o_src, closing, c_src
+
+
+def _resolve_period(cur, acct_uuid, rows, p_start=None, p_end=None):
+    """The statement's own period, not just the span of its transactions -- the book balance and
+    the outstanding items are measured at the statement END date, which is usually later than
+    the last transaction. Explicit dates win, then what the file states, then: start the day after
+    the last signed-off period, end on the last transaction date."""
+    first = min(r["date"] for r in rows); last = max(r["date"] for r in rows)
+    p_end = p_end or getattr(rows, "period_end", None) or last
+    if not p_start:
+        p_start = getattr(rows, "period_start", None)
+    if not p_start:
+        prev = _prev_signed_closing(cur, acct_uuid, first)
+        p_start = prev[1] + timedelta(days=1) if prev else first
+    if p_start > first or p_end < last:
+        raise ValueError(f"The statement period {p_start} to {p_end} doesn't cover all its transactions "
+                         f"({first} to {last}).")
+    return p_start, p_end
+
+
+def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None):
     if not rows: raise ValueError("No transactions found in the file.")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
@@ -1400,18 +1591,24 @@ def _save_statement(rows, account_name, source_format):
     if not arow:
         cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
     acct_uuid, currency = arow
-    p_start = min(r["date"] for r in rows); p_end = max(r["date"] for r in rows)
-    closing = sum((r["amount"] for r in rows), Decimal(0))
+    p_start, p_end = _resolve_period(cur, acct_uuid, rows, p_start, p_end)
+    moves = sum((r["amount"] for r in rows), Decimal(0))
+    o_src = "user" if opening is not None else None
+    c_src = "user" if closing is not None else None
+    if opening is None and getattr(rows, "opening", None) is not None:
+        opening, o_src = rows.opening, "file"
+    if closing is None and getattr(rows, "closing", None) is not None:
+        closing, c_src = rows.closing, "file"
+    opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src)
     cur.execute("DELETE FROM statement WHERE account_id=%s AND period_start=%s AND period_end=%s;",
                 (acct_uuid, p_start, p_end))
     cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end,
-                   opening_balance, closing_balance, currency, source_format)
-                   VALUES (%s,%s,%s,%s,0,%s,%s,%s) RETURNING statement_id;""",
-                (ORG_ID, acct_uuid, p_start, p_end, closing, currency, source_format))
+                   opening_balance, closing_balance, opening_source, closing_source, currency, source_format)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
+                (ORG_ID, acct_uuid, p_start, p_end, opening or 0, closing or 0, o_src, c_src, currency, source_format))
     sid = cur.fetchone()[0]
     seen = {}
-    for r in rows:
-        key = r.get("fitid") or hashlib.sha256(f"{r['date']}|{r['amount']}|{(r.get('desc') or '').lower()}".encode()).hexdigest()[:32]
+    for r, key in zip(rows, _dedupe_keys(rows)):
         if key not in seen:
             seen[key] = (ORG_ID, sid, r["date"], r["amount"], currency, r.get("desc") or "", key)
     if seen:
@@ -1422,11 +1619,11 @@ def _save_statement(rows, account_name, source_format):
     conn.commit(); cur.close(); conn.close()
     return sid
 
-def ingest_file(text, filename, account_name):
+def ingest_file(text, filename, account_name, opening=None, closing=None, p_start=None, p_end=None):
     is_ofx = (filename or "").lower().endswith(".ofx") or "<OFX>" in text[:3000].upper()
     rows = parse_ofx(text) if is_ofx else parse_csv(text)
-    sid = _save_statement(rows, account_name, "ofx" if is_ofx else "csv")
-    return sid, len(rows)
+    sid = _save_statement(rows, account_name, "ofx" if is_ofx else "csv", opening, closing, p_start, p_end)
+    return sid, len(rows), getattr(rows, "skipped", [])
 
 
 def parse_books_csv(text):
@@ -1447,9 +1644,8 @@ def ingest_books(text, account_name):
     # Replace any prior CSV-imported books for this account (idempotent); never touches API-synced rows.
     cur.execute("DELETE FROM book_txn WHERE account_id=%s AND source_txn_type='CSV';", (acct_uuid,))
     seen = {}
-    for r in rows:
+    for r, key in zip(rows, _dedupe_keys(rows)):
         desc = r.get("desc") or ""
-        key = hashlib.sha256(f"{r['date']}|{r['amount']}|{desc.lower()}".encode()).hexdigest()[:32]
         seen[key] = (ORG_ID, acct_uuid, key, r["date"], r["amount"], currency, desc, desc, r.get("category"))
     n = len(seen)
     if seen:
@@ -1463,32 +1659,59 @@ def ingest_books(text, account_name):
             list(seen.values()),
             template="(%s,%s,%s,'CSV',%s,%s,%s,%s,%s,%s,'unknown',false,false,now())")
     conn.commit(); cur.close(); conn.close()
-    return n
+    return n, rows.skipped
 
 
 def run_matcher(statement_id):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, period_start, period_end FROM statement WHERE statement_id=%s;", (statement_id,))
     acct_uuid, p_start, p_end = cur.fetchone()
+    # Remember what the user rejected, so re-running the engine (after a books import,
+    # write-back, etc.) doesn't resurrect those pairings as confirmed.
+    cur.execute("""SELECT m.match_type,
+                          array(SELECT line_id::text FROM match_statement_line WHERE match_id=m.match_id),
+                          array(SELECT txn_id::text FROM match_book_txn WHERE match_id=m.match_id)
+                   FROM match m WHERE m.statement_id=%s AND m.status='rejected';""", (statement_id,))
+    rejected = {(mt, frozenset(ls), frozenset(ts)) for mt, ls, ts in cur.fetchall()}
+    cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
+    cur.execute("DELETE FROM match_book_txn WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match WHERE statement_id=%s;", (statement_id,))
     cur.execute("SELECT line_id, posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE statement_id=%s;", (statement_id,))
     lines = cur.fetchall()
-    cur.execute("""SELECT txn_id, posted_date, amount, coalesce(counterparty, description,'')
-                   FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s
-                   AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false;""", (acct_uuid, p_start, p_end))
-    txns = cur.fetchall()
+    txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
     used, matched_lines, matches = set(), set(), []
     def add(lids, tids, mt, conf, delta):
         matches.append((str(uuid.uuid4()), mt, conf, delta, lids, tids))
 
-    # pass 1: exact (amount equal, date within tolerance)
+    # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
+    # first hit, so two equal amounts a few days apart don't get cross-paired.
     for l_id, ld, la, lw in lines:
+        best = None
         for t_id, td, ta, tw in txns:
-            if t_id in used:
+            if t_id in used or la != ta:
                 continue
-            if la == ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS:
-                add([l_id], [t_id], "exact", 1.0, 0); used.add(t_id); matched_lines.add(l_id); break
+            gap = abs((ld - td).days)
+            if gap <= DATE_TOLERANCE_DAYS and (best is None or gap < best[0]):
+                best = (gap, t_id)
+        if best:
+            add([l_id], [best[1]], "exact", 1.0, 0); used.add(best[1]); matched_lines.add(l_id)
+
+    # pass 1b: cleared later -- same amount, bank date on/after the book date but beyond the
+    # tolerance (cheques presented late, items brought forward from last period). Confidence
+    # below 1 puts these in the review list.
+    for l_id, ld, la, lw in lines:
+        if l_id in matched_lines:
+            continue
+        best = None
+        for t_id, td, ta, tw in txns:
+            if t_id in used or la != ta:
+                continue
+            lag = (ld - td).days
+            if DATE_TOLERANCE_DAYS < lag <= CLEARING_WINDOW_DAYS and (best is None or lag < best[0]):
+                best = (lag, t_id)
+        if best:
+            add([l_id], [best[1]], "exact", 0.9, 0); used.add(best[1]); matched_lines.add(l_id)
 
     # pass 2: fuzzy (same payee, amount differs)
     for l_id, ld, la, lw in lines:
@@ -1556,7 +1779,9 @@ def run_matcher(statement_id):
     if matches:
         execute_values(cur,
             "INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta) VALUES %s",
-            [(m[0], ORG_ID, statement_id, "confirmed", m[1], m[2], m[3]) for m in matches])
+            [(m[0], ORG_ID, statement_id,
+              "rejected" if (m[1], frozenset(map(str, m[4])), frozenset(map(str, m[5]))) in rejected else "confirmed",
+              m[1], m[2], m[3]) for m in matches])
         msl = [(m[0], lid) for m in matches for lid in m[4]]
         if msl:
             execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", msl)
@@ -1572,25 +1797,17 @@ def run_matcher(statement_id):
 
 
 def account_summary(cur, acct_uuid, name, atype, currency=None):
-    cur.execute("SELECT statement_id, period_start, period_end, signed_off_at FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
-    s = cur.fetchone()
+    s = _latest_statement(cur, acct_uuid)
     if not s: return {"name": name, "type": atype, "status": "none", "currency": currency}
-    sid, ps, pe, signed = s
+    sid, ps, pe, signed = s[:4]
     cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status<>'rejected' GROUP BY match_type;", (sid,))
     mc = dict(cur.fetchall())
-    cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
-    ml = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
-    mt = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT line_id, amount FROM statement_line WHERE statement_id=%s;", (sid,))
-    lines = cur.fetchall()
-    cur.execute("SELECT txn_id, amount FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false;", (acct_uuid, ps, pe))
-    txns = cur.fetchall()
-    exc = len([l for l in lines if l[0] not in ml]) + len([t for t in txns if t[0] not in mt])
-    diff = sum((l[1] for l in lines), Decimal(0)) - sum((t[1] for t in txns), Decimal(0))
+    rec = reconcile(cur, acct_uuid, s)
+    exc = len(rec["un_lines"]) + len(rec["un_books"])
     return {"name": name, "type": atype, "currency": currency, "status": "signed" if signed else "open",
             "p_start": ps, "p_end": pe, "exact": mc.get("exact", 0), "fuzzy": mc.get("fuzzy", 0),
-            "m2o": mc.get("many_to_one", 0), "exc": exc, "diff": diff}
+            "m2o": mc.get("many_to_one", 0), "exc": exc, "rec_status": rec["status"],
+            "rec_diff": rec["rec_diff"], "missing": rec["missing"]}
 
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
@@ -1626,18 +1843,18 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 </div>
 <div class=fbar id=fbar></div>
 <table>
-<thead><tr><th>Account</th><th>Type</th><th>Currency</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th></tr></thead>
+<thead><tr><th>Account</th><th>Type</th><th>Currency</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th></tr></thead>
 <tbody>
 {% for r in rows %}<tr data-status="{{ r.status }}" data-exc="{{ r.get('exc',0) }}">
 <td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td>
 <td>{{ 'bank' if r.type=='bank' else 'credit card' }}</td>
 <td>{{ r.currency or '—' }}</td>
-<td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% else %}<span class="pill open">Reconciled</span>{% endif %}</td>
+<td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% elif r.rec_status=='balanced' %}<span class="pill open">Balanced</span>{% else %}<span class="pill open">In progress</span>{% endif %}</td>
 {% if r.status=='none' %}<td class=muted>—</td><td class=muted>—</td><td class=muted>—</td><td class="a muted">—</td>
 {% else %}<td>{{ r.p_start }} → {{ r.p_end }}</td>
 <td>{{ r.exact }} exact{% if r.fuzzy %}, {{ r.fuzzy }} fuzzy{% endif %}{% if r.m2o %}, {{ r.m2o }} batched{% endif %}</td>
 <td>{{ r.exc }}</td>
-<td class=a>{% if r.diff==0 %}<span class=ok>0.00</span>{% elif r.exc>0 %}<span class=muted>{{ r.diff|money }} · explained</span>{% else %}<span class=bad>{{ r.diff|money }} · unexplained</span>{% endif %}</td>
+<td class=a>{% if r.rec_status=='balanced' %}<span class=ok>0.00 · balanced</span>{% elif r.rec_status=='out' %}<span class=bad>{{ r.rec_diff|money }} · out</span>{% else %}<span class=muted>needs {{ r.missing }}</span>{% endif %}</td>
 {% endif %}</tr>{% endfor %}
 </tbody></table>
 <script>
@@ -1723,7 +1940,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div class=upload>
 <form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
 <div class=u-label>Bank statement (CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>
-<input type=file name=statement accept=.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button></form>
+<input type=file name=statement accept=.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button>
+<div class=balform style="margin-top:10px">
+<div><label>Opening balance <span class=muted>(optional)</span></label><input name=opening_balance inputmode=decimal placeholder="from the statement"></div>
+<div><label>Closing balance</label><input name=closing_balance inputmode=decimal placeholder="from the statement"></div>
+<div><label>Period start</label><input type=date name=period_start></div>
+<div><label>Period end (statement date)</label><input type=date name=period_end></div>
+</div>
+<div class=muted style="font-size:12px">Leave blank if the file has a running-balance column (CSV) or a ledger balance (OFX) — they're read automatically. Opening defaults to last signed-off closing. Set the period end to the statement date: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></form>
 <form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data>
 <div class=u-label>Books from QuickBooks (CSV export) · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
 <input type=file name=books accept=.csv required> <button type=submit class=btn>Import books</button></form>
@@ -1743,21 +1967,66 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>Discrepancies</span></div><div class=t-val>{{ n_fuzzy }}</div></button>
 <button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="8" height="8" rx="1.5"/><rect x="13" y="12.5" width="8" height="8" rx="1.5"/><path d="M13 7.5h3a2 2 0 0 1 2 2v3"/></svg></span><span class=t-label>Batched</span></div><div class=t-val>{{ n_m2o }}</div></button>
 <button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
-<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Difference</span></div><div class=t-val style="color:{{ '#047857' if diff==0 else ('#667085' if (writebacks|length + deposits|length + on_stmt|length + in_books|length)>0 else '#b42318') }}">{{ diff|money }}</div></button>
+<button class="tile" data-target="sec-balance"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Unreconciled</span></div><div class=t-val style="color:{{ '#047857' if rec.status=='balanced' else ('#b42318' if rec.status=='out' else '#667085') }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</div></button>
 </div>
+<h2 id=sec-balance style="font-size:15px">Balance reconciliation</h2>
+{% set cc = atype=='credit_card' %}
+<div class=recgrid>
+<table class=rec>
+<tr><th colspan=2>Bank {{ 'card statement' if cc else 'statement' }}</th></tr>
+<tr><td>Closing balance at {{ p_end }}{% if rec.closing_src %} <span class=src>· {{ src_label[rec.closing_src] }}</span>{% endif %}</td><td class=a>{% if rec.closing is none %}<span class=muted>not entered</span>{% else %}{{ rec.closing|money }}{% endif %}</td></tr>
+<tr><td>Add: {{ 'charges' if cc else 'deposits' }} in books, not yet on statement ({{ rec.n_out_in }})</td><td class=a>{{ rec.out_in|money }}</td></tr>
+<tr><td>Less: {{ 'payments & refunds' if cc else 'payments' }} in books, not yet on statement ({{ rec.n_out_out }})</td><td class=a>{{ rec.out_out|money }}</td></tr>
+<tr class=tot><td>Adjusted bank balance</td><td class=a>{% if rec.adj_bank is none %}—{% else %}{{ rec.adj_bank|money }}{% endif %}</td></tr>
+</table>
+<table class=rec>
+<tr><th colspan=2>Books</th></tr>
+<tr><td>Book balance at {{ p_end }}{% if rec.book_src %} <span class=src>· {{ src_label[rec.book_src] }}</span>{% endif %}</td><td class=a>{% if rec.book is none %}<span class=muted>not entered</span>{% else %}{{ rec.book|money }}{% endif %}</td></tr>
+<tr><td>Add/less: on statement, not in books ({{ rec.n_unrec }})</td><td class=a>{{ rec.unrec|money }}</td></tr>
+<tr><td>Add/less: amount differences on matched items ({{ rec.n_match_adj }})</td><td class=a>{{ rec.match_adj|money }}</td></tr>
+<tr class=tot><td>Adjusted book balance</td><td class=a>{% if rec.adj_book is none %}—{% else %}{{ rec.adj_book|money }}{% endif %}</td></tr>
+</table>
+</div>
+<div class="recres {{ rec.status }}">
+{% if rec.status=='balanced' %}<span>&#10003; Balanced — adjusted bank and book balances agree</span><span>0.00</span>
+{% elif rec.status=='out' %}<span>Out of balance{% if rec.rec_diff == 0 %} — the statement itself doesn't add up{% endif %}</span><span>{{ rec.rec_diff|money }}</span>
+{% else %}<span>Enter the {{ rec.missing }} to complete the reconciliation</span><span>—</span>{% endif %}
+</div>
+{% if rec.foot_diff %}<div class="recnote bad">The statement doesn't add up: opening {{ rec.opening|money }} + {{ rec.n_lines }} lines ({{ rec.moves|money }}) = {{ (rec.opening + rec.moves)|money }}, but the closing balance is {{ rec.closing|money }} (out by {{ rec.foot_diff|money }}). A line is probably missing from the upload, or a balance was mistyped.</div>
+{% elif rec.foot_diff is not none and rec.opening_src != 'derived' %}<div class=sub style="margin:4px 0 8px;font-size:13px">&#10003; Statement adds up: opening {{ rec.opening|money }} + movements {{ rec.moves|money }} = closing {{ rec.closing|money }}</div>{% endif %}
+{% if rec.prev_closing is not none and rec.opening is not none and rec.opening_src != 'carried' and rec.prev_closing != rec.opening %}<div class="recnote warn">This opening balance ({{ rec.opening|money }}) doesn't match the last signed-off closing balance ({{ rec.prev_closing|money }} at {{ rec.prev_end }}). Check for a missing statement between the two periods.</div>{% endif %}
+{% if rec.bf_count %}<div class=sub style="margin:4px 0 8px;font-size:13px">Includes {{ rec.bf_count }} item{{ '' if rec.bf_count==1 else 's' }} brought forward from earlier periods, still not cleared by the bank.</div>{% endif %}
+<details {% if rec.status=='incomplete' %}open{% endif %} style="margin:10px 0 20px">
+<summary style="cursor:pointer;color:var(--accent);font-size:13px;font-weight:600">Edit balances</summary>
+<form method=post action="{{ url_for('balances', name=name) }}" class=balform>
+<div><label>Period start</label><input type=date name=period_start value="{{ p_start }}"></div>
+<div><label>Period end</label><input type=date name=period_end value="{{ p_end }}"></div>
+<div><label>Opening balance</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening }}"></div>
+<div><label>Closing balance (statement)</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing }}"></div>
+<div><label>Book balance at {{ p_end }}</label><input name=book inputmode=decimal value="{{ '' if rec.book is none else rec.book }}"></div>
+<button type=submit class=btn-sm>Save balances</button>
+</form>
+{% if qbo_linked %}<form method=post action="{{ url_for('balances', name=name) }}" style="margin:8px 0 0"><input type=hidden name=action value=fetch_book><button type=submit class=btn-sm>Get book balance from QuickBooks</button> <span class=muted style="font-size:12px">Syncs first, then reads the account balance as at {{ p_end }}.</span></form>{% endif %}
+<div class=muted style="font-size:12px;margin-top:8px;line-height:1.5">Book balance is the account's register (or Balance Sheet) balance in QuickBooks as at the statement end date{{ ' — enter what you owe as a positive number' if cc else '' }}. Blank opening falls back to the last signed-off closing balance.</div>
+</details>
 <div style="margin-bottom:24px">
 {% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
 <form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterward.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
-{% else %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>{% endif %}
+{% elif rec.status=='balanced' %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>
+{% else %}<button type=button class=btn-go disabled style="opacity:.45;cursor:not-allowed" title="Balance the reconciliation first">Sign off this reconciliation</button>{% endif %}
 <a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
 <a href="{{ url_for('qbo_import_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download for QuickBooks (CSV)</a>
+{% if session.is_admin and not signed_off and rec.status!='balanced' %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
+<form method=post action="{{ url_for('signoff', name=name) }}" class=balform><input type=hidden name=override value=1>
+<div><label>Reason (recorded with the sign-off)</label><input name=note required style="width:340px;max-width:100%"></div>
+<button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Sign off unbalanced</button></form></details>{% endif %}
 </div>
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px">Needs review ({{ reviewable|length }})</h2>
 {% if n_signflip %}<div class=sub style="margin:-4px 0 12px">{{ n_signflip }} opposite-sign proposal{{ '' if n_signflip==1 else 's' }} below (same amount, flipped sign) — confirm the real matches, reject the rest.</div>{% endif %}
 <table><tr><th>Type</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
-<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else 'batched') }}</span></td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'discrepancy' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched')) }}</span></td>
 <td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}{% endfor %}{% if r.delta and r.delta != 0 %}<br><span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
@@ -1810,7 +2079,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 <h2 style="font-size:15px">In books, not on statement ({{ in_books|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
-{% for _, d, a, who in in_books %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
+{% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
 </div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
@@ -1917,15 +2186,95 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
     return out
 
 
-def compute_detail(cur, acct_uuid, atype="bank"):
-    cur.execute("SELECT statement_id, period_start, period_end, signed_off_at FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
-    s = cur.fetchone()
-    if not s: return {"has_results": False}
-    sid, ps, pe, signed = s
+STMT_COLS = """statement_id, period_start, period_end, signed_off_at, opening_balance, closing_balance,
+               opening_source, closing_source, book_balance, book_balance_source"""
+
+
+def _latest_statement(cur, acct_uuid):
+    cur.execute(f"SELECT {STMT_COLS} FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
+    return cur.fetchone()
+
+
+def book_pool(cur, acct_uuid, sid, p_start, p_end):
+    """Book transactions a statement can clear: those dated in its period, plus older ones still
+    outstanding (brought forward) since the account's first signed-off period. Anything already
+    cleared on another signed-off statement is excluded, so it can't be matched twice."""
+    cur.execute("""SELECT min(period_start) FROM statement
+                   WHERE account_id=%s AND signed_off_at IS NOT NULL AND statement_id<>%s AND period_start < %s;""",
+                (acct_uuid, sid, p_start))
+    floor = cur.fetchone()[0] or p_start
+    cur.execute("""SELECT bt.txn_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
+                   FROM book_txn bt
+                   WHERE bt.account_id=%s AND bt.posted_date BETWEEN %s AND %s
+                     AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false
+                     AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
+                                     JOIN match m ON m.match_id=mbt.match_id
+                                     JOIN statement s ON s.statement_id=m.statement_id
+                                     WHERE mbt.txn_id=bt.txn_id AND m.status<>'rejected'
+                                       AND s.statement_id<>%s AND s.signed_off_at IS NOT NULL)
+                   ORDER BY bt.posted_date;""", (acct_uuid, floor, p_end, sid))
+    return cur.fetchall()
+
+
+def reconcile(cur, acct_uuid, stmt):
+    """The balance proof for one statement.
+
+        adjusted bank = statement closing + book items not yet on the statement
+        adjusted book = book balance at period end + statement items not in the books
+                        + (statement - books) on every accepted match
+    The two must agree. Status is 'balanced', 'out', or 'incomplete' (a balance is missing).
+    """
+    sid, ps, pe, signed, ob, cb, o_src, c_src, bb, b_src = stmt
     cur.execute("SELECT line_id, posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE statement_id=%s ORDER BY posted_date;", (sid,))
     lines = cur.fetchall()
-    cur.execute("SELECT txn_id, posted_date, amount, coalesce(counterparty, description,'') FROM book_txn WHERE account_id=%s AND posted_date BETWEEN %s AND %s AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false ORDER BY posted_date;", (acct_uuid, ps, pe))
-    txns = cur.fetchall()
+    pool = book_pool(cur, acct_uuid, sid, ps, pe)
+    cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
+    ml = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
+    mt = {r[0] for r in cur.fetchall()}
+    cur.execute("""SELECT d FROM (
+                     SELECT (SELECT coalesce(sum(sl.amount),0) FROM match_statement_line msl
+                               JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=m.match_id)
+                          - (SELECT coalesce(sum(bt.amount),0) FROM match_book_txn mbt
+                               JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=m.match_id) AS d
+                     FROM match m WHERE m.statement_id=%s AND m.status<>'rejected') q WHERE d<>0;""", (sid,))
+    deltas = [r[0] for r in cur.fetchall()]
+    un_lines = [l for l in lines if l[0] not in ml]
+    un_books = [t for t in pool if t[0] not in mt]
+    Z = Decimal(0)
+    moves = sum((l[2] for l in lines), Z)
+    opening = ob if o_src else None
+    closing = cb if c_src else None
+    book = bb if b_src else None
+    r = {"lines": lines, "pool": pool, "ml": ml, "mt": mt, "un_lines": un_lines, "un_books": un_books,
+         "opening": opening, "opening_src": o_src, "closing": closing, "closing_src": c_src,
+         "book": book, "book_src": b_src, "moves": moves, "n_lines": len(lines), "p_end": pe,
+         "bf_count": sum(1 for t in un_books if t[1] < ps),
+         "out_in": sum((t[2] for t in un_books if t[2] > 0), Z), "n_out_in": sum(1 for t in un_books if t[2] > 0),
+         "out_out": sum((t[2] for t in un_books if t[2] < 0), Z), "n_out_out": sum(1 for t in un_books if t[2] < 0),
+         "unrec": sum((l[2] for l in un_lines), Z), "n_unrec": len(un_lines),
+         "match_adj": sum(deltas, Z), "n_match_adj": len(deltas)}
+    r["foot_diff"] = (opening + moves - closing) if (opening is not None and closing is not None) else None
+    prev = _prev_signed_closing(cur, acct_uuid, ps, sid)
+    r["prev_closing"], r["prev_end"] = (prev[0], prev[1]) if prev else (None, None)
+    r["adj_bank"] = closing + r["out_in"] + r["out_out"] if closing is not None else None
+    r["adj_book"] = book + r["unrec"] + r["match_adj"] if book is not None else None
+    missing = [w for w, v in (("closing balance", closing), ("book balance", book)) if v is None]
+    if missing:
+        r["status"], r["rec_diff"] = "incomplete", None
+    else:
+        r["rec_diff"] = r["adj_bank"] - r["adj_book"]
+        r["status"] = "balanced" if r["rec_diff"] == 0 and not r["foot_diff"] else "out"
+    r["missing"] = " and ".join(missing)
+    return r
+
+
+def compute_detail(cur, acct_uuid, atype="bank"):
+    s = _latest_statement(cur, acct_uuid)
+    if not s: return {"has_results": False}
+    sid, ps, pe, signed = s[:4]
+    rec = reconcile(cur, acct_uuid, s)
+    lines, ml = rec["lines"], rec["ml"]
     cur.execute("""SELECT m.match_type, m.amount_delta, sl.posted_date, sl.amount,
                    coalesce(sl.counterparty, sl.description,''), bt.amount FROM match m
                    JOIN match_statement_line msl ON msl.match_id=m.match_id JOIN statement_line sl ON sl.line_id=msl.line_id
@@ -1937,7 +2286,9 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='manual' AND status<>'rejected';", (sid,))
     n_signflip = cur.fetchone()[0]
     reviewable = []
-    cur.execute("SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s AND match_type IN ('fuzzy','many_to_one','manual') ORDER BY match_type;", (sid,))
+    cur.execute("""SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s
+                   AND (match_type IN ('fuzzy','many_to_one','manual') OR (match_type='exact' AND confidence < 1))
+                   ORDER BY match_type;""", (sid,))
     rmatches = cur.fetchall()
     rids = [str(r[0]) for r in rmatches]
     sls_by, bts_by = {}, {}
@@ -1953,11 +2304,6 @@ def compute_detail(cur, acct_uuid, atype="bank"):
     for mid, mtype, status, delta in rmatches:
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])})
-    cur.execute("SELECT msl.line_id FROM match m JOIN match_statement_line msl ON msl.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
-    ml = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT mbt.txn_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id WHERE m.statement_id=%s AND m.status<>'rejected';", (sid,))
-    mt = {r[0] for r in cur.fetchall()}
-    st = sum((l[2] for l in lines), Decimal(0)); bt_ = sum((t[2] for t in txns), Decimal(0))
     mem = build_memory()
     writebacks, deposits, on_stmt_in = [], [], []
     for (lid, dd, a, who) in [l for l in lines if l[0] not in ml]:
@@ -1984,22 +2330,49 @@ def compute_detail(cur, acct_uuid, atype="bank"):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
-            "on_stmt": on_stmt_in,
-            "in_books": [t for t in txns if t[0] not in mt], "diff": st - bt_}
+            "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"]}
+
+
+BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
+                   "derived": "closing less movements", "qbo": "from QuickBooks"}
 
 
 @app.route("/account/<name>")
 def detail(name):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, type, currency, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, atype, ccy = row
+    acct_uuid, atype, ccy, acct_qbo = row
     d = compute_detail(cur, acct_uuid, atype)
     cur.close(); conn.close()
-    return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy,
-                                  detail_msg=session.pop("detail_msg", None), **d)
+    return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
+                                  src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None), **d)
+
+
+def _form_amount(field):
+    """Optional money field from the posted form: None when blank, ValueError when unreadable."""
+    v = (request.form.get(field) or "").strip()
+    if not v:
+        return None
+    try:
+        return parse_amount(v)
+    except Exception:
+        raise ValueError(f"Couldn't read '{v}' as an amount.")
+
+
+def _form_date(field):
+    v = (request.form.get(field) or "").strip()
+    return datetime.strptime(v, "%Y-%m-%d").date() if v else None
+
+
+def _skipped_note(skipped):
+    if not skipped:
+        return ""
+    eg = ", ".join(skipped[:3]) + (" …" if len(skipped) > 3 else "")
+    return (f" WARNING: {len(skipped)} row{'' if len(skipped)==1 else 's'} had a date or amount that couldn't "
+            f"be read and {'was' if len(skipped)==1 else 'were'} skipped (dates: {eg}). Check the file before signing off.")
 
 
 @app.route("/account/<name>/upload", methods=["POST"])
@@ -2008,9 +2381,11 @@ def upload(name):
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
     try:
-        sid, n = ingest_file(f.read().decode("utf-8-sig", errors="ignore"), f.filename, name)
+        opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
+        sid, n, skipped = ingest_file(f.read().decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
+                                      _form_date("period_start"), _form_date("period_end"))
         note = run_matcher(sid)
-        session["detail_msg"] = f"Loaded {n} statement lines and reconciled." + (f" {note}" if note else "")
+        session["detail_msg"] = f"Loaded {n} statement lines and reconciled." + _skipped_note(skipped) + (f" {note}" if note else "")
     except Exception as e:
         return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
@@ -2022,7 +2397,7 @@ def import_books(name):
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
     try:
-        n = ingest_books(f.read().decode("utf-8-sig", errors="ignore"), name)
+        n, skipped = ingest_books(f.read().decode("utf-8-sig", errors="ignore"), name)
         conn = get_conn(); cur = conn.cursor()
         cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
         arow = cur.fetchone()
@@ -2037,7 +2412,7 @@ def import_books(name):
             c2 = get_conn(); cu2 = c2.cursor()
             cu2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
             c2.commit(); cu2.close(); c2.close()
-        session["detail_msg"] = f"Imported {n} book transactions." + (f" {note}" if note else "")
+        session["detail_msg"] = f"Imported {n} book transactions." + _skipped_note(skipped) + (f" {note}" if note else "")
     except Exception as e:
         return f"Could not import books: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
@@ -2054,6 +2429,62 @@ def review_match(name, match_id):
     return redirect(url_for("detail", name=name))
 
 
+@app.route("/account/<name>/balances", methods=["POST"])
+def balances(name):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    if not s:
+        cur.close(); conn.close(); return redirect(url_for("detail", name=name))
+    acct_uuid, acct_qbo = row
+    sid, ps, pe = s[:3]
+    try:
+        if request.form.get("action") == "fetch_book":
+            cur.close(); conn.close()
+            if not acct_qbo:
+                raise ValueError("This account isn't linked to a QuickBooks account.")
+            sync_from_quickbooks(full=False)   # the calculation needs fresh transactions
+            bal = qbo_book_balance_at(qbo_token(), acct_uuid, acct_qbo, pe)
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("UPDATE statement SET book_balance=%s, book_balance_source='qbo' WHERE statement_id=%s;", (bal, sid))
+            session["detail_msg"] = f"Book balance at {pe} from QuickBooks: {_money(bal)}."
+        else:
+            opening, closing, book = _form_amount("opening"), _form_amount("closing"), _form_amount("book")
+            new_ps, new_pe = _form_date("period_start") or ps, _form_date("period_end") or pe
+            cur.execute("SELECT coalesce(sum(amount),0), min(posted_date), max(posted_date) FROM statement_line WHERE statement_id=%s;", (sid,))
+            moves, first, last = cur.fetchone()
+            rematch = (new_ps, new_pe) != (ps, pe)
+            if rematch:
+                if new_ps > first or new_pe < last:
+                    raise ValueError(f"the period must cover the statement's transactions ({first} to {last})")
+                cur.execute("UPDATE statement SET period_start=%s, period_end=%s WHERE statement_id=%s;", (new_ps, new_pe, sid))
+                ps = new_ps
+            opening, o_src, closing, c_src = _resolve_balances(
+                cur, acct_uuid, ps, moves, opening, "user" if opening is not None else None,
+                closing, "user" if closing is not None else None, exclude_sid=sid)
+            cur.execute("""UPDATE statement SET opening_balance=%s, opening_source=%s, closing_balance=%s, closing_source=%s,
+                           book_balance=%s, book_balance_source=%s WHERE statement_id=%s;""",
+                        (opening or 0, o_src, closing or 0, c_src, book, "user" if book is not None else None, sid))
+            session["detail_msg"] = "Balances saved."
+            if rematch:
+                conn.commit(); cur.close(); conn.close()
+                note = run_matcher(sid)
+                conn = get_conn(); cur = conn.cursor()
+                session["detail_msg"] = "Balances and period saved; matching re-run." + (f" {note}" if note else "")
+        cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
+        conn.commit()
+    except urllib.error.HTTPError as e:
+        session["detail_msg"] = f"QuickBooks error (HTTP {e.code}) while fetching the book balance."
+    except Exception as e:
+        session["detail_msg"] = f"Couldn't update balances: {e}"
+    try:
+        cur.close(); conn.close()
+    except Exception:
+        pass
+    return redirect(url_for("detail", name=name) + "#sec-balance")
+
+
 @app.route("/account/<name>/signoff", methods=["POST"])
 def signoff(name):
     conn = get_conn(); cur = conn.cursor()
@@ -2065,15 +2496,26 @@ def signoff(name):
         srow = cur.fetchone()
         if srow:
             sid = srow[0]
+            d = compute_detail(cur, acct_uuid, atype)
+            rec = d["rec"]
+            note = (request.form.get("note") or "").strip()
+            override = session.get("is_admin") and request.form.get("override") == "1" and note
+            if rec["status"] != "balanced" and not override:
+                why = (f"it needs a {rec['missing']}" if rec["status"] == "incomplete"
+                       else f"the adjusted balances are out by {_money(rec['rec_diff'])}" if rec["rec_diff"]
+                       else f"the statement doesn't add up (out by {_money(rec['foot_diff'])})")
+                session["detail_msg"] = f"Not signed off: {why}."
+                cur.close(); conn.close()
+                return redirect(url_for("detail", name=name) + "#sec-balance")
             try:
-                d = compute_detail(cur, acct_uuid, atype)
                 exc = len(d.get("writebacks", [])) + len(d.get("deposits", [])) + len(d.get("on_stmt", [])) + len(d.get("in_books", []))
                 _ensure_snapshot_cols(cur)
                 cur.execute("UPDATE statement SET snap_exact=%s, snap_fuzzy=%s, snap_m2o=%s, snap_exc=%s, snap_diff=%s WHERE statement_id=%s;",
-                            (d.get("n_exact", 0), d.get("n_fuzzy", 0), d.get("n_m2o", 0), exc, d.get("diff", 0), sid))
+                            (d.get("n_exact", 0), d.get("n_fuzzy", 0), d.get("n_m2o", 0), exc, rec["rec_diff"], sid))
             except Exception:
-                pass
-            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by=%s WHERE statement_id=%s;", (session.get("name") or "you", sid))
+                conn.rollback()
+            cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by=%s, signoff_note=%s WHERE statement_id=%s;",
+                        (session.get("name") or "you", note if rec["status"] != "balanced" else None, sid))
             conn.commit()
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
@@ -2098,12 +2540,14 @@ def reopen(name):
 def writeback(name, line_id):
     chosen = (request.form.get("category") or "").strip()
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     arow = cur.fetchone()
     if not arow:
         cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, acct_qbo = arow
-    cur.execute("SELECT posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE line_id=%s;", (line_id,))
+    acct_uuid, acct_qbo, atype, ccy = arow
+    cur.execute("""SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
+                   FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   WHERE sl.line_id=%s AND s.account_id=%s;""", (line_id, acct_uuid))
     lrow = cur.fetchone()
     cur.close(); conn.close()
     if not lrow:
@@ -2115,7 +2559,9 @@ def writeback(name, line_id):
         acct_id, label = _resolve_account(chosen, expense_accts)
         if not acct_id:
             return f"No expense account found to categorize under. <br><a href='{url_for('detail', name=name)}'>Back</a>"
-        result = create_purchase(token, acct_qbo, acct_id, float(abs(amount)), str(d), f"Reconciliation write-back: {who}")
+        is_cc = atype == "credit_card"
+        result = create_purchase(token, acct_qbo, acct_id, float(abs(amount)), str(d), f"Reconciliation write-back: {who}",
+                                 payment_type="CreditCard" if is_cc else "Cash")
         new_id = (result.get("Purchase") or {}).get("Id")
         sug = suggest_category(build_memory(), who)[0]
         if chosen and chosen != (sug or ""):
@@ -2126,10 +2572,10 @@ def writeback(name, line_id):
                 INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
                                       posted_date, amount, currency, description, counterparty,
                                       reference, category, cleared_status, last_modified)
-                VALUES (%s,%s,%s,'Purchase',%s,%s,'USD',%s,%s,NULL,%s,'unknown',now())
+                VALUES (%s,%s,%s,'Purchase',%s,%s,%s,%s,%s,NULL,%s,'unknown',now())
                 ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
                   amount=EXCLUDED.amount, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
-            """, (ORG_ID, acct_uuid, new_id, d, -abs(amount), who, who, label))
+            """, (ORG_ID, acct_uuid, new_id, d, abs(amount) if is_cc else -abs(amount), ccy or "USD", who, who, label))
         cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
         srow = cur.fetchone(); conn.commit(); cur.close(); conn.close()
         if srow:
@@ -2152,14 +2598,16 @@ def writeback(name, line_id):
 def deposit_writeback(name, line_id):
     chosen = (request.form.get("category") or "").strip()
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, source_account_id, type FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     arow = cur.fetchone()
     if not arow:
         cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, acct_qbo, atype = arow
+    acct_uuid, acct_qbo, atype, ccy = arow
     if atype != "bank":
         cur.close(); conn.close(); return redirect(url_for("detail", name=name))
-    cur.execute("SELECT posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE line_id=%s;", (line_id,))
+    cur.execute("""SELECT sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description,'')
+                   FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   WHERE sl.line_id=%s AND s.account_id=%s;""", (line_id, acct_uuid))
     lrow = cur.fetchone()
     cur.close(); conn.close()
     if not lrow:
@@ -2179,10 +2627,10 @@ def deposit_writeback(name, line_id):
                 INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
                                       posted_date, amount, currency, description, counterparty,
                                       reference, category, cleared_status, last_modified)
-                VALUES (%s,%s,%s,'Deposit',%s,%s,'USD',%s,%s,NULL,%s,'unknown',now())
+                VALUES (%s,%s,%s,'Deposit',%s,%s,%s,%s,%s,NULL,%s,'unknown',now())
                 ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
                   amount=EXCLUDED.amount, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
-            """, (ORG_ID, acct_uuid, new_id, d, abs(amount), who or "Deposit", who, label))
+            """, (ORG_ID, acct_uuid, new_id, d, abs(amount), ccy or "USD", who or "Deposit", who, label))
         cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
         srow = cur.fetchone(); conn.commit(); cur.close(); conn.close()
         if srow:
@@ -2280,7 +2728,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <div class=sub>Past reconciliations for this account{% if ccy %} · {{ ccy }}{% endif %}</div>
 {% if stmts %}
 <table>
-<thead><tr><th>Period</th><th>Reconciled on</th><th>Matches</th><th>Exceptions</th><th class=a>Difference</th><th>Status</th></tr></thead>
+<thead><tr><th>Period</th><th>Reconciled on</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th><th>Status</th></tr></thead>
 <tbody>
 {% for s in stmts %}<tr>
 <td>{{ s.period_start }} → {{ s.period_end }}</td>
@@ -2288,7 +2736,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <td>{% if s.exact is not none %}{{ s.exact }} exact{% if s.fuzzy %}, {{ s.fuzzy }} fuzzy{% endif %}{% if s.m2o %}, {{ s.m2o }} batched{% endif %}{% else %}—{% endif %}</td>
 <td>{% if s.exc is not none %}{{ s.exc }}{% else %}—{% endif %}</td>
 <td class=a>{% if s.diff is not none %}{{ s.diff|money }}{% else %}—{% endif %}</td>
-<td>{% if s.signed %}<span class="pill signed">Signed off {{ s.signed.strftime('%Y-%m-%d') }}</span>{% else %}<span class="pill open">In progress</span>{% endif %}</td>
+<td>{% if s.signed %}<span class="pill signed">Signed off {{ s.signed.strftime('%Y-%m-%d') }}</span>{% if s.note %}<br><span class=bad style="font-size:12px;white-space:normal">Unbalanced — {{ s.note }}</span>{% endif %}{% else %}<span class="pill open">In progress</span>{% endif %}</td>
 </tr>{% endfor %}
 </tbody></table>
 <div class=sub style="font-size:12.5px;margin-top:6px">Match counts and difference are snapshots taken when each period was signed off.</div>
@@ -2311,12 +2759,12 @@ def history(name):
     except Exception:
         pass
     cur.execute("""SELECT period_start, period_end, created_at, signed_off_at,
-                          snap_exact, snap_fuzzy, snap_m2o, snap_exc, snap_diff
+                          snap_exact, snap_fuzzy, snap_m2o, snap_exc, snap_diff, signoff_note
                    FROM statement WHERE account_id=%s ORDER BY created_at DESC;""", (acct_uuid,))
     stmts = []
-    for ps, pe, created, signed, ex, fz, m2, exc, diff in cur.fetchall():
+    for ps, pe, created, signed, ex, fz, m2, exc, diff, note in cur.fetchall():
         stmts.append({"period_start": ps, "period_end": pe, "created": created, "signed": signed,
-                      "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff})
+                      "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff, "note": note})
     cur.close(); conn.close()
     return render_template_string(HISTORY_TEMPLATE, name=name, ccy=ccy, stmts=stmts)
 
