@@ -394,6 +394,108 @@ def import_accounts_from_qbo(token):
     return created
 
 
+CDC_MAX_DAYS = 29          # QBO's change feed only reaches back 30 days
+CDC_ENTITY_CAP = 1000      # CDC returns at most this many objects per entity, unpaged
+REMOVAL_GUARD_MIN = 20     # a full resync may always remove this many rows per type...
+REMOVAL_GUARD_SHARE = 0.5  # ...but never more than this share of them without a human looking
+
+
+def qbo_cdc_deleted(token, entities, changed_since):
+    """{entity: [ids]} of objects QBO reports deleted since `changed_since`, and whether any
+    entity hit the per-call cap (in which case some deletions may be missing)."""
+    def call(ents):
+        q = urllib.parse.urlencode({"entities": ",".join(ents), "changedSince": changed_since})
+        req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/cdc?{q}")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    try:
+        data = call(entities)
+    except urllib.error.HTTPError:
+        data = call([e for e in entities if e not in QBO_OPTIONAL])   # older API versions
+    deleted, capped = {}, False
+    for block in data.get("CDCResponse", []):
+        for qr in block.get("QueryResponse", []):
+            for etype, objs in qr.items():
+                if etype not in QBO_HANDLERS or not isinstance(objs, list):
+                    continue
+                capped = capped or len(objs) >= CDC_ENTITY_CAP
+                ids = [str(o["Id"]) for o in objs if o.get("status") == "Deleted" and o.get("Id")]
+                if ids:
+                    deleted.setdefault(etype, []).extend(ids)
+    return deleted, capped
+
+
+def _mark_removed(cur, txn_ids):
+    if txn_ids:
+        cur.execute("UPDATE book_txn SET is_deleted=true, updated_at=now() WHERE txn_id = ANY(%s::uuid[]);",
+                    ([str(t) for t in txn_ids],))
+
+
+def _apply_removals(cur, rows, cache, fetched, deleted, full_mode, since):
+    """Flag synced book rows that no longer exist in QuickBooks under that account.
+
+    Three sources: CDC deletions (incremental), changed transactions that now point at a
+    different account or none, and -- on a full pull only -- rows QBO no longer returns at all.
+    Rows are flagged is_deleted, never removed; CSV-imported books are never touched.
+    Returns (removed txn_ids, warnings)."""
+    removed, warnings = set(), []
+    for etype, ids in deleted.items():
+        cur.execute("""SELECT txn_id FROM book_txn WHERE source_txn_type=%s AND source_txn_id = ANY(%s)
+                       AND NOT is_deleted;""", (etype, ids))
+        removed.update(r[0] for r in cur.fetchall())
+    current = {(str(r[1]), r[3], str(r[2])) for r in rows}   # (account, type, id) as QBO has them now
+    for etype, ents in cache.items():
+        ids = [str(e.get("Id")) for e in ents if e.get("Id")]
+        if not ids:
+            continue
+        cur.execute("""SELECT txn_id, account_id, source_txn_id FROM book_txn
+                       WHERE source_txn_type=%s AND source_txn_id = ANY(%s) AND NOT is_deleted;""", (etype, ids))
+        removed.update(t for t, a, i in cur.fetchall() if (str(a), etype, i) not in current)
+    if full_mode:
+        for etype, ents in cache.items():
+            if fetched.get(etype, -1) < 0:
+                continue   # a failed pull says nothing about what exists
+            ids = [str(e.get("Id")) for e in ents if e.get("Id")]
+            cur.execute("""SELECT txn_id FROM book_txn
+                           WHERE source_txn_type=%s AND NOT is_deleted AND NOT (source_txn_id = ANY(%s))
+                             AND (%s::date IS NULL OR posted_date >= %s::date);""", (etype, ids, since, since))
+            gone = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT count(*) FROM book_txn WHERE source_txn_type=%s AND NOT is_deleted AND (%s::date IS NULL OR posted_date >= %s::date);",
+                        (etype, since, since))
+            live = cur.fetchone()[0]
+            if len(gone) > max(REMOVAL_GUARD_MIN, REMOVAL_GUARD_SHARE * live):
+                warnings.append(f"{etype}: QuickBooks no longer returns {len(gone)} of {live} synced records. "
+                                f"Nothing was removed; check the right company is connected, then run a full resync again.")
+                continue
+            removed.update(gone)
+    _mark_removed(cur, removed)
+    return removed, warnings
+
+
+def _removal_fallout(cur, removed):
+    """Statements whose accepted matches used a removed transaction: (open ids, signed-off labels)."""
+    if not removed:
+        return [], []
+    cur.execute("""SELECT DISTINCT s.statement_id, a.name, s.period_start, s.period_end, s.signed_off_at
+                   FROM match_book_txn mbt JOIN match m ON m.match_id=mbt.match_id
+                   JOIN statement s ON s.statement_id=m.statement_id JOIN account a ON a.account_id=s.account_id
+                   WHERE mbt.txn_id = ANY(%s::uuid[]) AND m.status<>'rejected';""", ([str(t) for t in removed],))
+    open_, signed = [], []
+    for sid, nm, ps, pe, so in cur.fetchall():
+        (signed.append(f"{nm} {ps} to {pe}") if so else open_.append(sid))
+    return open_, signed
+
+
+def _sync_age_days(stamp):
+    try:
+        t = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).days
+    except Exception:
+        return 10 ** 6
+
+
 def sync_from_quickbooks(full=False):
     token = qbo_token()
     import_accounts_from_qbo(token)
@@ -402,7 +504,13 @@ def sync_from_quickbooks(full=False):
     # Stamped BEFORE fetching, so anything edited mid-sync is caught next time.
     # A newly handled entity type needs one full pull, or its older records never arrive.
     ent_sig = ",".join(sorted(QBO_HANDLERS))
-    changed_since = None if (full or get_config("sync_entities") != ent_sig) else get_config("last_sync_at")
+    changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
+        else get_config("last_sync_at")
+    notes = []
+    if changed_since and _sync_age_days(changed_since) > CDC_MAX_DAYS:
+        # Deletions older than the change feed's reach can only be found by a full pull.
+        changed_since = None
+        notes.append(f"last sync was over {CDC_MAX_DAYS} days ago, so this was a full sync to catch deletions")
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S-00:00")
     t0 = time.time()
     cache = {}
@@ -414,6 +522,13 @@ def sync_from_quickbooks(full=False):
         except urllib.error.HTTPError:
             cache[etype] = []
             fetched[etype] = -1  # -1 marks a failed pull, distinct from a genuine zero
+    deleted, cdc_ok, capped = {}, True, False
+    if changed_since:
+        try:
+            deleted, capped = qbo_cdc_deleted(token, list(QBO_HANDLERS), changed_since)
+        except Exception:
+            cdc_ok = False
+            notes.append("couldn't read deletions from QuickBooks; they'll be checked on the next sync")
     fetch_secs = time.time() - t0
     conn = get_conn(); cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
@@ -442,34 +557,60 @@ def sync_from_quickbooks(full=False):
                 if not res:
                     continue
                 amount, cp, desc, cat = res
+                # QBO voids by zeroing the amounts; keep the row but out of matching.
                 rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
                              e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
                              e.get("DocNumber"), cat, "unknown",
-                             e.get("MetaData", {}).get("LastUpdatedTime")))
+                             e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0))
     t1 = time.time()
     if rows:
         execute_values(cur, """
             INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type,
                                   posted_date, amount, currency, description, counterparty,
-                                  reference, category, cleared_status, last_modified)
+                                  reference, category, cleared_status, last_modified, is_void)
             VALUES %s
             ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET
               posted_date=EXCLUDED.posted_date, amount=EXCLUDED.amount, currency=EXCLUDED.currency,
               description=EXCLUDED.description, counterparty=EXCLUDED.counterparty,
-              reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified;
+              reference=EXCLUDED.reference, category=EXCLUDED.category, last_modified=EXCLUDED.last_modified,
+              is_void=EXCLUDED.is_void, is_deleted=false, updated_at=now();
         """, rows, page_size=500)
     total = len(rows)
+    realm, synced_realm = qbo_realm(), get_config("synced_realm")
+    if synced_realm and synced_realm != realm:
+        # A different company: its IDs mean nothing against rows synced from the old one.
+        removed, warns = set(), ["the connected QuickBooks company changed since the last sync, so no transactions "
+                                 "were flagged as deleted this time"]
+    else:
+        removed, warns = _apply_removals(cur, rows, cache, fetched, deleted, changed_since is None, since)
+    reopen, signed_hit = _removal_fallout(cur, removed)
     conn.commit(); cur.close(); conn.close()
+    for sid in reopen:   # open reconciliations: re-match without the removed transactions
+        run_matcher(sid)
+    if removed:
+        notes.append(f"flagged {len(removed)} transaction{'' if len(removed)==1 else 's'} deleted or moved in QuickBooks"
+                     + (f", re-matched {len(reopen)} open reconciliation{'' if len(reopen)==1 else 's'}" if reopen else ""))
+    if signed_hit:
+        notes.append("WARNING: signed-off reconciliations used transactions since removed in QuickBooks: "
+                     + "; ".join(signed_hit[:5]) + (" …" if len(signed_hit) > 5 else "") + ". Review and reopen them.")
+    notes.extend(warns)
     insert_secs = time.time() - t1
-    clean = all(v >= 0 for k, v in fetched.items() if k not in QBO_OPTIONAL)
+    clean = all(v >= 0 for k, v in fetched.items() if k not in QBO_OPTIONAL) and cdc_ok
     if clean:
         set_config("last_sync_at", started_at)   # only advance if every entity pulled OK
         set_config("sync_entities", ent_sig)
+        set_config("synced_realm", realm)
+        # Past the CDC cap some deletions may be missing: make the next sync a full one.
+        set_config("sync_force_full", "1" if capped else "0")
+        if capped:
+            notes.append("many changes at once, so the next sync will be a full one to be sure nothing was missed")
     detail = ", ".join(f"{k} {('unavailable' if k in QBO_OPTIONAL else 'FAILED') if v < 0 else v}" for k, v in fetched.items())
     mode = "full" if changed_since is None else f"changes since {changed_since[:16].replace('T', ' ')}"
     timing = f"fetch {fetch_secs:.0f}s, save {insert_secs:.0f}s"
     if not clean:
         detail += " \u2014 some types failed, so the next sync will re-check the same period"
+    if notes:
+        detail += ". " + "; ".join(notes)
     return total, detail, mode, timing
 
 
@@ -1995,6 +2136,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if rec.foot_diff %}<div class="recnote bad">The statement doesn't add up: opening {{ rec.opening|money }} + {{ rec.n_lines }} lines ({{ rec.moves|money }}) = {{ (rec.opening + rec.moves)|money }}, but the closing balance is {{ rec.closing|money }} (out by {{ rec.foot_diff|money }}). A line is probably missing from the upload, or a balance was mistyped.</div>
 {% elif rec.foot_diff is not none and rec.opening_src != 'derived' %}<div class=sub style="margin:4px 0 8px;font-size:13px">&#10003; Statement adds up: opening {{ rec.opening|money }} + movements {{ rec.moves|money }} = closing {{ rec.closing|money }}</div>{% endif %}
 {% if rec.prev_closing is not none and rec.opening is not none and rec.opening_src != 'carried' and rec.prev_closing != rec.opening %}<div class="recnote warn">This opening balance ({{ rec.opening|money }}) doesn't match the last signed-off closing balance ({{ rec.prev_closing|money }} at {{ rec.prev_end }}). Check for a missing statement between the two periods.</div>{% endif %}
+{% if rec.n_gone %}<div class="recnote bad">{{ rec.n_gone }} book transaction{{ '' if rec.n_gone==1 else 's' }} matched in this reconciliation {{ 'has' if rec.n_gone==1 else 'have' }} since been deleted, voided or moved in QuickBooks.{% if signed_off %} Undo the sign-off and re-upload the statement to re-match.{% endif %}</div>{% endif %}
 {% if rec.bf_count %}<div class=sub style="margin:4px 0 8px;font-size:13px">Includes {{ rec.bf_count }} item{{ '' if rec.bf_count==1 else 's' }} brought forward from earlier periods, still not cleared by the bank.</div>{% endif %}
 <details {% if rec.status=='incomplete' %}open{% endif %} style="margin:10px 0 20px">
 <summary style="cursor:pointer;color:var(--accent);font-size:13px;font-weight:600">Edit balances</summary>
@@ -2239,6 +2381,10 @@ def reconcile(cur, acct_uuid, stmt):
                                JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=m.match_id) AS d
                      FROM match m WHERE m.statement_id=%s AND m.status<>'rejected') q WHERE d<>0;""", (sid,))
     deltas = [r[0] for r in cur.fetchall()]
+    cur.execute("""SELECT count(*) FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
+                   JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                   WHERE m.statement_id=%s AND m.status<>'rejected' AND (bt.is_deleted OR bt.is_void);""", (sid,))
+    n_gone = cur.fetchone()[0]
     un_lines = [l for l in lines if l[0] not in ml]
     un_books = [t for t in pool if t[0] not in mt]
     Z = Decimal(0)
@@ -2253,7 +2399,7 @@ def reconcile(cur, acct_uuid, stmt):
          "out_in": sum((t[2] for t in un_books if t[2] > 0), Z), "n_out_in": sum(1 for t in un_books if t[2] > 0),
          "out_out": sum((t[2] for t in un_books if t[2] < 0), Z), "n_out_out": sum(1 for t in un_books if t[2] < 0),
          "unrec": sum((l[2] for l in un_lines), Z), "n_unrec": len(un_lines),
-         "match_adj": sum(deltas, Z), "n_match_adj": len(deltas)}
+         "match_adj": sum(deltas, Z), "n_match_adj": len(deltas), "n_gone": n_gone}
     r["foot_diff"] = (opening + moves - closing) if (opening is not None and closing is not None) else None
     prev = _prev_signed_closing(cur, acct_uuid, ps, sid)
     r["prev_closing"], r["prev_end"] = (prev[0], prev[1]) if prev else (None, None)
