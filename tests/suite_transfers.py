@@ -86,6 +86,9 @@ check("bank-to-card payment flagged (both statements show -150,000)", any(a == "
 k = c.cursor(); dc = A.compute_detail(k, CEN, "bank", "36"); c.rollback()
 check("same number in another currency is not a transfer", all(x["account"] != "Stanbic USD" for v in dc["xfers"].values() for x in v))
 check("pair button shown", "Record as one transfer" in page)
+ids = re.findall(r"<h2 id=(sec-[a-z]+)", page)
+check("each section heading has its own id (transfers and not-in-books apart)", len(ids) == len(set(ids))
+      and "sec-transfers" in ids)
 
 # ---- one line from the record table ------------------------------------------------------------
 L1, C1 = lid("TRANSFER TO CENTENARY"), lid("FROM STANBIC")
@@ -153,7 +156,8 @@ check("card side lowers what's owed (-300,000), bank side is money out (-300,000
 check("card payment matched on the card statement", matched(V1) == ("confirmed", "engine"))
 
 L3, V2 = lid("VISA PAYMENT"), lid("PAYMENT RECEIVED")
-cl.post("/account/Visa/transfer", data={"line": V2, "other": L3})
+r = cl.post("/account/Visa/transfer", data={"line": V2, "other": L3})
+check("recording a pair returns to the transfers section", r.headers["Location"].endswith("#sec-transfers"))
 ent, body = POSTS[-1]
 check("card/bank pair from the card's page: bank -> card", ent == "Transfer" and body["FromAccountRef"]["value"] == "35"
       and body["ToAccountRef"]["value"] == "41" and body["Amount"] == 150000.0)

@@ -3746,7 +3746,7 @@ update(false);
 })();</script>
 {% endif %}
 {% endif %}
-{% if n_xfer %}<h2 id=sec-exceptions style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
+{% if n_xfer %}<h2 id=sec-transfers style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it.</div>
 <table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
@@ -3807,10 +3807,10 @@ if(!menu||menu.getAttribute('data-built'))return;
 var heads=[].slice.call(document.querySelectorAll('h2[id^="sec-"]'));
 if(heads.length<2)return;
 menu.setAttribute('data-built','1');
-var NAMES={'sec-balance':'Balance','sec-review':'Suggested','sec-matched':'Matched','sec-record':'Record','sec-manual':'Match manually'};
+var NAMES={'sec-balance':'Balance','sec-review':'Suggested','sec-matched':'Matched','sec-record':'Record','sec-manual':'Match manually',
+  'sec-transfers':'Transfers','sec-exceptions':'Not in books'};
 function label(h){
   var t=(h.textContent||'').replace(/ +/g,' ').trim(),name=NAMES[h.id],n=null,m;
-  if(h.id==='sec-exceptions')name=/^Possible/.test(t)?'Transfers':'Not in books';
   if(!name){name=t.split(' (')[0].split(' —')[0];if(name.length>22)name=name.slice(0,21)+'…';}
   if((m=t.match(/([0-9]+) to review/)))n=+m[1];
   else if((m=t.match(/[(]([^)]*)[)]/))){var ds=m[1].match(/[0-9][0-9,]*/g);if(ds){n=0;ds.forEach(function(x){n+=+x.split(',').join('');});}}
@@ -4932,7 +4932,7 @@ def record_discard(name):
 def record_transfer(name):
     """Money visibly left one of your accounts and arrived at another, and neither side is in
     QuickBooks: record ONE Transfer and match both bank lines to it."""
-    back = redirect(url_for("detail", name=name) + "#sec-exceptions")
+    back = redirect(url_for("detail", name=name) + "#sec-transfers")
     lid, other = request.form.get("line") or "", request.form.get("other") or ""
     try:
         uuid.UUID(lid); uuid.UUID(other)
