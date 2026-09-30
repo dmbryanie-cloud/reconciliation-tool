@@ -22,11 +22,15 @@ const sum = () => d.getElementById("mmsum").textContent;
 const go = () => d.getElementById("mmgo");
 
 check("no script errors on load", errors.length === 0);
-check("record-table account pickers filled from the chart of accounts",
-      [...d.querySelectorAll("select.acct")].every(s => s.options.length >= 3));
-check("transfer group offered last in every picker, with your other bank",
-      [...d.querySelectorAll("select.acct")].every(s => { const g = [...s.querySelectorAll("optgroup")].pop();
-        return g && /^Transfer (to|from) your account$/.test(g.label) && g.textContent.includes("Centenary"); }));
+const boxes0 = [...d.querySelectorAll(".acctbox")];
+const fire = (el, type, init = {}) => el.dispatchEvent(new window[type === "keydown" ? "KeyboardEvent" : "Event"](type, { bubbles: true, cancelable: true, ...init }));
+const opts = b => [...b.querySelectorAll(".acct-list .ao")].map(o => o.firstChild.textContent);
+check("record-table account pickers filled from the chart of accounts", boxes0.length > 0 && boxes0.every(b => {
+  const q = b.querySelector(".acct-q"); fire(q, "focus"); const n = opts(b).length; fire(q, "blur"); return n >= 3; }));
+check("transfer group offered last in every picker, with your other bank", boxes0.every(b => {
+  const q = b.querySelector(".acct-q"); fire(q, "focus");
+  const g = [...b.querySelectorAll(".acct-list .ag")].pop(), last = opts(b).pop(); fire(q, "blur");
+  return g && /^Transfer (to|from) your account$/.test(g.textContent) && last === "Centenary"; }));
 check("button starts disabled", go().disabled && /Tick at least one/.test(sum()));
 
 tick("mml", "DEPOSIT CASH");
@@ -71,6 +75,38 @@ const e2 = new window.SubmitEvent("submit", { cancelable: true, bubbles: true, s
 rf.dispatchEvent(e2);
 console.log("   bulk confirm:", confirmMsg);
 check("bulk record confirms count and total (flagged lines excluded)", /^Record 2 transactions totalling 510,000\.00 in QuickBooks\?$/.test(confirmMsg || ""));
+
+// The account box: type to search, closest first, clear to leave the line unrecorded.
+const tr = [...d.querySelectorAll(".rectbl tr")].find(r => r.textContent.includes("NEW EXPENSE"));
+const box = tr.querySelector(".acctbox"), q = box.querySelector(".acct-q"), v = box.querySelector(".acct-v"), cb = tr.querySelector(".rsel");
+cb.checked = false;
+const type = t => { q.value = t; fire(q, "input"); };
+fire(q, "focus"); type("supp");
+check("typing finds accounts by any word ('supp')", opts(box)[0] === "Office Supplies");
+type("offce suplies");
+check("…and near-misses, closest first ('offce suplies')", opts(box)[0] === "Office Supplies");
+type("sal");
+check("…in any account type ('sal' finds Sales)", opts(box)[0] === "Sales");
+type("offi");
+fire(q, "keydown", { key: "Enter" });
+check("Enter picks the top match", v.value === "83" && q.value === "Office Supplies");
+check("…and ticks the line for recording", cb.checked);
+check("…and the list closes", box.querySelector(".acct-list").hidden);
+box.querySelector(".acct-x").click(); fire(q, "blur");
+check("the clear button empties the account", v.value === "" && q.value === "");
+check("…and unticks the line, so it isn't recorded", !cb.checked);
+fire(q, "focus"); type("zzzz");
+check("no match: says so and how to leave it", /No account matches/.test(box.querySelector(".acct-list").textContent));
+fire(q, "blur");
+check("text that isn't an account: nothing sent, box flagged", v.value === "" && q.classList.contains("bad") && !cb.checked);
+fire(q, "focus"); type("sales"); fire(q, "blur");
+check("typing an account's full name picks it", v.value === "90" && !q.classList.contains("bad"));
+fire(q, "focus"); type("Sale");
+check("editing the text drops the old pick until a new one is chosen", v.value === "");
+type("off");
+const o = [...box.querySelectorAll(".acct-list .ao")].find(e => e.textContent.startsWith("Office"));
+o.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true, cancelable: true })); fire(q, "blur");
+check("clicking a match picks it", v.value === "83" && q.value === "Office Supplies");
 
 check("no script errors during interaction", errors.length === 0);
 if (errors.length) console.log(errors);

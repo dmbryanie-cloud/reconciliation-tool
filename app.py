@@ -1327,6 +1327,17 @@ tbody tr:hover{background:#f7f9fb}
 .rectbl td{vertical-align:top}
 .rectbl select,.rectbl input.payee{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:230px;background:#fff}
 .rectbl select{width:230px}.rectbl input.payee{width:150px}
+.acctbox{position:relative;width:230px;max-width:100%}
+.acctbox .acct-q{width:100%;box-sizing:border-box;padding:6px 26px 6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:#fff}
+.acctbox .acct-q.bad{border-color:#d97706;background:#fffbeb}
+.acctbox .acct-x{position:absolute;right:3px;top:4px;border:0;background:none;color:var(--muted);font-size:17px;line-height:1;cursor:pointer;padding:2px 5px}
+.acctbox .acct-x:hover{color:#b3471f}
+.acct-list{position:absolute;z-index:30;top:100%;left:0;width:min(340px,86vw);max-height:280px;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 22px rgba(15,23,42,.14);margin-top:3px}
+.acct-list .ao{padding:6px 10px;font-size:13px;cursor:pointer;white-space:normal;display:flex;justify-content:space-between;gap:10px}
+.acct-list .ao .at{color:var(--muted);font-size:11px;white-space:nowrap}
+.acct-list .ao.hi{background:#eef4ff}
+.acct-list .ag{padding:7px 10px 3px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.acct-list .none{padding:9px 10px;font-size:12px;color:var(--muted);white-space:normal}
 .booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .dupwarn{margin-top:6px;padding:7px 9px;border-radius:7px;background:#fffbeb;border:1px solid #fde68a;color:#92400e;font-size:12.5px;line-height:1.45;white-space:normal}
@@ -3155,7 +3166,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
-<td><select name="acct_{{ w.line_id }}" class=acct data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}" aria-label="Account"></select>{% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
+<td><div class=acctbox data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
 <td><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class=payee aria-label="Payee">{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm>Record</button></td>
 {% endif %}
@@ -3166,18 +3177,83 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <script>(function(){
 var el=document.getElementById('coa-data');if(!el)return;var coa=[];try{coa=JSON.parse(el.textContent)}catch(e){}
 var order={out:['Expense','Cost of Goods Sold','Other Expense'],'in':['Income','Other Income']};
-var groups={},xfer=[];coa.forEach(function(a){if(a.x)xfer.push(a);else(groups[a.t]=groups[a.t]||[]).push(a)});
-function opt(g,a,sel){var op=document.createElement('option');op.value=a.id;op.textContent=a.n;if(a.id===sel)op.selected=true;g.appendChild(op)}
-document.querySelectorAll('select.acct').forEach(function(s){
-  var dir=s.getAttribute('data-dir'),pref=order[dir]||[],sel=s.getAttribute('data-sel');
-  var o=document.createElement('option');o.value='';o.textContent=dir==='xfer'?'— paid from which bank? —':'— choose account —';s.appendChild(o);
-  if(dir!=='xfer')Object.keys(groups).sort(function(a,b){var x=pref.indexOf(a),y=pref.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x-y||a.localeCompare(b)}).forEach(function(t){
-    var g=document.createElement('optgroup');g.label=t;
-    groups[t].forEach(function(a){opt(g,a,sel)});
-    s.appendChild(g)});
-  if(xfer.length){var g=document.createElement('optgroup');g.label=dir==='out'?'Transfer to your account':dir==='in'?'Transfer from your account':'Transfer from your bank';
-    xfer.forEach(function(a){opt(g,a,sel)});s.appendChild(g)}
-  s.addEventListener('change',function(){var cb=s.closest('tr').querySelector('.rsel');if(cb&&s.value)cb.checked=true});
+var xferLabel={out:'Transfer to your account','in':'Transfer from your account',xfer:'Transfer from your bank'};
+// Each picker's accounts, in the order the old drop-down showed them: the usual types for its
+// direction first, then the rest, then your own accounts (transfers).
+function accountsFor(dir){
+  var pref=order[dir]||[],out=[];
+  if(dir!=='xfer')coa.filter(function(a){return !a.x}).forEach(function(a){out.push(a)});
+  out.sort(function(a,b){var x=pref.indexOf(a.t),y=pref.indexOf(b.t);x=x<0?99:x;y=y<0?99:y;return x-y||a.t.localeCompare(b.t)||a.n.localeCompare(b.n)});
+  coa.filter(function(a){return a.x}).forEach(function(a){out.push(a)});
+  return out.map(function(a,i){return {id:a.id,n:a.n,t:a.x?xferLabel[dir]:a.t,rank:i,low:a.n.toLowerCase()}});
+}
+function lev(a,b){   // edit distance, for typos ("stationary" finds "Stationery")
+  var m=a.length,n=b.length,p=[],i,j;for(j=0;j<=n;j++)p[j]=j;
+  for(i=1;i<=m;i++){var prev=p[0];p[0]=i;for(j=1;j<=n;j++){var t=p[j];p[j]=Math.min(p[j]+1,p[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));prev=t}}
+  return p[n];
+}
+// Closest accounts first: starts with what you typed, then a word starting with it, then containing
+// it, then containing every word typed, then letters in order, then near-misses (typos).
+function ranked(list,q){
+  q=q.trim().toLowerCase();if(!q)return list;
+  var words=q.split(/ +/),flat=q.replace(/ +/g,''),hits=[];
+  list.forEach(function(a){
+    var n=a.low,parts=n.split(/[^a-z0-9]+/).filter(Boolean),sc=null;
+    if(n.indexOf(q)===0)sc=0;
+    else if(parts.some(function(p){return p.indexOf(q)===0}))sc=1;
+    else if(n.indexOf(q)>-1)sc=2;
+    else if(words.every(function(w){return n.indexOf(w)>-1}))sc=3;
+    else{var k=0;for(var i=0;i<n.length&&k<flat.length;i++)if(n[i]===flat[k])k++;
+      if(k===flat.length&&flat.length>=3)sc=4;
+      else{var best=99;words.forEach(function(w){parts.forEach(function(p){best=Math.min(best,lev(w,p.slice(0,Math.max(w.length,p.length))))})});
+        if(flat.length>=4&&best<=Math.max(1,Math.floor(words[0].length/4)))sc=5+best}}
+    if(sc!==null)hits.push({a:a,sc:sc});
+  });
+  hits.sort(function(x,y){return x.sc-y.sc||x.a.rank-y.a.rank});
+  return hits.map(function(h){return h.a});
+}
+document.querySelectorAll('.acctbox').forEach(function(box){
+  var dir=box.getAttribute('data-dir'),list=accountsFor(dir),q=box.querySelector('.acct-q'),v=box.querySelector('.acct-v'),
+      pop=box.querySelector('.acct-list'),x=box.querySelector('.acct-x'),shown=[],hi=0,chosen=null;
+  function row(){var tr=box.closest('tr');return tr&&tr.querySelector('.rsel')}
+  function set(a,byUser){chosen=a;v.value=a.id;q.value=a.n;q.classList.remove('bad');q.title='';x.style.visibility='visible';
+    var cb=row();if(cb&&byUser)cb.checked=true}
+  function clear(){chosen=null;v.value='';q.value='';q.classList.remove('bad');q.title='';x.style.visibility='hidden';
+    var cb=row();if(cb)cb.checked=false}
+  function close(){pop.hidden=true;q.setAttribute('aria-expanded','false')}
+  function render(){
+    shown=ranked(list,q.value).slice(0,q.value.trim()?40:400);hi=0;pop.innerHTML='';
+    if(!shown.length){var e=document.createElement('div');e.className='none';e.textContent='No account matches. Clear it to leave this line unrecorded, or add the account in QuickBooks and refresh.';pop.appendChild(e)}
+    var lastT=null,typed=!!q.value.trim();
+    shown.forEach(function(a,i){
+      if(!typed&&a.t!==lastT){var g=document.createElement('div');g.className='ag';g.textContent=a.t;pop.appendChild(g);lastT=a.t}
+      var o=document.createElement('div');o.className='ao'+(i===0?' hi':'');o.setAttribute('role','option');o.setAttribute('data-i',i);
+      var nm=document.createElement('span');nm.textContent=a.n;o.appendChild(nm);
+      if(typed){var t=document.createElement('span');t.className='at';t.textContent=a.t;o.appendChild(t)}
+      o.addEventListener('mousedown',function(ev){ev.preventDefault();set(a,true);close()});
+      pop.appendChild(o)});
+    pop.hidden=false;q.setAttribute('aria-expanded','true');
+  }
+  function move(d){var os=pop.querySelectorAll('.ao');if(!os.length)return;os[hi].classList.remove('hi');hi=(hi+d+os.length)%os.length;os[hi].classList.add('hi');
+    if(os[hi].scrollIntoView)os[hi].scrollIntoView({block:'nearest'})}
+  var start=list.filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
+  if(start)set(start);else x.style.visibility='hidden';
+  q.addEventListener('focus',function(){q.select&&q.select();render()});
+  q.addEventListener('input',function(){if(chosen&&q.value!==chosen.n){chosen=null;v.value=''}x.style.visibility=q.value?'visible':'hidden';render()});
+  q.addEventListener('keydown',function(ev){
+    if(ev.key==='ArrowDown'){ev.preventDefault();if(pop.hidden)render();else move(1)}
+    else if(ev.key==='ArrowUp'){ev.preventDefault();move(-1)}
+    else if(ev.key==='Enter'){if(!pop.hidden){ev.preventDefault();if(shown[hi])set(shown[hi],true);close()}}
+    else if(ev.key==='Escape'){close()}});
+  q.addEventListener('blur',function(){close();
+    var t=q.value.trim();
+    if(!t){clear();return}
+    if(chosen&&q.value===chosen.n)return;
+    var exact=list.filter(function(a){return a.low===t.toLowerCase()})[0];
+    if(exact){set(exact,true);return}
+    chosen=null;v.value='';q.classList.add('bad');q.title="Not an account: pick one from the list, or clear it. This line won't be recorded as it is.";
+    var cb=row();if(cb)cb.checked=false});
+  x.addEventListener('click',function(){clear();q.focus()});
 });
 var all=document.getElementById('selall');if(all)all.addEventListener('change',function(){document.querySelectorAll('.rsel').forEach(function(c){c.checked=all.checked})});
 var f=document.getElementById('recform');
@@ -4004,7 +4080,7 @@ def record(name):
     lines = cur.fetchall()
     dups = possible_duplicates(cur, acct_uuid, lines)
     cur.close(); conn.close()
-    done, problems, skipped = 0, [], 0
+    done, problems, skipped, no_acct = 0, [], 0, 0
     token, touched = None, set()
     for lid, d, amt, desc in lines:
         lid = str(lid)
@@ -4013,7 +4089,11 @@ def record(name):
         acc = coa.get(pick) or xt.get(pick)
         out = _money_out(amt, atype)
         if not acc:
-            problems.append(f"{label}: choose an account"); continue
+            if request.form.get("only"):
+                problems.append(f"{label}: choose an account")
+            else:
+                no_acct += 1     # left empty on purpose: not recorded, stays in the list
+            continue
         is_xfer = bool(acc.get("xfer"))
         if atype == "credit_card" and not out and not is_xfer:
             problems.append(f"{label}: choose the bank the card was paid from (refunds are recorded in QuickBooks)"); continue
@@ -4068,6 +4148,9 @@ def record(name):
     msg = f"Recorded {done} transaction{'' if done == 1 else 's'} in QuickBooks." if done else ""
     if skipped:
         msg += f" Skipped {skipped} already recorded or in progress."
+    if no_acct:
+        msg += (f" {no_acct} line{' has' if no_acct == 1 else 's have'} no account, so "
+                f"{'it was' if no_acct == 1 else 'they were'} left for later.")
     if problems:
         msg += " Not recorded: " + "; ".join(problems[:5]) + (" …" if len(problems) > 5 else "")
     session["detail_msg"] = msg.strip() or "Nothing to record."

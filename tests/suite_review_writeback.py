@@ -202,8 +202,9 @@ cur.execute("INSERT INTO writeback_log (line_id, status) VALUES (%s,'pending')",
 n = len(POSTS)
 cl.post("/account/Stanbic/record", data={"sel": [La, Lb], "bulk": "1", f"acct_{La}": "83", f"acct_{Lb}": ""})
 msg = cl.get("/account/Stanbic").data.decode()
-check("bulk: pending line skipped, line without account reported, nothing posted",
-      len(POSTS) == n and "Skipped 1 already recorded or in progress" in msg and "choose an account" in msg)
+check("bulk: pending line skipped, line without account left for later, nothing posted",
+      len(POSTS) == n and "Skipped 1 already recorded or in progress" in msg
+      and "1 line has no account, so it was left for later" in msg)
 check("page offers 'not in QuickBooks' reset for the interrupted line", "I checked — it" in msg)
 cl.post("/account/Stanbic/record_reset", data={"reset": La})
 cl.post("/account/Stanbic/record", data={"sel": [La, Lb], "bulk": "1", f"acct_{La}": "83", f"acct_{Lb}": "83"})

@@ -56,7 +56,7 @@ else:
     for l in out.stdout.splitlines():
         if l.startswith("   "):
             print(l)
-    check("browser test ran to the end", out.returncode in (0, 1) and len(lines) > 10)
+    check("browser test ran to the end", out.returncode in (0, 1) and len(lines) > 10 and "failure(s)" in out.stdout)
     if out.stderr.strip():
         print(out.stderr[-2000:])
 

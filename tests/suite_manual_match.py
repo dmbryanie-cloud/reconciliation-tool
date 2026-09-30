@@ -141,6 +141,11 @@ check("clean line records normally", len(POSTS) == n + 1)
 cl.post("/account/Stanbic/record", data={"only": L3, f"acct_{L3}": "83", f"dupok_{L3}": "1"})
 check("'Not a duplicate' lets it through", len(POSTS) == n + 2 and POSTS[-1][1]["Line"][0]["Amount"] == 80000.0)
 
+n = len(POSTS)
+cl.post("/account/Stanbic/record", data={"bulk": "1", "sel": [L4], f"acct_{L4}": ""})
+check("bulk record: a line left without an account isn't recorded, and says so", len(POSTS) == n
+      and "1 line has no account, so it was left for later" in cl.get("/account/Stanbic").data.decode())
+
 # ---- manual match replaces the engine's suggestion -------------------------------------------
 cl.post("/account/Stanbic/match", data={"ml": [L4], "mb": [B5]})
 check("matching the suggested pair by hand clears the pending suggestion", rec()["n_pending"] == 0
