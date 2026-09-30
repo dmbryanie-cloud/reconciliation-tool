@@ -520,11 +520,44 @@ def _store_customers(custs):
     conn.commit(); cur.close(); conn.close()
 
 
-def load_customers(cur, currency):
-    """Active customers a receipt in `currency` can be recorded against (QuickBooks ties each to one currency)."""
-    cur.execute("""SELECT qbo_id, coalesce(fqn, name), parent_id FROM qbo_customer WHERE coalesce(active, true)
+def load_customers(cur, currency, also=None):
+    """Active customers (students and families) a receipt in `currency` can be recorded against --
+    QuickBooks ties each to one currency. `also`: another currency accepted with an exchange rate
+    (a UGX receipt paid to a student's USD account). The bank's own currency comes first."""
+    cur.execute("""SELECT qbo_id, coalesce(fqn, name), parent_id, currency FROM qbo_customer WHERE coalesce(active, true)
+                     AND (%s::text IS NULL OR currency IS NULL OR currency = %s OR currency = %s)
+                   ORDER BY (currency IS DISTINCT FROM %s), 2;""", (currency, currency, also, currency))
+    return [{"id": i, "n": n or "", "c": c or currency or "", **({"p": p} if p else {})} for i, n, p, c in cur.fetchall()]
+
+
+def cross_currency(cur, currency, home=None):
+    """The other currency a home-currency bank's receipts can be paid to a student in (UGX bank -> a
+    student's USD account, at a rate). A foreign-currency bank only takes its own currency."""
+    home = home or qbo_home_currency(cur)
+    if not currency or currency != home:
+        return None
+    cur.execute("""SELECT currency FROM qbo_customer WHERE currency IS NOT NULL AND currency <> %s
+                   GROUP BY currency ORDER BY count(*) DESC LIMIT 1;""", (currency,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def _store_vendors(vends):
+    rows = [(str(v["Id"]), v.get("DisplayName"), (v.get("CurrencyRef") or {}).get("value"), bool(v.get("Active", True)))
+            for v in vends if v.get("Id")]
+    if not rows:
+        return
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM qbo_vendor;")
+    execute_values(cur, "INSERT INTO qbo_vendor (qbo_id, name, currency, active) VALUES %s", rows)
+    conn.commit(); cur.close(); conn.close()
+
+
+def load_vendors(cur, currency):
+    """Active suppliers in `currency`: a payable (Rent payable, say) is paid against one of them."""
+    cur.execute("""SELECT qbo_id, name FROM qbo_vendor WHERE coalesce(active, true)
                      AND (%s::text IS NULL OR currency IS NULL OR currency = %s) ORDER BY 2;""", (currency, currency))
-    return [{"id": i, "n": n or "", **({"p": p} if p else {})} for i, n, p in cur.fetchall()]
+    return [{"id": i, "n": n or ""} for i, n in cur.fetchall()]
 
 
 def import_accounts_from_qbo(token):
@@ -538,6 +571,10 @@ def import_accounts_from_qbo(token):
         _store_customers(qbo_query("Customer", token))
     except Exception:
         pass   # receipts can still be recorded to income accounts
+    try:
+        _store_vendors(qbo_query("Vendor", token))
+    except Exception:
+        pass   # payables need a supplier; everything else records without
     try:
         ci = qbo_query("CompanyInfo", token)
         if ci and ci[0].get("CompanyName"):
@@ -917,6 +954,8 @@ try:
                     currency text, active boolean);""")
     _cur.execute("ALTER TABLE qbo_customer ADD COLUMN IF NOT EXISTS parent_id text;")   # a child's parent (sub-customer)
     # The USD leg of each forward deal recorded here, so its UGX receipt can be worked out from it.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_vendor (qbo_id text PRIMARY KEY, name text, currency text,
+                    active boolean);""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS hedge_leg (line_id uuid PRIMARY KEY, deal text NOT NULL,
                     usd numeric NOT NULL, rate numeric NOT NULL, txn_date date, qbo_ids text,
                     created_at timestamptz NOT NULL DEFAULT now());""")
@@ -1083,7 +1122,7 @@ def load_coa(cur, currency=None):
     home = qbo_home_currency(cur) if currency else None
     return [{"id": i, "name": n, "fqn": f or n, "type": t, "ccy": c} for i, n, f, t, c in rows
             if (t not in POST_EXCLUDE and (not currency or not c or c in (home, currency)))
-            or (t == "Accounts Receivable" and currency and c == currency)]
+            or (t in ("Accounts Receivable", "Accounts Payable") and currency and c == currency)]
 
 
 def split_banks(cur, acct_qbo, currency):
@@ -1255,9 +1294,19 @@ def qbo_record_hedge_receipt(token, acct_qbo, transit_home, gain, amount_abs, pr
     return "Deposit", str((res.get("Deposit") or {}).get("Id") or "")
 
 
-def qbo_record_payment(token, acct_qbo, customer_id, amount_abs, txn_date, desc, currency=None, rate=None):
+def _pay_amount(bank_amt, x_rate, foreign, rate, pay_ccy):
+    """(amount, currency, rate) for a customer Payment. Paid to a student's account in another currency
+    (UGX received for their USD account): that currency's amount, at the rate that turns it back into
+    exactly the amount the bank received."""
+    if not x_rate:
+        return bank_amt, foreign, rate
+    amt = (Decimal(bank_amt) / x_rate).quantize(Decimal("0.01"))
+    return amt, pay_ccy, round(float(Decimal(bank_amt) / amt), 10)
+
+
+def qbo_record_payment(token, acct_qbo, customer_id, amount_abs, currency=None, rate=None, d=None, desc=""):
     """Money received against a customer's name: an unapplied QuickBooks Payment into this bank."""
-    body = _fx({"CustomerRef": {"value": customer_id}, "TotalAmt": float(amount_abs), "TxnDate": str(txn_date),
+    body = _fx({"CustomerRef": {"value": customer_id}, "TotalAmt": float(amount_abs), "TxnDate": str(d),
                 "DepositToAccountRef": {"value": acct_qbo},
                 "PrivateNote": f"Recorded from bank reconciliation: {desc}"[:4000]}, currency, rate)
     res = qbo_post(token, "Payment", body)
@@ -3208,7 +3257,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <thead><tr><th>Account</th><th>Type</th><th>Currency</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th></tr></thead>
 <tbody>
 {% for r in rows %}<tr data-status="{{ r.status }}" data-exc="{{ r.get('exc',0) }}">
-<td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td>
+<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a></td>
 <td>{{ 'bank' if r.type=='bank' else 'credit card' }}</td>
 <td>{{ r.currency or '—' }}</td>
 <td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% elif r.rec_status=='balanced' %}<span class="pill open">Balanced</span>{% else %}<span class="pill open">In progress</span>{% endif %}</td>
@@ -3261,7 +3310,7 @@ if(a.target==='_blank'||a.hasAttribute('download'))return;
 if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
 if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
-schedule('Loading...');});
+schedule(a.getAttribute('data-busy')||'Loading...');});
 document.addEventListener('submit',function(e){
 if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Please wait...';
@@ -3324,11 +3373,18 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </style>
 <div class=pagecols><nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
 <div class=wrap><form class=acctswitch method=get action="{{ url_for('switch_account') }}"><label for=acctswitch>Account</label>
-<select id=acctswitch name=name onchange="if(this.value)location.href=this.options[this.selectedIndex].dataset.href">
+<select id=acctswitch name=name>
 {% for label, accts in switch if accts %}<optgroup label="{{ label }}">{% for a in accts %}<option value="{{ a.name }}" data-href="{{ url_for('detail', name=a.name) }}"{% if a.name==name %} selected{% endif %}>{{ a.name }}{% if a.ccy %} · {{ a.ccy }}{% endif %}{% if a.p_end %} · to {{ a.p_end }}{% endif %}</option>{% endfor %}</optgroup>{% endfor %}
-</select><noscript><button type=submit class=btn-sm>Open</button></noscript></form>
+</select><button type=submit class="btn-sm acctgo" data-busy="Loading {{ name }}...">Reconcile</button></form>
+<script>(function(){var s=document.getElementById('acctswitch'),b=s&&s.form.querySelector('.acctgo');if(!b)return;
+// Choose an account, then Reconcile: it says which account is loading while the page is fetched.
+function upd(){var other=s.value!==s.getAttribute('data-cur');b.disabled=!other;b.classList.toggle('go',other);
+  b.setAttribute('data-busy','Loading '+s.value+': its statement, matches and lines to record...')}
+s.setAttribute('data-cur',s.value);s.addEventListener('change',upd);upd()})();</script>
 <style>.acctswitch{display:flex;align-items:center;gap:8px;margin:0 0 6px}.acctswitch label{font-size:13px;color:var(--muted)}
 .acctswitch select{max-width:100%;min-width:0;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:var(--panel);color:var(--ink)}
+.acctswitch .acctgo.go{background:var(--accent);color:#fff;border-color:var(--accent)}
+.acctswitch .acctgo:disabled{opacity:.5;cursor:default}
 @media print{.acctswitch{display:none}}</style>
 <h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
@@ -3470,7 +3526,7 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
   if(j.state==='running'){b.querySelector('.rj-n').textContent=j.n;setTimeout(tick,3000)}
   else{location.hash='sec-record';location.reload()}}).catch(function(){setTimeout(tick,6000)})}
 setTimeout(tick,3000)})();</script>{% endif %}
-<form method=post action="{{ url_for('record', name=name) }}" id=recform>
+<form method=post action="{{ url_for('record', name=name) }}" id=recform data-ccy="{{ acct_ccy or '' }}">
 {% if draft_meta %}<div class=savedsel>Showing the selection saved by {{ draft_meta.by or 'a user' }} on {{ draft_meta.at.strftime('%Y-%m-%d %H:%M') }}. <button type=submit formaction="{{ url_for('record_discard', name=name) }}" class=btn-sm data-busy="Discarding the saved selection...">Discard it</button></div>{% endif %}
 <table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
 {% for w in writebacks + deposits %}<tr data-amt="{{ w.amount }}">
@@ -3490,9 +3546,10 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
 <input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
 <input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
+{% if x_ccy and not w.out %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class="rate xrate" inputmode=decimal hidden placeholder="{{ acct_ccy }} per {{ x_ccy }}" aria-label="{{ x_ccy }} rate" title="The rate the {{ acct_ccy }} received converts to the student's {{ x_ccy }} account at ({{ acct_ccy }} per {{ x_ccy }}). Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}
 {% if w.hedge %}<input type=hidden name="hedge_{{ w.line_id }}" class=hedge-on value="{{ '1' if w.hedge_on else '' }}">{% endif %}
 {% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id and not w.saved %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug and not w.saved %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
-<td><div class=custbox data-sel="{{ w.cust }}"><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class="payee acct-q" autocomplete=off aria-label="Payee"><button type=button class=acct-x title="Clear the customer" aria-label="Clear customer">&times;</button><input type=hidden name="cust_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1 {% if w.dupok %}checked{% endif %}> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
+<td><div class=custbox data-sel="{{ w.vend }}"><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class="payee acct-q" autocomplete=off aria-label="Payee"><button type=button class=acct-x title="Clear the customer" aria-label="Clear customer">&times;</button><input type=hidden name="cust_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1 {% if w.dupok %}checked{% endif %}> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm data-busy="Recording this line in QuickBooks...">Record</button></td>
 {% endif %}
 </tr>{% if w.recordable and not w.wb and not w.xfer_only %}<tr class=splitrow hidden><td></td><td colspan=6 class=splitcell></td></tr>
@@ -3510,24 +3567,33 @@ setTimeout(tick,3000)})();</script>{% endif %}
 </form>
 <script id=coa-data type=application/json>{{ coa_json }}</script>
 <script id=cust-data type=application/json>{{ cust_json }}</script>
+<script id=vend-data type=application/json>{{ vend_json }}</script>
 <script>(function(){
 var el=document.getElementById('coa-data');if(!el)return;var coa=[],custs=[];try{coa=JSON.parse(el.textContent)}catch(e){}
 try{custs=JSON.parse(document.getElementById('cust-data').textContent)}catch(e){}
-var AR='Accounts Receivable';
-var order={out:['Expense','Cost of Goods Sold','Other Expense'],'in':[AR,'Income','Other Income']};
+var vends=[];try{vends=JSON.parse(document.getElementById('vend-data').textContent)}catch(e){}
+var AR='Accounts Receivable',AP='Accounts Payable',rf=document.getElementById('recform'),CCY=rf?rf.getAttribute('data-ccy'):'';
+var order={out:['Expense','Cost of Goods Sold','Other Expense'],'in':['Income','Other Income']};
 var xferLabel={out:'Transfer to your account','in':'Transfer from your account',xfer:'Transfer from your bank'};
-function typeLabel(a,dir){return a.x===1?xferLabel[dir]:a.x===2?'Bank and card accounts':a.t===AR?'Customer payment (Accounts Receivable)':a.t}
-// Each picker's accounts: the usual types for its direction first, then the rest, then your own
-// accounts (transfers). A split line can use any bank in the home currency or this one's.
+function typeLabel(a,dir){return a.x===1?xferLabel[dir]:a.x===2?'Bank and card accounts':a.t===AP?'Payables (choose the supplier)':a.t}
+// Students and families: a receipt is paid to one of them (their UGX or USD account), not to
+// Accounts Receivable in general. The bank's currency first; the other needs a rate.
+var studentList=custs.map(function(c,i){var other=CCY&&c.c&&c.c!==CCY;
+  return {id:'cust:'+c.id,cid:c.id,c:c.c,other:!!other,cust:true,n:c.n,p:c.p||'',rank:-100000+i,low:c.n.toLowerCase(),
+          t:'Students and families'+(other?' ('+c.c+', at a rate)':c.c?' ('+c.c+')':'')}});
+// Each picker's accounts: students first for money in, then the usual types for its direction, then
+// the rest, then your own accounts (transfers). A split line can use any bank in the home currency
+// or this one's; payables need a supplier, so they aren't offered in a split.
 function accountsFor(dir,split){
   var pref=order[dir]||[],out=[];
-  if(dir!=='xfer')coa.forEach(function(a){if(!a.x&&(a.t!==AR||(dir==='in'&&!split)))out.push(a)});
+  if(dir!=='xfer')coa.forEach(function(a){if(!a.x&&a.t!==AR&&(a.t!==AP||(dir==='out'&&!split)))out.push(a)});
   out.sort(function(a,b){var x=pref.indexOf(a.t),y=pref.indexOf(b.t);x=x<0?99:x;y=y<0?99:y;return x-y||a.t.localeCompare(b.t)||a.n.localeCompare(b.n)});
   coa.forEach(function(a){if(split?a.x===2:a.x===1)out.push(a)});
-  return out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ar:a.t===AR,rank:i,low:a.n.toLowerCase()}});
+  var list=out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ap:a.t===AP,rank:i,low:a.n.toLowerCase()}});
+  return dir==='in'&&!split?studentList.concat(list):list;
 }
-var custList=custs.map(function(c,i){return {id:c.id,n:c.n,p:c.p||'',t:'Customer',rank:i,low:c.n.toLowerCase()}});
-function childrenOf(id){return custList.filter(function(c){return c.p===id})}
+var custList=studentList,vendList=vends.map(function(v,i){return {id:v.id,n:v.n,t:'Supplier',rank:i,low:v.n.toLowerCase()}});
+function childrenOf(cid){return custList.filter(function(c){return c.p===cid})}
 // The panel rows (split, hedge, children) that follow a record row, up to the next record row.
 function panel(tr,cls){var n=tr.nextElementSibling;while(n&&!n.hasAttribute('data-amt')){if(n.classList.contains(cls))return n;n=n.nextElementSibling}return null}
 function lev(a,b){   // edit distance, for typos ("stationary" finds "Stationery")
@@ -3575,11 +3641,14 @@ function initBox(box,list,onPick,active){
   function close(){pop.hidden=true;q.setAttribute('aria-expanded','false')}
   function render(){
     if(!on()){close();return}
-    shown=ranked(list,q.value).slice(0,q.value.trim()?40:400);hi=0;pop.innerHTML='';
+    var L=typeof list==='function'?list():list;
+    if(q.value.trim())shown=ranked(L,q.value).slice(0,40);
+    else{var ns=0;shown=L.filter(function(a){return !a.cust||ns++<25}).slice(0,400)}
+    hi=0;pop.innerHTML='';
     if(!shown.length){var e=document.createElement('div');e.className='none';e.textContent=none;pop.appendChild(e)}
     var lastT=null,typed=!!q.value.trim();
     shown.forEach(function(a,i){
-      if(!typed&&a.t!==lastT){var g=document.createElement('div');g.className='ag';g.textContent=a.t;pop.appendChild(g);lastT=a.t}
+      if(!typed&&a.t!==lastT){var g=document.createElement('div');g.className='ag';g.textContent=a.t+(a.cust?' \u2014 type a name to find one':'');pop.appendChild(g);lastT=a.t}
       var o=document.createElement('div');o.className='ao'+(i===0?' hi':'');o.setAttribute('role','option');
       var nm=document.createElement('span');nm.textContent=a.n;o.appendChild(nm);
       if(typed){var t=document.createElement('span');t.className='at';t.textContent=a.t;o.appendChild(t)}
@@ -3600,29 +3669,30 @@ function initBox(box,list,onPick,active){
     var t=q.value.trim();
     if(!t){clear();return}
     if(chosen&&q.value===chosen.n)return;
-    var exact=list.filter(function(a){return a.low===t.toLowerCase()})[0];
+    var exact=(typeof list==='function'?list():list).filter(function(a){return a.low===t.toLowerCase()})[0];
     if(exact){set(exact,true);return}
     chosen=null;v.value='';q.classList.add('bad');q.title="Not in the list: pick one from it, or clear it. This line won't be recorded as it is.";
     onPick(null,true)});
   x.addEventListener('click',function(){clear();q.focus()});
-  var start=list.filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
+  var start=(typeof list==='function'?list():list).filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
   if(start)set(start,false);else vis();
   return {get:function(){return chosen},refresh:function(){vis();if(!on()){v.value='';q.classList.remove('bad')}}};
 }
 function boxHtml(){return '<input type=text class=acct-q placeholder="Type to search accounts" autocomplete=off aria-label="Account"><button type=button class=acct-x aria-label="Clear account">&times;</button><input type=hidden class=acct-v value=""><div class=acct-list role=listbox hidden></div>'}
 document.querySelectorAll('.acctbox.main').forEach(function(box){
   var tr=box.closest('tr'),dir=box.getAttribute('data-dir'),cb=tr.querySelector('.rsel'),total=Math.abs(parseFloat(tr.getAttribute('data-amt'))||0);
-  var cbox=tr.querySelector('.custbox'),cust=null,isAr=false,kidsRow=panel(tr,'kidsrow'),kidsV=tr.querySelector('.kids-v');
+  var cbox=tr.querySelector('.custbox'),cust=null,isAr=false,isAp=false,kidsRow=panel(tr,'kidsrow'),kidsV=tr.querySelector('.kids-v'),
+      xr=tr.querySelector('.xrate');
   // A parent's lump sum: split it between the parent and some or all of their children.
   function kids(parent,restore){
     if(!kidsRow||!kidsV)return;
-    var ch=parent&&isAr?childrenOf(parent.id):[];
+    var ch=parent&&isAr?childrenOf(parent.cid):[];
     if(!ch.length){kidsRow.hidden=true;kidsV.value='';return}
     var saved={};try{(restore&&kidsV.value?JSON.parse(kidsV.value):[]).forEach(function(k){saved[k.c]=k.v})}catch(e){}
     var cell=kidsRow.querySelector('.kidscell');
     cell.innerHTML='<div class=splithead>'+'Paid for their children? Enter how much is for each (leave the others empty). It must add up to '+fmt(total)+'; each becomes its own payment.'+'</div>';
     var ins=[];
-    [parent].concat(ch).forEach(function(c,i){
+    [parent].concat(ch).forEach(function(c,i){c={id:c.cid,n:c.n};
       var d=document.createElement('div');d.className='kidline';
       var nm=document.createElement('span');nm.textContent=c.n+(i===0?' (the parent)':'');d.appendChild(nm);
       var inp=document.createElement('input');inp.className='splitamt';inp.setAttribute('inputmode','decimal');inp.placeholder='0.00';inp.value=saved[c.id]||'';inp.setAttribute('data-c',c.id);d.appendChild(inp);
@@ -3639,15 +3709,20 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
     }
     kidsRow.hidden=false;ksync(false);
   }
+  var first=true;
   var main=initBox(box,accountsFor(dir,false),function(a,byUser){
-    if(byUser&&cb)cb.checked=!!a;
-    isAr=!!(a&&a.ar);
-    if(cbox){cbox.classList.toggle('ar',isAr);var pq=cbox.querySelector('.acct-q');pq.placeholder=isAr?"Type the customer's name":'optional';if(cust){cust.refresh();kids(isAr?cust.get():null,false)}}
+    isAr=!!(a&&a.cust);isAp=!!(a&&a.ap);
+    if(byUser&&cb)cb.checked=!!a&&(!isAp||!!(cust&&cust.get()));
+    // A student's account in the other currency: the amount converts at the rate typed here.
+    if(xr){xr.hidden=!(a&&a.other);if(xr.hidden&&!first)xr.value=''}
+    if(cbox){cbox.classList.toggle('ar',isAp);cbox.classList.toggle('off',isAr);var pq=cbox.querySelector('.acct-q');
+      pq.disabled=isAr;pq.placeholder=isAp?"Type the supplier's name":isAr?'the student':'optional';if(cust)cust.refresh()}
+    kids(isAr?a:null,first);first=false;
     count();
   });
-  if(cbox){cbox.setAttribute('data-none','No customer matches. Check the name, or add the customer in QuickBooks and refresh.');
-    cust=initBox(cbox,custList,function(a,byUser){if(byUser&&cb&&isAr)cb.checked=!!(a&&main.get());kids(a,!byUser);count()},function(){return isAr});
-    cbox.classList.toggle('ar',isAr);cust.refresh()}
+  if(cbox){cbox.setAttribute('data-none','No supplier matches. Check the name, or add the supplier in QuickBooks and refresh.');
+    cust=initBox(cbox,function(){return vendList},function(a,byUser){if(byUser&&cb&&isAp)cb.checked=!!(a&&main.get());count()},function(){return isAp});
+    cbox.classList.toggle('ar',isAp);cust.refresh()}
   // Hedge: a forward deal booked via FX in Transit, with its gain or loss.
   var hbtn=tr.querySelector('.hedge-btn'),hrow=panel(tr,'hedgerow'),hon=tr.querySelector('.hedge-on');
   if(hbtn&&hrow&&hon){
@@ -3701,7 +3776,7 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
   function cancel(){lines=[];wrap.innerHTML='';srow.hidden=true;box.classList.remove('off');box.querySelector('.acct-q').disabled=false;btn.classList.remove('on');hid.value='';if(cb)cb.checked=!!main.get();count()}
   btn.addEventListener('click',function(){
     if(!srow.hidden){srow.querySelector('.acct-q')&&srow.querySelector('.acct-q').focus();return}
-    open();if(!lines.length){var m=main.get();add(m&&!m.ar?m.id:'',String(total));add('','')}sync(true)});
+    open();if(!lines.length){var m=main.get();add(m&&!m.cust&&!m.ap?m.id:'',String(total));add('','')}sync(true)});
   cell.querySelector('[data-add]').addEventListener('click',function(){add('','');sync(true)});
   cell.querySelector('[data-cancel]').addEventListener('click',cancel);
   var saved=[];try{saved=hid.value?JSON.parse(hid.value):[]}catch(e){}
@@ -3812,6 +3887,58 @@ update(false);
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
+<style>th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover{color:var(--accent)}
+th.sortable .sortind{font-size:11px;margin-left:4px;color:var(--accent);font-weight:600}</style>
+<script>(function(){
+// Click a column heading to sort: Date and amounts sort as dates and numbers; "Statement side" and
+// "Books side" sort by date, then (clicking on) by amount. A line's panels (split, hedge, children)
+// move with it. The order is kept for this page until the tab is closed.
+var PANEL=/(^| )(splitrow|hedgerow|kidsrow)( |$)/;
+function key(td,kind){var t=td?td.textContent.replace(/\\s+/g,' ').trim():'',m;
+  if(kind==='date'){m=t.match(/\\d{4}-\\d{2}-\\d{2}/);return m?m[0]:''}
+  if(kind==='amt'){m=t.replace(/,/g,'').match(/\\d{4}-\\d{2}-\\d{2} \\u00b7 (-?\\d+(?:\\.\\d+)?)/);return m?parseFloat(m[1]):-Infinity}
+  if(kind==='num'){m=t.replace(/,/g,'').match(/-?\\d+(?:\\.\\d+)?/);return m?parseFloat(m[0]):-Infinity}
+  return t.toLowerCase()}
+var NAMES={date:'date',amt:'amount',num:'',text:''};
+function store(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v)}catch(e){return null}}
+document.querySelectorAll('.wrap table').forEach(function(tbl,ti){
+  var head=tbl.rows[0];if(!head||!head.querySelector('th')||tbl.classList.contains('rec'))return;
+  var cols=[];
+  [].forEach.call(head.cells,function(th,ci){
+    var lab=th.textContent.trim(),kinds=null;
+    if(lab==='Date')kinds=['date'];
+    else if(/^(Amount|Statement|Books|Difference)$/.test(lab))kinds=['num'];
+    else if(/ side$/.test(lab))kinds=['date','amt'];
+    else if(/^(Payee|Description|Bank description|On this statement)$/.test(lab))kinds=['text'];
+    if(!kinds)return;
+    var modes=[];kinds.forEach(function(k){modes.push([k,1],[k,-1])});
+    var ind=document.createElement('span');ind.className='sortind';th.appendChild(ind);th.classList.add('sortable');
+    th.title='Sort by '+(kinds[1]?'date, then amount':lab.toLowerCase());th.setAttribute('role','button');th.tabIndex=0;
+    cols.push({th:th,ci:ci,modes:modes,ind:ind,at:-1});
+  });
+  if(!cols.length)return;
+  var sk='sort:'+location.pathname+':'+ti;
+  function apply(c,at,save){
+    cols.forEach(function(o){if(o!==c){o.at=-1;o.ind.textContent=''}});
+    c.at=at;var m=c.modes[at],k=m[0],dir=m[1];
+    c.ind.textContent=(NAMES[k]?NAMES[k]+' ':'')+(dir>0?'\\u2191':'\\u2193');
+    var groups=[],cur=null;
+    [].slice.call(tbl.rows,1).forEach(function(r){if(PANEL.test(r.className)&&cur)cur.push(r);else groups.push(cur=[r])});
+    groups.forEach(function(g,i){g.i=i;g.k=key(g[0].cells[c.ci],k)});
+    groups.sort(function(a,b){var x=a.k,y=b.k;return (x<y?-1:x>y?1:0)*dir||a.i-b.i});
+    var parent=head.parentNode;groups.forEach(function(g){g.forEach(function(r){parent.appendChild(r)})});
+    if(save)store(sk,c.ci+':'+at);
+  }
+  cols.forEach(function(c){
+    function next(){apply(c,(c.at+1)%c.modes.length,true)}
+    c.th.addEventListener('click',function(e){if(e.target.tagName!=='INPUT')next()});
+    c.th.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();next()}});
+  });
+  var saved=(store(sk)||'').split(':');
+  var sc=cols.filter(function(o){return String(o.ci)===saved[0]})[0];
+  if(sc&&sc.modes[+saved[1]])apply(sc,+saved[1],false);
+});
+})();</script>
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
 </div></div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
@@ -3832,7 +3959,7 @@ if(a.target==='_blank'||a.hasAttribute('download'))return;
 if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
 if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
 if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
-schedule('Loading...');});
+schedule(a.getAttribute('data-busy')||'Loading...');});
 document.addEventListener('submit',function(e){
 if(e.defaultPrevented)return;
 var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Please wait...';
@@ -4135,8 +4262,12 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         cur.execute("SELECT deal, usd, rate, txn_date FROM hedge_leg ORDER BY txn_date;")
         for deal, usd, rate_, dd in cur.fetchall():
             hedge_legs.setdefault(deal, []).append((usd, rate_, dd))
-    custs = load_customers(cur, acct_ccy) if coa and unmatched_lines else []
+    also = cross_currency(cur, acct_ccy, home) if coa and unmatched_lines else None
+    custs = load_customers(cur, acct_ccy, also) if coa and unmatched_lines else []
     cust_names = {c["id"]: c["n"] for c in custs}
+    vends = load_vendors(cur, acct_ccy) if coa and unmatched_lines else []
+    vend_ids = {v["id"] for v in vends}
+    coa_type = {a["id"]: a["type"] for a in coa}
     drafts, draft_meta = {}, None
     if unmatched_lines:
         cur.execute("""SELECT line_id, data, saved_by, saved_at FROM record_draft WHERE line_id = ANY(%s::uuid[])
@@ -4181,6 +4312,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         item["sel"] = bool(item["acct_id"] and not item["dups"])
         pref = item["payee_ref"] or ""
         item["cust"] = pref.split(":", 1)[1] if pref.startswith("Customer:") and pref.split(":", 1)[1] in cust_names else ""
+        item["vend"] = pref.split(":", 1)[1] if pref.startswith("Vendor:") and pref.split(":", 1)[1] in vend_ids else ""
         item["rate"] = item["split"] = item["kids"] = ""
         item["dupok"] = False
         # A forward deal: its foreign leg (money out of the USD account) or its home receipt (UGX in).
@@ -4204,6 +4336,13 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                 item["hedge_on"] = True
                 item["hedge"] = {**item["hedge"], "rate": dr.get("hedge_rate") or item["hedge"]["rate"],
                                  "usd": dr.get("hedge_usd") or item["hedge"]["usd"]}
+        # A receipt goes to the student (or family) itself, never to Accounts Receivable in general.
+        if coa_type.get(item["acct_id"]) == "Accounts Receivable" or (item["acct_id"] or "").startswith("cust:"):
+            c_ = item["cust"] or (item["acct_id"] or "")[5:]
+            item["acct_id"] = f"cust:{c_}" if c_ in cust_names and not out else None
+            item["sel"] = item["sel"] and bool(item["acct_id"])
+        if dr and coa_type.get(dr.get("acct")) == "Accounts Payable":
+            item["vend"] = dr.get("cust") or ""
         (writebacks if out else deposits).append(item)
     _unmatched = [l for l in lines if l[0] not in ml]
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
@@ -4224,6 +4363,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                                             "x": 1 if a.get("xfer") else 2 if a.get("bank") else 0}
                                            for a in coa + xt + sb]).replace("<", "\\u003c")),
             "cust_json": Markup(json.dumps(custs).replace("<", "\\u003c")),
+            "vend_json": Markup(json.dumps(vends).replace("<", "\\u003c")), "acct_ccy": acct_ccy, "x_ccy": also,
             "fx_ccy": acct_ccy if acct_ccy and home and acct_ccy != home else None, "home_ccy": home,
             "hedge_accts": hedge_accounts(cur, acct_ccy if acct_ccy != home else "USD") if coa else {},
             "draft_meta": draft_meta}
@@ -4754,10 +4894,18 @@ def _record_run(name, form, ids, user, progress=None):
     foreign = ccy if ccy and home and ccy != home else None     # e.g. USD in a UGX company
     rates = {}
     xt = {a["id"]: a for a in transfer_targets(cur, acct_qbo, atype, ccy)}
-    split_ok = {**{k: a for k, a in coa.items() if a["type"] != "Accounts Receivable"},
+    split_ok = {**{k: a for k, a in coa.items() if a["type"] not in ("Accounts Receivable", "Accounts Payable")},
                 **{a["id"]: a for a in split_banks(cur, acct_qbo, ccy)}}
-    cust_rows = load_customers(cur, ccy)
+    x_ccy = cross_currency(cur, ccy, home)
+    cust_rows = load_customers(cur, ccy, x_ccy)
     customers = {c["id"]: c["n"] for c in cust_rows}
+    cust_ccy = {c["id"]: c["c"] for c in cust_rows}
+    vendors = {v["id"]: v["n"] for v in load_vendors(cur, ccy)}
+    cur.execute("""SELECT currency, qbo_id, coalesce(fqn, name) FROM qbo_coa
+                   WHERE account_type='Accounts Receivable' AND coalesce(active, true) ORDER BY qbo_id;""")
+    ar_by_ccy = {}
+    for c_, i_, f_ in cur.fetchall():
+        ar_by_ccy.setdefault(c_, {"id": i_, "fqn": f_, "type": "Accounts Receivable", "name": f_})
     parent_of = {c["id"]: c.get("p") for c in cust_rows}
     hacc = hedge_accounts(cur, ccy if ccy != home else "USD")
     hnames = {}
@@ -4813,7 +4961,14 @@ def _record_run(name, form, ids, user, progress=None):
                 problems.append(f"{label}: the split lines add up to {_money(sum((v for _, v in parts), Decimal(0)))}, "
                                 f"not {_money(abs(amt))}"); continue
         pick = form.get(f"acct_{lid}") or ""
-        acc = None if parts else (coa.get(pick) or xt.get(pick))
+        picked_cust = None
+        if pick.startswith("cust:") and not parts:
+            # A student or family: a payment into their account (Accounts Receivable in that currency).
+            picked_cust = pick[5:]
+            acc = ar_by_ccy.get(cust_ccy.get(picked_cust)) or {"id": "", "fqn": "Accounts Receivable",
+                                                               "type": "Accounts Receivable"}
+        else:
+            acc = None if parts else (coa.get(pick) or xt.get(pick))
         if not acc and not parts:
             if form.get("only"):
                 problems.append(f"{label}: choose an account")
@@ -4831,8 +4986,15 @@ def _record_run(name, form, ids, user, progress=None):
         ref = form.get(f"pref_{lid}") or None
         if payee != (form.get(f"psug_{lid}") or "").strip():
             ref = None
-        cust = form.get(f"cust_{lid}") or ""
+        cust = picked_cust or form.get(f"cust_{lid}") or ""
         kids = None
+        is_ap = bool(acc and acc["type"] == "Accounts Payable")
+        if is_ap:
+            # A payable (Rent payable, say) is paid against the supplier QuickBooks owes.
+            vend = cust if cust in vendors else (ref or "").split(":", 1)[1] if (ref or "").startswith("Vendor:") else ""
+            if vend not in vendors:
+                problems.append(f"{label}: choose the supplier this {acc['name'] if acc.get('name') else 'payable'} is paid to"); continue
+            payee, ref = vendors[vend], f"Vendor:{vend}"
         if is_ar:
             if cust not in customers and ref and ref.startswith("Customer:") and ref.split(":", 1)[1] in customers:
                 cust = ref.split(":", 1)[1]
@@ -4856,6 +5018,22 @@ def _record_run(name, form, ids, user, progress=None):
                     problems.append(f"{label}: the children's amounts add up to "
                                     f"{_money(sum((v for _, v in kids), Decimal(0)))}, not {_money(abs(amt))}"); continue
         rate = None
+        pay_ccy = cust_ccy.get(cust) if is_ar else None
+        if is_ar and pay_ccy and ccy and pay_ccy != ccy:
+            # UGX received for a student's USD account: paid in USD at the rate, deposited as the UGX.
+            typed = (form.get(f"rate_{lid}") or "").replace(",", "").strip()
+            try:
+                if typed:
+                    x_rate = Decimal(typed); assert x_rate > 0
+                else:
+                    token = token or qbo_token()
+                    x_rate = Decimal(str(rates[(pay_ccy, d)] if (pay_ccy, d) in rates else qbo_exchange_rate(token, pay_ccy, d)))
+                    rates[(pay_ccy, d)] = x_rate
+            except Exception:
+                problems.append(f"{label}: type the rate ({ccy} per {pay_ccy}) to pay it to the student's {pay_ccy} account"
+                                if not typed else f"{label}: the rate '{typed}' isn't a number"); continue
+        else:
+            x_rate = None
         if foreign:
             typed = (form.get(f"rate_{lid}") or "").replace(",", "").strip()
             if typed:
@@ -4904,11 +5082,13 @@ def _record_run(name, form, ids, user, progress=None):
             elif is_ar and kids:
                 paid = []
                 for c_id, v in kids:
-                    _e, pid = qbo_record_payment(token, acct_qbo, c_id, v, d, desc, foreign, rate)
+                    _e, pid = qbo_record_payment(token, acct_qbo, c_id, *_pay_amount(v, x_rate, foreign, rate, pay_ccy),
+                                                 d=d, desc=desc)
                     paid.append((c_id, v, pid))
                 entity, new_id, used_ref = "Payment", ",".join(p for _, _, p in paid), f"Customer:{cust}"
             elif is_ar:
-                entity, new_id = qbo_record_payment(token, acct_qbo, cust, abs(amt), d, desc, foreign, rate)
+                entity, new_id = qbo_record_payment(token, acct_qbo, cust, *_pay_amount(abs(amt), x_rate, foreign, rate, pay_ccy),
+                                                    d=d, desc=desc)
                 used_ref = f"Customer:{cust}"
             else:
                 entity, new_id, used_ref = qbo_record_line(token, acct_qbo, atype, out, acc["id"], abs(amt), d, desc,

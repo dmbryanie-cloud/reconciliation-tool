@@ -151,7 +151,9 @@ check("no suggestion for a first-time payee", items["AIRTEL DATA BUNDLE"]["sug"]
 check("money-in line doesn't get an expense suggestion", items["CUSTOMER XYZ DEPOSIT"]["sug"] is None and items["CUSTOMER XYZ DEPOSIT"]["out"] is False)
 page = cl.get("/account/Stanbic").data.decode()
 check("record table renders with suggestion reason", "Not in QuickBooks yet" in page and "similar bank lines were posted to Automobile:Fuel" in page)
-check("chart of accounts embedded safely as JSON", '"n": "Automobile:Fuel"' in page and "Accounts Payable" not in page.split('id=coa-data')[1][:2000])
+coa_js = json.loads(re.search(r"<script id=coa-data type=application/json>(.*?)</script>", page, re.S).group(1))
+check("chart of accounts embedded safely as JSON", any(a["n"] == "Automobile:Fuel" for a in coa_js)
+      and not any(a["t"] == "Accounts Payable" for a in coa_js))   # a payable only in the bank's own currency
 
 # ---- write-back ---------------------------------------------------------------
 L = lid("POS PURCHASE SHELL NTINDA 998877")

@@ -223,13 +223,13 @@ const rc = rowOf(process.argv[5]);
 const fee = rowOf(process.argv[6]), fq = fee.querySelector(".custbox .acct-q");
 fire(fq, "focus"); type(fq, "jane"); out.custBefore = fee.querySelector(".custbox .acct-list").hidden; fire(fq, "blur");
 out.feeNotAr = !fee.querySelector(".custbox").classList.contains("ar");
-const cq = rc.querySelector(".custbox .acct-q");
-const aq = rc.querySelector(".acctbox.main .acct-q"); fire(aq, "focus"); type(aq, "receivable");
-out.arTop = rc.querySelector(".acctbox.main .acct-list .ao span").textContent;
+const aq = rc.querySelector(".acctbox.main .acct-q"); fire(aq, "focus"); type(aq, "");
+out.groups = [...rc.querySelectorAll(".acctbox.main .acct-list .ag")].map(g => g.textContent);
+type(aq, "receivable"); out.arHits = [...rc.querySelectorAll(".acctbox.main .acct-list .ao span:first-child")].map(s => s.textContent);
+type(aq, "jane"); out.arTop = rc.querySelector(".acctbox.main .acct-list .ao span").textContent;
 fire(aq, "keydown", { key: "Enter" }); fire(aq, "blur");
-out.arOn = rc.querySelector(".custbox").classList.contains("ar");
-fire(cq, "focus"); type(cq, "jane"); fire(cq, "keydown", { key: "Enter" }); fire(cq, "blur");
-out.cust = rc.querySelector(".custbox .acct-v").value; out.custName = cq.value;
+out.cust = rc.querySelector(".acctbox.main .acct-v").value; out.custName = aq.value;
+out.payeeOff = rc.querySelector(".custbox .acct-q").disabled;
 // progress message says what's being done (once the page has loaded, as in a browser)
 const bulkBtn = d.querySelector("button[name=bulk]");
 out.bulkBusy = bulkBtn.getAttribute("data-busy");
@@ -260,7 +260,7 @@ const press = (win, btn) => btn.closest("form").dispatchEvent(new win.SubmitEven
     if res.stderr.strip():
         print(res.stderr[-2000:])
     o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
-    print("   ", {k: o.get(k) for k in ("count0", "count1", "rem", "busySave", "busyConfirm", "busyReject", "bulkBusy")})
+    print("   ", {k: o.get(k) for k in ("groups", "arHits", "arTop", "cust", "count0", "count1", "rem", "busySave", "busyConfirm", "busyReject", "bulkBusy")})
     check("browser: count of selected transactions shown", re.match(r"^Selected \d+ of 3 transactions", o.get("count0", "")) is not None)
     check("browser: Split opens with the whole amount on the first line", o.get("splitOpen") and o.get("nLines") == 2
           and o.get("firstAmt") == "250000")
@@ -270,8 +270,11 @@ const press = (win, btn) => btn.closest("form").dispatchEvent(new win.SubmitEven
     check("browser: …line ticked, single account set aside", o.get("fxTicked") and o.get("mainOff"))
     check("browser: …and the count follows", o.get("count1", "").startswith("Selected ") and o.get("count1") != o.get("count0"))
     check("browser: payee stays plain text without A/R (money out)", o.get("custBefore") is True and o.get("feeNotAr") is True)
-    check("browser: A/R offered first for money in", o.get("arTop") == "Accounts Receivable (A/R) - USD" and o.get("arOn"))
-    check("browser: …then the payee searches customers", o.get("cust") == "502" and o.get("custName") == "Jane Doe (USD)")
+    check("browser: money in offers students first, not Accounts Receivable in general",
+          (o.get("groups") or [""])[0].startswith("Students and families (USD)")
+          and not any("Receivable" in x for x in o.get("arHits") or []))
+    check("browser: …typing a name finds the student, who is the payee", o.get("arTop") == "Jane Doe (USD)"
+          and o.get("cust") == "cust:502" and o.get("custName") == "Jane Doe (USD)" and o.get("payeeOff"))
     check("browser: progress says 'Saving your selection...'", o.get("busySave") == "Saving your selection...")
     check("browser: …'Confirming...' and 'Rejecting...' on suggestions", o.get("busyConfirm") == "Confirming..."
           and o.get("busyReject") == "Rejecting...")
