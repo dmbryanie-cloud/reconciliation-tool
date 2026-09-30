@@ -23,7 +23,10 @@ COA = [{"Id": "35", "Name": "Stanbic UGX", "AccountType": "Bank", "CurrencyRef":
        {"Id": "36", "Name": "Centenary UGX", "AccountType": "Bank", "CurrencyRef": {"value": "UGX"}},
        {"Id": "37", "Name": "Stanbic USD", "AccountType": "Bank", "CurrencyRef": {"value": "USD"}},
        {"Id": "41", "Name": "Visa", "AccountType": "Credit Card", "CurrencyRef": {"value": "UGX"}},
-       {"Id": "83", "Name": "Office Supplies", "AccountType": "Expense", "CurrencyRef": {"value": "UGX"}}]
+       {"Id": "83", "Name": "Office Supplies", "AccountType": "Expense", "CurrencyRef": {"value": "UGX"}},
+       {"Id": "90", "Name": "Sales", "AccountType": "Income", "CurrencyRef": {"value": "UGX"}},
+       {"Id": "95", "Name": "USD Loan", "AccountType": "Other Current Liability", "CurrencyRef": {"value": "USD"}},
+       {"Id": "96", "Name": "EUR Accruals", "AccountType": "Other Current Liability", "CurrencyRef": {"value": "EUR"}}]
 A._store_coa(COA)
 POSTS, QBO = [], []
 def fake_post(token, entity, body):
@@ -175,4 +178,41 @@ check("matches survive the sync", matched(L2) == ("confirmed", "user") and match
 
 k = c.cursor(); r = A.reconcile(k, UGX, A._latest_statement(k, UGX)); c.rollback()
 check("Stanbic statement fully matched", r["un_lines"] == [] or len(r["un_lines"]) == 0)
+
+# ---- expenses and deposits on a USD bank are recorded in USD ----------------------------------
+RATES = []
+def fake_rate(token, ccy, d):
+    RATES.append((ccy, str(d))); return 3712.5
+A.qbo_exchange_rate = fake_rate
+upload("Stanbic USD", [("2026-09-25", "ACCOUNT MAINTENANCE FEES", -10), ("2026-09-26", "USD CASH DEPOSIT", 50)])
+F1, D1 = lid("ACCOUNT MAINTENANCE FEES"), lid("USD CASH DEPOSIT")
+ids = [a["id"] for a in coa_json(cl.get("/account/Stanbic USD").data.decode())]
+check("USD bank: offers home-currency and USD accounts, not EUR ones", "83" in ids and "95" in ids and "96" not in ids)
+k = c.cursor(); ids = [a["id"] for a in A.load_coa(k, "UGX")]; c.rollback()
+check("UGX bank: no foreign-currency accounts offered", "83" in ids and "95" not in ids and "96" not in ids)
+cl.post("/account/Stanbic USD/record", data={"only": F1, f"acct_{F1}": "83"})
+ent, body = POSTS[-1]
+check("USD expense sent in USD at QuickBooks' rate for its date", ent == "Purchase" and body["CurrencyRef"] == {"value": "USD"}
+      and body["ExchangeRate"] == 3712.5 and body["AccountRef"]["value"] == "37" and body["Line"][0]["Amount"] == 10.0
+      and RATES == [("USD", "2026-09-25")])
+cl.post("/account/Stanbic USD/record", data={"only": D1, f"acct_{D1}": "90"})
+ent, body = POSTS[-1]
+check("USD deposit too", ent == "Deposit" and body["CurrencyRef"] == {"value": "USD"} and body["ExchangeRate"] == 3712.5)
+n = len(POSTS)
+upload("Centenary UGX", [("2026-09-27", "STATIONERY", -5000)])
+S1 = lid("STATIONERY")
+cl.post("/account/Centenary UGX/record", data={"only": S1, f"acct_{S1}": "83"})
+ent, body = POSTS[-1]
+check("home-currency lines unchanged: no currency, no rate lookup", len(POSTS) == n + 1 and "CurrencyRef" not in body
+      and "ExchangeRate" not in body and len(RATES) == 2)
+def no_rate(token, ccy, d):
+    raise ValueError(f"QuickBooks has no {ccy} exchange rate for {d}")
+A.qbo_exchange_rate = no_rate
+upload("Stanbic USD", [("2026-09-28", "LEDGER FEES", -3)])
+F2 = lid("LEDGER FEES")
+n = len(POSTS)
+cl.post("/account/Stanbic USD/record", data={"only": F2, f"acct_{F2}": "83"})
+page = cl.get("/account/Stanbic USD").data.decode()
+check("no exchange rate: nothing sent, asks for the rate", len(POSTS) == n and "has no USD rate for 2026-09-28" in page
+      and "Type the rate" in page)
 sys.exit(T.summary())

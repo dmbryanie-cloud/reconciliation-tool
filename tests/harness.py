@@ -129,6 +129,8 @@ def setup(accounts_sql):
         sys.path.insert(0, ROOT)
     import app   # runs the app's startup migrations against the test database
     share_connection(app, c)
+    # Never ask the real QuickBooks for a rate; suites that record in USD set their own.
+    app.qbo_exchange_rate = lambda token, ccy, d: 3700.0
     return app, c
 
 
