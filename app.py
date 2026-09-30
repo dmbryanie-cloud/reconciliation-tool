@@ -954,6 +954,8 @@ try:
                     currency text, active boolean);""")
     _cur.execute("ALTER TABLE qbo_customer ADD COLUMN IF NOT EXISTS parent_id text;")   # a child's parent (sub-customer)
     # The USD leg of each forward deal recorded here, so its UGX receipt can be worked out from it.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS transfer_dismissal (line_id uuid NOT NULL, other text NOT NULL,
+                    dismissed_by text, dismissed_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (line_id, other));""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_vendor (qbo_id text PRIMARY KEY, name text, currency text,
                     active boolean);""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS hedge_leg (line_id uuid PRIMARY KEY, deal text NOT NULL,
@@ -1190,6 +1192,31 @@ def transfer_ends(this_qbo, other_qbo, amount, atype):
 def qbo_post(token, entity, body):
     req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/{entity.lower()}",
                                  data=json.dumps(body).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def qbo_read(token, entity, ent_id):
+    """One QuickBooks record by id (for its SyncToken). None when QuickBooks has no such record."""
+    req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/{entity.lower()}/{ent_id}", method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read()).get(entity)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code in (400, 404) and ("Object Not Found" in body or "610" in body):
+            return None
+        raise urllib.error.HTTPError(e.url, e.code, body[:300], e.hdrs, None)
+
+
+def qbo_delete(token, entity, ent_id, sync_token):
+    req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/{entity.lower()}?operation=delete",
+                                 data=json.dumps({"Id": str(ent_id), "SyncToken": str(sync_token)}).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
@@ -3891,14 +3918,51 @@ update(false);
 })();</script>
 {% endif %}
 {% endif %}
-{% if n_xfer %}<h2 id=sec-transfers style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
-<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it.</div>
-<table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
+{% if n_xfer or xfer_recorded or xfer_dismissed %}<h2 id=sec-transfers style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
+<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it. <em>Edit</em> picks a different counterpart (or just the other account, when its statement isn't uploaded); <em>Not a transfer</em> hides a wrong suggestion.</div>
+{% if n_xfer %}<table class=xfertbl><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
 <tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
 <td class=desc><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
-<td style="font-size:12px;color:var(--muted)">{{ c.note }}{% if c.rule == 'unrecorded' %}<br>{% if not acct_linked or not c.other_linked %}Both accounts must be linked to QuickBooks to record it here.{% elif signed_off or c.other_signed %}A statement is signed off \u2014 reopen it to record this.{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" style="margin-top:6px" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}</td></tr>
+<td style="font-size:12px;color:var(--muted);white-space:normal;min-width:220px">{{ c.note }}<div class=btnrow style="margin-top:6px;flex-wrap:wrap">
+{% if c.rule == 'unrecorded' %}{% if not acct_linked or not c.other_linked %}<span>Both accounts must be linked to QuickBooks to record it here.</span>{% elif signed_off or c.other_signed %}<span>A statement is signed off \u2014 reopen it to record this.</span>{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}
+{% if loop.first and not signed_off and acct_linked %}<button type=button class="btn-sm xfer-edit" data-line="{{ lid }}" aria-expanded=false>Edit</button>{% endif %}
+<form method=post action="{{ url_for('transfer_dismiss', name=name) }}"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.key }}"><button type=submit class=btn-sm data-busy="Hiding this suggestion...">Not a transfer</button></form>
+</div></td></tr>
+{% if loop.last and not signed_off and acct_linked %}<tr class=xferedit id="xe-{{ lid }}" hidden><td></td><td colspan=4 style="white-space:normal;background:#f8faff">
+<form method=post action="{{ url_for('record_transfer', name=name) }}" class=xe-form data-amt="{{ a|abs|money }}"><input type=hidden name=line value="{{ lid }}">
+<div class=splithead>Record {{ a|abs|money }} as a transfer {{ 'to' if a < 0 else 'from' }} another of your accounts. Pick the matching line on its statement, or just the account if its statement isn't uploaded (only this line is matched then).</div>
+{% set ch = xfer_choices.get(lid, []) %}{% for o in ch %}<label class=xe-opt><input type=radio name=other value="{{ o.line_id }}"{% if not o.linked %} disabled{% endif %}> <b>{{ o.account }}</b> \u00b7 {{ o.date }} \u00b7 {{ o.amount|money }}{% if o.who %} \u00b7 {{ o.who }}{% endif %}{% if not o.linked %} <span class=hint>(not linked to QuickBooks)</span>{% endif %}</label>
+{% else %}<div class=hint style="margin:4px 0">No other statement has this amount moving the other way within {{ 14 }} days.</div>{% endfor %}
+{% if xfer_accounts %}<label class=xe-opt><input type=radio name=other value="" class=xe-acct-r> Only the account:
+<select name=other_acct class=xe-acct><option value="">choose\u2026</option>{% for t in xfer_accounts %}<option value="{{ t.id }}">{{ t.fqn }}</option>{% endfor %}</select></label>{% endif %}
+<div class=btnrow style="margin-top:8px"><button type=submit class=btn-sm data-busy="Recording the transfer in QuickBooks...">Record transfer</button><button type=button class="btn-sm xe-cancel">Cancel</button></div>
+</form></td></tr>{% endif %}
 {% endfor %}{% endif %}{% endfor %}</table>{% endif %}
+{% if xfer_recorded %}<h3 style="font-size:13.5px;margin:4px 0 6px">Transfers recorded from this statement ({{ xfer_recorded|length }})</h3>
+<table class=xferdone><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Other account</th><th></th></tr>
+{% for t in xfer_recorded %}<tr><td>{{ t.date }}</td><td class=desc>{{ t.who }}</td><td class=a>{{ t.amount|money }}</td><td class=desc>{{ t.other or '' }}<br><span class=hint>QuickBooks #{{ t.qbo_id }}{% if t.by %} \u00b7 {{ t.by }}{% endif %}</span></td>
+<td>{% if not signed_off %}<form method=post action="{{ url_for('transfer_undo', name=name) }}" onsubmit="return confirm(this.dataset.q)" data-q="Undo this transfer? It is DELETED in QuickBooks (#{{ t.qbo_id }}), and its bank lines go back to the list to record again."><input type=hidden name=qbo_id value="{{ t.qbo_id }}"><button type=submit class=btn-sm data-busy="Undoing the transfer (deleting it in QuickBooks)...">Undo</button></form>{% else %}<span class=hint>signed off</span>{% endif %}</td></tr>{% endfor %}</table>{% endif %}
+{% if xfer_dismissed %}<details class=xferhid style="margin:0 0 22px"><summary class=hint style="cursor:pointer">{{ xfer_dismissed|length }} suggestion{{ '' if xfer_dismissed|length == 1 else 's' }} marked \u2018Not a transfer\u2019</summary>
+<table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Suggested counterpart</th><th></th></tr>
+{% for x in xfer_dismissed %}<tr><td>{{ x.date }}</td><td class=desc>{{ x.who }}</td><td class=a>{{ x.amount|money }}</td><td class=desc>{{ x.c.account }} \u00b7 {{ x.c.date }} \u00b7 {{ x.c.amount|money }}{% if x.by %}<br><span class=hint>hidden by {{ x.by }}</span>{% endif %}</td>
+<td><form method=post action="{{ url_for('transfer_restore', name=name) }}"><input type=hidden name=line value="{{ x.line_id }}"><input type=hidden name=other value="{{ x.c.key }}"><button type=submit class=btn-sm data-busy="Restoring the suggestion...">Restore</button></form></td></tr>{% endfor %}</table></details>{% endif %}
+<style>.xe-opt{display:block;padding:5px 0;font-size:13px}.xe-opt select{margin-left:6px;padding:4px 6px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:100%}
+.xfertbl .btnrow form{margin:0}</style>
+<script>(function(){
+// Edit: open the chooser under the line; picking an account ticks "Only the account".
+document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.getElementById('xe-'+b.getAttribute('data-line'));if(!row)return;
+  b.addEventListener('click',function(){row.hidden=!row.hidden;b.setAttribute('aria-expanded',String(!row.hidden))});
+  row.querySelector('.xe-cancel').addEventListener('click',function(){row.hidden=true;b.setAttribute('aria-expanded','false')});
+  var sel=row.querySelector('.xe-acct'),r=row.querySelector('.xe-acct-r'),f=row.querySelector('.xe-form');
+  if(sel&&r)sel.addEventListener('change',function(){if(sel.value)r.checked=true});
+  f.addEventListener('submit',function(e){var pick=f.querySelector('input[name=other]:checked');
+    var acct=pick&&pick.classList.contains('xe-acct-r')?sel.options[sel.selectedIndex]:null;
+    if(!pick||(acct&&!sel.value)){e.preventDefault();var h=f.querySelector('.xe-err');if(!h){h=document.createElement('div');h.className='hint bad xe-err';f.appendChild(h)}
+      h.textContent=!pick?'Pick the matching line or an account first.':'Choose the account.';return}
+    if(!confirm('Record a transfer of '+f.getAttribute('data-amt')+(acct?' with '+acct.textContent:' between these two lines')+' in QuickBooks?'))e.preventDefault()});
+});})();</script>
+{% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
@@ -3912,7 +3976,7 @@ th.sortable .sortind{font-size:11px;margin-left:4px;color:var(--accent);font-wei
 // Click a column heading to sort: Date and amounts sort as dates and numbers; "Statement side" and
 // "Books side" sort by date, then (clicking on) by amount. A line's panels (split, hedge, children)
 // move with it. The order is kept for this page until the tab is closed.
-var PANEL=/(^| )(splitrow|hedgerow|kidsrow)( |$)/;
+var PANEL=/(^| )(splitrow|hedgerow|kidsrow|xferedit)( |$)/;
 function key(td,kind){var t=td?td.textContent.replace(/\\s+/g,' ').trim():'',m;
   if(kind==='date'){m=t.match(/\\d{4}-\\d{2}-\\d{2}/);return m?m[0]:''}
   if(kind==='amt'){m=t.replace(/,/g,'').match(/\\d{4}-\\d{2}-\\d{2} \\u00b7 (-?\\d+(?:\\.\\d+)?)/);return m?parseFloat(m[1]):-Infinity}
@@ -4114,7 +4178,7 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
     """, (ids, dts, amts, acct_uuid, acct_uuid, m_this, window, window))
     for lid, nm, d, a, who, other_lid, other_signed, other_qbo in cur.fetchall():
         out.setdefault(str(lid), []).append(
-            {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who,
+            {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who, "key": f"line:{other_lid}",
              "line_id": str(other_lid), "other_signed": bool(other_signed), "other_linked": bool(other_qbo),
              "note": "Opposite entry on another bank statement, not recorded in QuickBooks either side."})
 
@@ -4122,7 +4186,7 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
     cur.execute(f"""
         WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
         SELECT un.line_id, a.name, bt.posted_date, bt.amount,
-               coalesce(bt.counterparty, bt.description, '')
+               coalesce(bt.counterparty, bt.description, ''), bt.txn_id
         FROM un
         JOIN book_txn bt ON bt.account_id <> %s
                         AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
@@ -4134,11 +4198,66 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
                           JOIN match m ON m.match_id = mbt.match_id
                           WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed');
     """, (ids, dts, amts, acct_uuid, window, window, acct_uuid, m_this))
-    for lid, nm, d, a, who in cur.fetchall():
+    for lid, nm, d, a, who, tid in cur.fetchall():
         out.setdefault(str(lid), []).append(
-            {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who,
+            {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who, "key": f"book:{tid}",
              "note": "Recorded in QuickBooks against this account instead \u2014 likely posted to the wrong bank."})
     return out
+
+
+EDIT_WINDOW_DAYS = 14    # Edit offers counterparts this far apart (the suggestions use TRANSFER_WINDOW_DAYS)
+
+
+def transfer_dismissed(cur, line_ids):
+    """{line_id: [(key, by, at)]} pairs marked 'Not a transfer'."""
+    if not line_ids:
+        return {}
+    cur.execute("""SELECT line_id::text, other, dismissed_by, dismissed_at FROM transfer_dismissal
+                   WHERE line_id = ANY(%s::uuid[]) ORDER BY dismissed_at;""", ([str(x) for x in line_ids],))
+    out = {}
+    for lid, other, by, at in cur.fetchall():
+        out.setdefault(lid, []).append((other, by, at))
+    return out
+
+
+def transfer_choices(cur, acct_uuid, lines, window=EDIT_WINDOW_DAYS):
+    """For Edit: every unmatched line on another account's statement (same currency, not signed off)
+    with the same money moving the other way, within `window` days. {line_id: [...]}, closest date first."""
+    if not lines:
+        return {}
+    cur.execute("SELECT type FROM account WHERE account_id=%s;", (acct_uuid,))
+    m_this = -1 if (cur.fetchone() or [None])[0] == "credit_card" else 1
+    flow = "(CASE WHEN a.type = 'credit_card' THEN -1 ELSE 1 END)"
+    cur.execute(f"""
+        WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
+        SELECT un.line_id, sl.line_id, a.name, sl.posted_date, sl.amount, coalesce(sl.counterparty, sl.description, ''),
+               a.source_account_id IS NOT NULL
+        FROM un
+        JOIN statement s ON s.account_id <> %s AND s.signed_off_at IS NULL
+        JOIN account a ON a.account_id = s.account_id AND a.currency = (SELECT currency FROM account WHERE account_id = %s)
+        JOIN statement_line sl ON sl.statement_id = s.statement_id AND sl.amount * {flow} = -un.amt * %s
+                              AND sl.posted_date BETWEEN un.d - %s AND un.d + %s
+        WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                          WHERE msl.line_id = sl.line_id AND m.status = 'confirmed')
+        ORDER BY abs(sl.posted_date - un.d), a.name;
+    """, ([str(l[0]) for l in lines], [l[1] for l in lines], [l[2] for l in lines], acct_uuid, acct_uuid, m_this,
+          window, window))
+    out = {}
+    for lid, other, nm, d, a, who, linked in cur.fetchall():
+        out.setdefault(str(lid), []).append({"line_id": str(other), "account": nm, "date": d, "amount": a, "who": who,
+                                             "linked": linked})
+    return out
+
+
+def recorded_transfers(cur, sid):
+    """Transfers the app recorded for this statement's lines (from Possible transfers or the record list)."""
+    cur.execute("""SELECT w.qbo_id, sl.line_id::text, sl.posted_date, sl.amount, coalesce(sl.description,''),
+                          w.account_fqn, w.created_by, w.created_at
+                   FROM writeback_log w JOIN statement_line sl ON sl.line_id = w.line_id
+                   WHERE sl.statement_id=%s AND w.status='done' AND w.qbo_type='Transfer' AND coalesce(w.qbo_id,'') <> ''
+                   ORDER BY sl.posted_date;""", (sid,))
+    return [{"qbo_id": q, "line_id": l, "date": d, "amount": a, "who": w, "other": o, "by": by, "at": at}
+            for q, l, d, a, w, o, by, at in cur.fetchall()]
 
 
 STMT_COLS = """statement_id, period_start, period_end, signed_off_at, opening_balance, closing_balance,
@@ -4372,9 +4491,25 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
     try:
         xfers = transfer_candidates(cur, acct_uuid, _unmatched)
+        gone = transfer_dismissed(cur, list(xfers))
+        xfer_dismissed = []
+        for l_id, items in list(xfers.items()):
+            keys = {k for k, _, _ in gone.get(l_id, [])}
+            kept = [c for c in items if c.get("key") not in keys]
+            line = next(l for l in _unmatched if str(l[0]) == l_id)
+            xfer_dismissed += [{"line_id": l_id, "date": line[1], "amount": line[2], "who": line[3], "c": c,
+                                "by": next(b for k, b, _ in gone[l_id] if k == c.get("key"))}
+                               for c in items if c.get("key") in keys]
+            if kept:
+                xfers[l_id] = kept
+            else:
+                del xfers[l_id]
+        choices = transfer_choices(cur, acct_uuid, [l for l in _unmatched if str(l[0]) in xfers])
     except Exception:
-        xfers = {}   # a suggestion engine must never break the reconciliation itself
+        xfers, xfer_dismissed, choices = {}, [], {}   # a suggestion engine must never break the reconciliation itself
     return {"xfers": xfers, "n_xfer": sum(len(v) for v in xfers.values()), "all_unmatched": _all_unmatched,
+            "xfer_choices": choices, "xfer_dismissed": xfer_dismissed, "xfer_recorded": recorded_transfers(cur, sid),
+            "xfer_accounts": [a for a in xt if a.get("xfer")] if acct_qbo else [],
             "has_results": True, "p_start": ps, "p_end": pe,
             "signed_off": signed.strftime("%Y-%m-%d") if signed else None,
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
@@ -5333,12 +5468,46 @@ def record_discard(name):
     return redirect(url_for("detail", name=name) + "#sec-record")
 
 
+def _record_transfer_one_side(name, lid, other_acct, back):
+    """Edit's "Only the account": a Transfer between this bank line's account and another of your
+    accounts whose statement isn't uploaded. Only this line is matched."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        uuid.UUID(lid)
+    except ValueError:
+        cur.close(); conn.close(); session["detail_msg"] = "Nothing to record."; return back
+    cur.execute("""SELECT sl.line_id, sl.posted_date, sl.amount, coalesce(sl.description,''), s.statement_id, s.signed_off_at,
+                          a.account_id, a.source_account_id, a.type, a.currency,
+                          EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                                  WHERE msl.line_id=sl.line_id AND m.status='confirmed')
+                   FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   JOIN account a ON a.account_id=s.account_id WHERE sl.line_id=%s AND a.name=%s;""", (lid, name))
+    me = cur.fetchone()
+    targets = {t["id"]: t for t in transfer_targets(cur, me[7], me[8], me[9])} if me else {}
+    problem = ("That bank line wasn't found. Reload and try again." if not me else
+               "This line is already matched." if me[10] else
+               "The statement is signed off. Reopen it to record this transfer." if me[5] else
+               "This account must be linked to QuickBooks." if not me[7] else
+               "Choose one of your accounts in the same currency." if other_acct not in targets else None)
+    if problem:
+        cur.close(); conn.close(); session["detail_msg"] = problem; return back
+    cur.close(); conn.close()
+    # The regular record path does the rest (claim, QuickBooks, books, matching this line).
+    msg = _record_run(name, {"only": str(me[0]), f"acct_{me[0]}": other_acct, f"dupok_{me[0]}": "1"}, [str(me[0])],
+                      session.get("name"))
+    session["detail_msg"] = msg
+    return back
+
+
 @app.route("/account/<name>/transfer", methods=["POST"])
 def record_transfer(name):
     """Money visibly left one of your accounts and arrived at another, and neither side is in
     QuickBooks: record ONE Transfer and match both bank lines to it."""
     back = redirect(url_for("detail", name=name) + "#sec-transfers")
     lid, other = request.form.get("line") or "", request.form.get("other") or ""
+    other_acct = (request.form.get("other_acct") or "").strip()
+    if not other and other_acct:
+        return _record_transfer_one_side(name, lid, other_acct, back)
     try:
         uuid.UUID(lid); uuid.UUID(other)
     except ValueError:
@@ -5422,6 +5591,97 @@ def record_transfer(name):
                              f"in QuickBooks" + (f" (#{new_id})" if new_id else "") +
                              (" and matched both bank lines." if matched == 2 else
                               ". It will match on the next refresh."))
+    return back
+
+
+def _xfer_line_of(cur, name, lid):
+    """The statement line `lid` on account `name`'s latest statement, or None."""
+    try:
+        uuid.UUID(lid)
+    except (ValueError, TypeError):
+        return None
+    cur.execute("""SELECT sl.line_id FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   JOIN account a ON a.account_id=s.account_id WHERE sl.line_id=%s AND a.name=%s;""", (lid, name))
+    return cur.fetchone()
+
+
+@app.route("/account/<name>/transfer_dismiss", methods=["POST"])
+def transfer_dismiss(name):
+    """'Not a transfer': hide this suggested pairing (it can be restored)."""
+    lid, other = request.form.get("line") or "", (request.form.get("other") or "")[:80]
+    conn = get_conn(); cur = conn.cursor()
+    if other and _xfer_line_of(cur, name, lid):
+        cur.execute("""INSERT INTO transfer_dismissal (line_id, other, dismissed_by) VALUES (%s,%s,%s)
+                       ON CONFLICT DO NOTHING;""", (lid, other, session.get("name") or "user"))
+        conn.commit()
+        session["detail_msg"] = "Hidden: it won't be suggested as a transfer again. Restore it below if that was a mistake."
+    cur.close(); conn.close()
+    return redirect(url_for("detail", name=name) + "#sec-transfers")
+
+
+@app.route("/account/<name>/transfer_restore", methods=["POST"])
+def transfer_restore(name):
+    lid, other = request.form.get("line") or "", request.form.get("other") or ""
+    conn = get_conn(); cur = conn.cursor()
+    if _xfer_line_of(cur, name, lid):
+        cur.execute("DELETE FROM transfer_dismissal WHERE line_id=%s AND other=%s;", (lid, other))
+        conn.commit()
+        session["detail_msg"] = "Restored: the suggestion is back."
+    cur.close(); conn.close()
+    return redirect(url_for("detail", name=name) + "#sec-transfers")
+
+
+@app.route("/account/<name>/transfer_undo", methods=["POST"])
+def transfer_undo(name):
+    """Undo a transfer the app recorded: delete it in QuickBooks, unpair its bank lines (they go back
+    to the list), and take it out of the books here. Only while none of its statements is signed off."""
+    back = redirect(url_for("detail", name=name) + "#sec-transfers")
+    qid = (request.form.get("qbo_id") or "").strip()
+    user = session.get("name") or "user"
+    conn = get_conn(); cur = conn.cursor()
+    # Every bank line the app recorded as this Transfer, and every book row of it.
+    cur.execute("""SELECT w.line_id::text, s.statement_id, s.signed_off_at, a.name, a.account_id
+                   FROM writeback_log w JOIN statement_line sl ON sl.line_id=w.line_id
+                   JOIN statement s ON s.statement_id=sl.statement_id JOIN account a ON a.account_id=s.account_id
+                   WHERE w.qbo_type='Transfer' AND w.qbo_id=%s AND w.status='done';""", (qid,))
+    lines = cur.fetchall()
+    cur.execute("""SELECT bt.txn_id::text, bt.account_id FROM book_txn bt
+                   WHERE bt.source_txn_type='Transfer' AND bt.source_txn_id=%s;""", (qid,))
+    books = cur.fetchall()
+    cur.execute("""SELECT DISTINCT m.match_id::text, s.signed_off_at, s.statement_id FROM match m
+                   JOIN statement s ON s.statement_id=m.statement_id
+                   WHERE m.match_id IN (SELECT match_id FROM match_book_txn WHERE txn_id = ANY(%s::uuid[]))
+                      OR m.match_id IN (SELECT match_id FROM match_statement_line WHERE line_id = ANY(%s::uuid[]));""",
+                ([b[0] for b in books], [l[0] for l in lines]))
+    matches = cur.fetchall()
+    problem = None
+    if not qid or not any(l[3] == name for l in lines):
+        problem = "That transfer wasn't recorded from this account here, so it can't be undone from this page."
+    elif any(l[2] for l in lines) or any(m[1] for m in matches):
+        problem = "A statement it's matched on is signed off. Reopen it first, then undo the transfer."
+    if problem:
+        cur.close(); conn.close(); session["detail_msg"] = problem; return back
+    try:
+        token = qbo_token()
+        ent = qbo_read(token, "Transfer", qid)
+        if ent is not None:
+            qbo_delete(token, "Transfer", qid, ent.get("SyncToken", "0"))
+    except Exception as e:
+        err = f"HTTP {e.code}: {str(e.reason)[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
+        cur.close(); conn.close()
+        session["detail_msg"] = f"Not undone: QuickBooks said {err}. Nothing was changed."; return back
+    ids = [m[0] for m in matches]
+    if ids:
+        cur.execute("DELETE FROM match WHERE match_id = ANY(%s::uuid[]);", (ids,))
+    cur.execute("""UPDATE book_txn SET is_deleted=true, updated_at=now()
+                   WHERE source_txn_type='Transfer' AND source_txn_id=%s;""", (qid,))
+    cur.execute("""UPDATE writeback_log SET status='failed', error='undone by ' || %s
+                   WHERE qbo_type='Transfer' AND qbo_id=%s AND status='done';""", (user, qid))
+    conn.commit(); cur.close(); conn.close()
+    for sid in {l[1] for l in lines} | {m[2] for m in matches}:
+        _after_review(sid)
+    session["detail_msg"] = (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
+                             f"{'s are' if len(lines) > 1 else ' is'} back in the list to record again.")
     return back
 
 
