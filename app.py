@@ -1588,6 +1588,10 @@ tbody tr:hover{background:#f7f9fb}
 .tag.pending{background:var(--warn-soft);color:var(--warn)}
 .hint{color:var(--muted);font-size:12px;line-height:1.4;white-space:normal}
 .rectbl td{vertical-align:top}
+/* Bank wording with no spaces (FXPLOU~1110179~FWD~BUY~USD/UGX~3,840.0000) wraps inside its cell instead of
+   running into the amount beside it; dates and amounts stay on one line. */
+td.desc{white-space:normal;overflow-wrap:anywhere;word-break:break-word;min-width:140px;max-width:300px}
+td.a{white-space:nowrap}
 .rectbl select,.rectbl input.payee{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:230px;background:#fff}
 .rectbl select{width:230px}.rectbl input.payee{width:150px}
 .acctbox{position:relative;width:230px;max-width:100%}
@@ -1634,7 +1638,7 @@ tbody tr:hover{background:#f7f9fb}
 .mmhead{padding:10px 12px;border-bottom:1px solid var(--line-soft);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;color:var(--muted);display:flex;gap:8px;align-items:center;justify-content:space-between}
 .mmsearch{padding:5px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;width:55%;text-transform:none;letter-spacing:0}
 .mmlist{max-height:340px;overflow:auto}
-.mmrow{display:grid;grid-template-columns:22px 86px 1fr auto;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
+.mmrow{display:grid;grid-template-columns:22px 86px minmax(0,1fr) auto;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
 .mmrow:hover{background:#f7f9fb}.mmrow.on{background:var(--accent-soft)}
 .mmrow .mmw{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mmrow .a{font-variant-numeric:tabular-nums}
@@ -3501,8 +3505,8 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <table><tr><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched total')) }}</span></td>
-<td>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
-<td>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
+<td class=desc>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
+<td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
 <td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}" class=btnrow>
 {% if r.status=='proposed' %}<button type=submit name=status value=confirmed class=btn-sm>Confirm</button><button type=submit name=status value=rejected class=btn-sm>Reject</button>
@@ -3514,7 +3518,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 {% endif %}
 <h2 id=sec-matched style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
-{% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td>{{ who }}</td>
+{% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
@@ -3532,7 +3536,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% for w in writebacks + deposits %}<tr data-amt="{{ w.amount }}">
 <td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.sel %}checked{% endif %}><input type=hidden name=rowid value="{{ w.line_id }}">{% endif %}</td>
 <td>{{ w.date }}</td>
-<td style="white-space:normal;max-width:280px">{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
+<td class=desc>{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
 {% if w.dups and not w.wb %}<div class=dupwarn>&#9888; QuickBooks may already have this: {% for x in w.dups %}{{ x.date }} · {{ x.amount|money }}{% if x.who %} · {{ x.who }}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}.
 {% if w.dup_matchable %}<br><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable }}">Match it instead</button>
 {% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh.{% endif %}</div>{% endif %}</td>
@@ -3674,7 +3678,8 @@ function initBox(box,list,onPick,active){
     chosen=null;v.value='';q.classList.add('bad');q.title="Not in the list: pick one from it, or clear it. This line won't be recorded as it is.";
     onPick(null,true)});
   x.addEventListener('click',function(){clear();q.focus()});
-  var start=(typeof list==='function'?list():list).filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
+  var LL=typeof list==='function'?list():list,start=LL.filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
+  if(!start&&q.value.trim())start=LL.filter(function(a){return a.low===q.value.trim().toLowerCase()})[0];
   if(start)set(start,false);else vis();
   return {get:function(){return chosen},refresh:function(){vis();if(!on()){v.value='';q.classList.remove('bad')}}};
 }
@@ -3712,6 +3717,7 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
   var first=true;
   var main=initBox(box,accountsFor(dir,false),function(a,byUser){
     isAr=!!(a&&a.cust);isAp=!!(a&&a.ap);
+    var ph=tr.querySelector('.pickhint');if(ph&&a)ph.remove();
     if(byUser&&cb)cb.checked=!!a&&(!isAp||!!(cust&&cust.get()));
     // A student's account in the other currency: the amount converts at the rate typed here.
     if(xr){xr.hidden=!(a&&a.other);if(xr.hidden&&!first)xr.value=''}
@@ -3785,6 +3791,19 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
 var all=document.getElementById('selall');if(all)all.addEventListener('change',function(){document.querySelectorAll('.rsel').forEach(function(c){c.checked=all.checked});count()});
 var f=document.getElementById('recform');
 if(f){f.addEventListener('change',function(e){if(e.target.classList&&e.target.classList.contains('rsel'))count()});
+// Enter in a text box never sends the form: it would press the first button on the page and act on
+// another line. (Enter in an open list still picks the highlighted item.)
+f.addEventListener('keydown',function(e){var t=e.target;
+  if(e.key==='Enter'&&t.tagName==='INPUT'&&t.type!=='submit'&&t.type!=='button'&&t.type!=='checkbox')e.preventDefault()});
+// A line's own Record button: its account must be picked from the list, not just typed.
+f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='only')return;
+  var tr=b.closest('tr'),box=tr&&tr.querySelector('.acctbox.main'),q=box&&box.querySelector('.acct-q'),v=box&&box.querySelector('.acct-v');
+  var split=tr&&tr.querySelector('.split-v'),hedge=tr&&tr.querySelector('.hedge-on');
+  if(!box||(split&&split.value)||(hedge&&hedge.value==='1')||(v&&v.value))return;
+  e.preventDefault();q.classList.add('bad');
+  q.title=q.value.trim()?'Pick it from the list (click it, or use the arrow keys and Enter), then Record.':'Choose an account first.';
+  var h=tr.querySelector('.pickhint');if(!h){h=document.createElement('div');h.className='hint pickhint bad';box.parentNode.insertBefore(h,box.nextSibling)}
+  h.textContent=q.title;q.focus()},true);
 f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='bulk')return;
   var n=0,t=0;document.querySelectorAll('.rsel:checked').forEach(function(c){n++;t+=Math.abs(parseFloat(c.getAttribute('data-amt'))||0)});
   if(!n){e.preventDefault();return}
@@ -3799,8 +3818,8 @@ count();
 <table><tr><th>Matched by you</th><th>Statement side</th><th>Books side</th><th class=a>Difference</th><th></th></tr>
 {% for u in user_matches %}<tr>
 <td class=hint>{{ u.by or '' }}{% if u.at %}<br>{{ u.at.strftime('%Y-%m-%d') }}{% endif %}</td>
-<td>{% for d,a,w in u.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
-<td>{% for d,a,w in u.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
+<td class=desc>{% for d,a,w in u.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
+<td class=desc>{% for d,a,w in u.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td class=a>{% if u.delta %}<span class=warn>{{ u.delta|money }}</span>{% else %}0.00{% endif %}</td>
 <td><form method=post action="{{ url_for('unmatch', name=name, match_id=u.id) }}"><button type=submit class=btn-sm>Undo</button></form></td>
 </tr>{% endfor %}</table>
@@ -3876,16 +3895,16 @@ update(false);
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it.</div>
 <table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
-<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td>
-<td><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
+<tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
+<td class=desc><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
 <td style="font-size:12px;color:var(--muted)">{{ c.note }}{% if c.rule == 'unrecorded' %}<br>{% if not acct_linked or not c.other_linked %}Both accounts must be linked to QuickBooks to record it here.{% elif signed_off or c.other_signed %}A statement is signed off \u2014 reopen it to record this.{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" style="margin-top:6px" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}</td></tr>
 {% endfor %}{% endif %}{% endfor %}</table>{% endif %}
 <h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
-{% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
+{% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 <h2 style="font-size:15px">In books, not on statement ({{ in_books|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
-{% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
+{% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <style>th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover{color:var(--accent)}
 th.sortable .sortind{font-size:11px;margin-left:4px;color:var(--accent);font-weight:600}</style>
@@ -4267,6 +4286,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     cust_names = {c["id"]: c["n"] for c in custs}
     vends = load_vendors(cur, acct_ccy) if coa and unmatched_lines else []
     vend_ids = {v["id"] for v in vends}
+    vend_by_name = {}
+    for v in vends:
+        vend_by_name.setdefault(v["n"].strip().lower(), v["id"])
     coa_type = {a["id"]: a["type"] for a in coa}
     drafts, draft_meta = {}, None
     if unmatched_lines:
@@ -4313,6 +4335,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         pref = item["payee_ref"] or ""
         item["cust"] = pref.split(":", 1)[1] if pref.startswith("Customer:") and pref.split(":", 1)[1] in cust_names else ""
         item["vend"] = pref.split(":", 1)[1] if pref.startswith("Vendor:") and pref.split(":", 1)[1] in vend_ids else ""
+        if not item["vend"] and item["payee"]:   # suggested by name only (older entries carry no supplier ID)
+            item["vend"] = vend_by_name.get(item["payee"].strip().lower(), "")
         item["rate"] = item["split"] = item["kids"] = ""
         item["dupok"] = False
         # A forward deal: its foreign leg (money out of the USD account) or its home receipt (UGX in).
@@ -4992,6 +5016,8 @@ def _record_run(name, form, ids, user, progress=None):
         if is_ap:
             # A payable (Rent payable, say) is paid against the supplier QuickBooks owes.
             vend = cust if cust in vendors else (ref or "").split(":", 1)[1] if (ref or "").startswith("Vendor:") else ""
+            if vend not in vendors and payee:
+                vend = next((i for i, n in vendors.items() if n.strip().lower() == payee.lower()), "")
             if vend not in vendors:
                 problems.append(f"{label}: choose the supplier this {acc['name'] if acc.get('name') else 'payable'} is paid to"); continue
             payee, ref = vendors[vend], f"Vendor:{vend}"

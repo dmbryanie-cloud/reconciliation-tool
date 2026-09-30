@@ -96,6 +96,25 @@ line = body["Line"][0]["AccountBasedExpenseLineDetail"]
 check("with the supplier: an expense to Rent payable UGX against them", ent == "Purchase" and line["AccountRef"] == {"value": "222"}
       and body["EntityRef"] == {"value": "70", "type": "Vendor"} and body["Line"][0]["Amount"] == 5000000.0)
 
+# a supplier suggested by name only (older entries carry no supplier ID) counts as picked
+q("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref, currency)
+     VALUES (%s, 'LANDLORD SEPT RENT', 'Accounts Payable (A/P)  UGX:Rent payable UGX', true, 'Regina Muwonge', NULL, 'UGX') RETURNING 1""",
+  (A.ORG_ID,))
+upload("Stanbic UGX", [("2026-07-01", "RENT JULY", -5000000), ("2026-07-02", "OKELLO SCHOOL FEES", 3650000),
+                       ("2026-07-03", "OKELLO USD FEES", 1000000), ("2026-07-04", "OKELLO FAMILY LUMP", 7300000),
+                       ("2026-07-05", "AMY OKELLO UGX FEES", 250000), ("2026-07-06", "NO RATE FEES", 730000),
+                       ("2026-07-07", "LANDLORD SEPT RENT", -700000)])
+RENT, F1, F2, FAM, F3, NR, LS = (lid(x) for x in ("RENT JULY", "OKELLO SCHOOL FEES", "OKELLO USD FEES", "OKELLO FAMILY LUMP",
+                                                  "AMY OKELLO UGX FEES", "NO RATE FEES", "LANDLORD SEPT RENT"))
+p_ = page("Stanbic UGX")
+row = re.search(rf'value="{LS}" class=rsel.*?</tr>', p_, re.S).group(0)
+check("a supplier suggested by name only is preselected", 'class=custbox data-sel="70"' in row)
+n = len(POSTS)
+cl.post("/account/Stanbic UGX/record", data={"only": LS, f"acct_{LS}": "222", f"payee_{LS}": "Regina Muwonge",
+                                              f"psug_{LS}": "Regina Muwonge"})
+check("…and the name alone is enough to record it against them", len(POSTS) == n + 1
+      and POSTS[-1][1].get("EntityRef") == {"value": "70", "type": "Vendor"})
+
 # ---- students ----------------------------------------------------------------------------------------------
 cl.post("/account/Stanbic UGX/record", data={"only": F3, f"acct_{F3}": "cust:12"})
 ent, body = POSTS[-1]
@@ -190,6 +209,20 @@ th.find(t => /^Amount/.test(t.textContent)).click(); out.amtUp = amounts();
 th.find(t => /^Amount/.test(t.textContent)).click(); out.amtDown = amounts();
 th.find(t => /^Date/.test(t.textContent)).click(); out.dateUp = dates();
 out.panelsFollow = [...tbl.querySelectorAll("tr.splitrow")].length > 3 && [...tbl.querySelectorAll("tr.splitrow")].every(r => { let p = r.previousElementSibling; while (p && !p.hasAttribute("data-amt")) p = p.previousElementSibling; return p && p.nextElementSibling === r; });
+// Enter never sends the form; a line's Record with a typed-but-unpicked account is stopped
+const lc = rowOf(process.argv[5]), lq = lc.querySelector(".acctbox.main .acct-q");
+fire(lq, "focus"); lq.value = "office"; fire(lq, "input");
+const e1 = new w.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }); lq.dispatchEvent(e1);
+out.pickedByEnter = lc.querySelector(".acctbox.main .acct-v").value;
+const e2 = new w.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }); lq.dispatchEvent(e2);
+out.enterBlocked = e2.defaultPrevented;
+lq.value = "offic"; fire(lq, "input"); fire(lq, "blur");
+const rb = lc.querySelector("button[name=only]");
+const sev = new w.SubmitEvent("submit", { cancelable: true, bubbles: true, submitter: rb }); d.getElementById("recform").dispatchEvent(sev);
+out.unpickedStopped = sev.defaultPrevented; out.pickHint = (lc.querySelector(".pickhint") || {}).textContent;
+fire(lq, "focus"); lq.value = "office supplies"; fire(lq, "input"); fire(lq, "keydown", { key: "Enter" });
+const sev2 = new w.SubmitEvent("submit", { cancelable: true, bubbles: true, submitter: rb }); d.getElementById("recform").dispatchEvent(sev2);
+out.pickedGoes = !sev2.defaultPrevented && !lc.querySelector(".pickhint");
 // the account switcher
 const sel = d.getElementById("acctswitch"), go = d.querySelector(".acctgo");
 out.goDisabled0 = go.disabled;
@@ -201,7 +234,7 @@ console.log(JSON.stringify(out));
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(ugx); f.close()
     g = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8"); g.write(JS); g.close()
     try:
-        res = subprocess.run([node, g.name, f.name, BEN, RA], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+        res = subprocess.run([node, g.name, f.name, BEN, RA, A_], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
     finally:
         os.unlink(f.name); os.unlink(g.name)
     if res.stderr.strip():
@@ -220,6 +253,10 @@ console.log(JSON.stringify(out));
     dt = o.get("dateUp") or []
     check("browser: clicking Date sorts by date", dt == sorted(dt) and len(dt) > 3)
     check("browser: a line's panels move with it", o.get("panelsFollow"))
+    check("browser: Enter picks from the list but never sends the form", o.get("pickedByEnter") == "83" and o.get("enterBlocked"))
+    check("browser: Record with an account typed but not picked is stopped, saying why", o.get("unpickedStopped")
+          and "Pick it from the list" in (o.get("pickHint") or ""))
+    check("browser: …once picked, Record goes ahead", o.get("pickedGoes"))
     check("browser: Reconcile waits until another account is chosen, then says what's loading",
           o.get("goDisabled0") and o.get("goEnabled") and (o.get("goBusy") or "").startswith("Loading DFCU USD"))
     check("browser: no script errors", o.get("errors") == [])
