@@ -3279,13 +3279,16 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 .secnav a.on{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:600}
 @media (max-width:760px){.secnav{padding:7px 15px}}
 @media (min-width:1260px){
-  .secnav{position:fixed;top:calc(var(--navh,53px) + 30px);left:calc(50% - 622px);width:132px;max-height:calc(100vh - var(--navh,53px) - 60px);overflow:auto;flex-direction:column;gap:2px;padding:0 0 0 10px;background:none;backdrop-filter:none;-webkit-backdrop-filter:none;border:0;border-left:1px solid var(--line)}
+  /* The menu has its own column beside the content: it scrolls with the page sideways and can't sit over it. */
+  .pagecols{display:grid;grid-template-columns:132px minmax(0,1000px);column-gap:16px;justify-content:center;align-items:start}
+  .pagecols>.wrap{margin:0;max-width:none;min-width:0}
+  .secnav{position:sticky;top:calc(var(--navh,53px) + 30px);margin-top:34px;align-self:start;width:auto;max-height:calc(100vh - var(--navh,53px) - 60px);overflow:auto;flex-direction:column;gap:2px;padding:0 0 0 10px;background:none;backdrop-filter:none;-webkit-backdrop-filter:none;border:0;border-left:1px solid var(--line)}
   .secnav a{border:0;background:none;border-radius:calc(var(--radius) - 6px);padding:5px 9px;white-space:normal;line-height:1.35}
   .secnav a.on{background:var(--accent-soft)}
 }
 @media print{.secnav{display:none}}
 </style>
-<nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
+<div class=pagecols><nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
@@ -3420,6 +3423,12 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 {% if writebacks or deposits %}
 <h2 id=sec-record style="font-size:15px">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
 <div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. Money moved between your own accounts: pick the other account under <em>Transfer</em> and it's recorded as one transfer (same currency only). Money received from a customer: pick <em>Accounts Receivable</em> and the customer, and it's recorded as a payment against their name. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div>
+{% if rec_job %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">Recording in QuickBooks: <b class=rj-n>{{ rec_job.n }}</b> of {{ rec_job.total }} lines done ({{ rec_job.done }} recorded so far). The list updates when it finishes.</div>
+<script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
+function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
+  if(j.state==='running'){b.querySelector('.rj-n').textContent=j.n;setTimeout(tick,3000)}
+  else{location.hash='sec-record';location.reload()}}).catch(function(){setTimeout(tick,6000)})}
+setTimeout(tick,3000)})();</script>{% endif %}
 <form method=post action="{{ url_for('record', name=name) }}" id=recform>
 {% if draft_meta %}<div class=savedsel>Showing the selection saved by {{ draft_meta.by or 'a user' }} on {{ draft_meta.at.strftime('%Y-%m-%d %H:%M') }}. <button type=submit formaction="{{ url_for('record_discard', name=name) }}" class=btn-sm data-busy="Discarding the saved selection...">Discard it</button></div>{% endif %}
 <table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
@@ -3762,7 +3771,7 @@ update(false);
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
 {% endif %}
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
-</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
+</div></div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
 <script>(function(){
 var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
@@ -4335,6 +4344,15 @@ def detail(name):
     acct_uuid, atype, ccy, acct_qbo = row
     d = compute_detail(cur, acct_uuid, atype, acct_qbo)
     cur.close(); conn.close()
+    rec_job = record_job(name)
+    if rec_job and rec_job.get("state") in ("done", "failed", "stalled") and \
+            rec_job.get("started") != session.get("rec_seen:" + name):   # each job's result shown once
+        extra = rec_job.get("msg") if rec_job["state"] != "stalled" else (
+            f"Recording stopped before finishing ({rec_job.get('n')} of {rec_job.get('total')} lines done). "
+            f"Lines already recorded show as recorded; record the rest again.")
+        session["detail_msg"] = " ".join(x for x in (extra, session.get("detail_msg")) if x)
+        session["rec_seen:" + name] = rec_job.get("started")
+    d["rec_job"] = rec_job if rec_job and rec_job.get("state") == "running" else None
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None),
@@ -4567,22 +4585,104 @@ def unmatch(name, match_id):
     return redirect(url_for("detail", name=name) + "#sec-manual")
 
 
+RECORD_BG_MIN = 4          # this many lines or more are recorded in the background
+RECORD_STALE_SECS = 600    # a recording job silent this long was lost (a restart); say so
+TWIN_DAYS = 3              # an entry QuickBooks already has: same amount, dated this close
+
+
+def _record_key(name):
+    return f"record_job:{name}"
+
+
+def record_job(name):
+    """The account's latest background recording, or None. A running one gone silent is 'stalled'."""
+    try:
+        job = json.loads(get_config(_record_key(name)) or "null")
+    except ValueError:
+        return None
+    if job and job.get("state") == "running" and time.time() - (job.get("beat") or 0) > RECORD_STALE_SECS:
+        job["state"] = "stalled"
+    return job
+
+
+def start_record_job(name, form, ids, user):
+    """Record these lines in a background thread; the page shows progress and then the result."""
+    job = {"state": "running", "by": user, "started": time.time(), "beat": time.time(), "total": len(ids),
+           "n": 0, "done": 0, "msg": ""}
+    set_config(_record_key(name), json.dumps(job))
+
+    def progress(n, total, done):
+        job.update(n=n, total=total, done=done, beat=time.time())
+        set_config(_record_key(name), json.dumps(job))
+
+    def run():
+        try:
+            msg = _record_run(name, form, ids, user, progress)
+            job.update(state="done", msg=msg, n=job["total"], finished=time.time())
+        except Exception as e:
+            job.update(state="failed", finished=time.time(),
+                       msg=f"Recording stopped: {e}. Lines already recorded show as recorded; check the rest.")
+        set_config(_record_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="qbo-record").start()
+
+
+def _words(t):
+    stop = {"the", "and", "for", "from", "with", "ltd", "limited", "payment", "charges", "charge", "fee", "fees"}
+    return {w for w in re.findall(r"[a-z0-9]{3,}", (t or "").lower()) if w not in stop}
+
+
+def same_text(a, b):
+    """Same description or payee, allowing for the bank's extra words: most of the shorter one's words
+    appear in the other (or the two are equal)."""
+    if (a or "").strip().lower() == (b or "").strip().lower() and (a or "").strip():
+        return True
+    wa, wb = _words(a), _words(b)
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / min(len(wa), len(wb)) >= 0.5
+
+
 @app.route("/account/<name>/record", methods=["POST"])
 def record(name):
-    """Record selected unmatched bank lines in QuickBooks: Purchase for money out, Deposit for money in,
-    or a Transfer when the chosen account is another of your own bank/card accounts."""
+    """Record selected unmatched bank lines in QuickBooks. Four lines or more go to a background job,
+    so a long batch isn't cut off by the server's time limit (the page shows its progress)."""
+    form = request.form.to_dict(flat=True)
+    ids = [form["only"]] if form.get("only") else list(dict.fromkeys(request.form.getlist("sel")))
+    user = session.get("name")
+    back = redirect(url_for("detail", name=name) + "#sec-record")
+    job = record_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = (f"Still recording {job.get('total')} lines for this account "
+                                 f"({job.get('n')} done). Wait for it to finish, then record the rest.")
+        return back
+    if SYNC_IN_BACKGROUND and len(ids) >= RECORD_BG_MIN:
+        start_record_job(name, form, ids, user)
+        return back
+    session["detail_msg"] = _record_run(name, form, ids, user)
+    return back
+
+
+@app.route("/account/<name>/record_status")
+def record_status(name):
+    job = record_job(name) or {}
+    return {k: job.get(k) for k in ("state", "n", "total", "done", "msg")}
+
+
+def _record_run(name, form, ids, user, progress=None):
+    """Record these bank lines in QuickBooks: Purchase for money out, Deposit for money in, a Transfer
+    to another of your own accounts, a customer Payment, a split or a hedge. A line QuickBooks already
+    has is matched to it instead. Returns the message saying how it went."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
     arow = cur.fetchone()
     if not arow:
-        cur.close(); conn.close(); return "Unknown account", 404
+        cur.close(); conn.close(); return "Unknown account."
     acct_uuid, acct_qbo, atype, ccy = arow
-    ids = [request.form["only"]] if request.form.get("only") else request.form.getlist("sel")
     s = _latest_statement(cur, acct_uuid)
     if not ids or not s or not acct_qbo:
         cur.close(); conn.close()
-        session["detail_msg"] = "Nothing to record." if acct_qbo else "This account isn't linked to QuickBooks."
-        return redirect(url_for("detail", name=name) + "#sec-record")
+        return "Nothing to record." if acct_qbo else "This account isn't linked to QuickBooks."
     coa = {a["id"]: a for a in load_coa(cur, ccy)}
     home = qbo_home_currency(cur)
     foreign = ccy if ccy and home and ccy != home else None     # e.g. USD in a UGX company
@@ -4608,16 +4708,22 @@ def record(name):
                    ORDER BY sl.posted_date;""", (s[0], ids))
     lines = cur.fetchall()
     dups = possible_duplicates(cur, acct_uuid, lines)
+    pool = book_pool(cur, acct_uuid, s[0], s[1], s[2])
+    cur.execute("""SELECT mbt.txn_id::text FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
+                   WHERE m.statement_id=%s AND m.status='confirmed';""", (s[0],))
+    taken = {r[0] for r in cur.fetchall()}
     cur.close(); conn.close()
-    done, problems, skipped, no_acct = 0, [], 0, 0
+    done, problems, skipped, no_acct, twins = 0, [], 0, 0, 0
     token, touched = None, set()
-    for lid, d, amt, desc in lines:
+    for n_line, (lid, d, amt, desc) in enumerate(lines):
+        if progress:
+            progress(n_line, len(lines), done)
         lid = str(lid)
         label = f"{d} {desc[:30]}"
         out = _money_out(amt, atype)
-        if request.form.get(f"hedge_{lid}") == "1":
+        if form.get(f"hedge_{lid}") == "1":
             r_ = _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home, hacc, hnames, names,
-                               dups, touched, token)
+                               dups, touched, token, form, user)
             token = r_.get("token") or token
             if r_.get("problem"):
                 problems.append(r_["problem"])
@@ -4626,7 +4732,7 @@ def record(name):
             continue
         # A split: several accounts for one bank line (an FX hedge with its gain or loss).
         parts = None
-        raw_split = (request.form.get(f"split_{lid}") or "").strip()
+        raw_split = (form.get(f"split_{lid}") or "").strip()
         if raw_split:
             try:
                 parts = [(str(p["a"]), Decimal(str(p["v"]).replace(",", ""))) for p in json.loads(raw_split)
@@ -4640,10 +4746,10 @@ def record(name):
             elif sum((v for _, v in parts), Decimal(0)) != abs(amt):
                 problems.append(f"{label}: the split lines add up to {_money(sum((v for _, v in parts), Decimal(0)))}, "
                                 f"not {_money(abs(amt))}"); continue
-        pick = request.form.get(f"acct_{lid}") or ""
+        pick = form.get(f"acct_{lid}") or ""
         acc = None if parts else (coa.get(pick) or xt.get(pick))
         if not acc and not parts:
-            if request.form.get("only"):
+            if form.get("only"):
                 problems.append(f"{label}: choose an account")
             else:
                 no_acct += 1     # left empty on purpose: not recorded, stays in the list
@@ -4654,16 +4760,12 @@ def record(name):
             problems.append(f"{label}: choose the bank the card was paid from (refunds are recorded in QuickBooks)"); continue
         if is_ar and out:
             problems.append(f"{label}: money out can't be a customer payment; record refunds in QuickBooks"); continue
-        if dups.get(lid) and not request.form.get(f"dupok_{lid}"):
-            x = dups[lid][0]
-            problems.append(f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
-                            f"match it instead, or tick 'Not a duplicate'"); continue
-        payee = (request.form.get(f"payee_{lid}") or "").strip()
+        payee = (form.get(f"payee_{lid}") or "").strip()
         # Only reuse the learned payee ID if the user kept the suggested payee name.
-        ref = request.form.get(f"pref_{lid}") or None
-        if payee != (request.form.get(f"psug_{lid}") or "").strip():
+        ref = form.get(f"pref_{lid}") or None
+        if payee != (form.get(f"psug_{lid}") or "").strip():
             ref = None
-        cust = request.form.get(f"cust_{lid}") or ""
+        cust = form.get(f"cust_{lid}") or ""
         kids = None
         if is_ar:
             if cust not in customers and ref and ref.startswith("Customer:") and ref.split(":", 1)[1] in customers:
@@ -4672,7 +4774,7 @@ def record(name):
                 problems.append(f"{label}: choose the customer it was received from"); continue
             payee = customers[cust]
             # A parent's lump sum split between some or all of their children (sub-customers).
-            raw_kids = (request.form.get(f"kids_{lid}") or "").strip()
+            raw_kids = (form.get(f"kids_{lid}") or "").strip()
             if raw_kids:
                 try:
                     kids = [(str(k["c"]), Decimal(str(k["v"]).replace(",", ""))) for k in json.loads(raw_kids)
@@ -4689,7 +4791,7 @@ def record(name):
                                     f"{_money(sum((v for _, v in kids), Decimal(0)))}, not {_money(abs(amt))}"); continue
         rate = None
         if foreign:
-            typed = (request.form.get(f"rate_{lid}") or "").replace(",", "").strip()
+            typed = (form.get(f"rate_{lid}") or "").replace(",", "").strip()
             if typed:
                 try:
                     rate = float(typed)
@@ -4704,7 +4806,22 @@ def record(name):
                 except Exception:
                     problems.append(f"{label}: QuickBooks has no {foreign} rate for {d}. Type the rate "
                                     f"({home} per {foreign}) in the Rate box and record again"); continue
-        if not _claim_writeback(lid, session.get("name")):
+        if not kids:
+            twin = next((t for t in pool if str(t[0]) not in taken and t[2] == amt and abs((t[1] - d).days) <= TWIN_DAYS
+                         and (same_text(t[3], desc) or (payee and same_text(t[3], payee)))), None)
+            if twin:
+                # QuickBooks already has it: pair the line with that entry; nothing is created or changed.
+                c2 = get_conn(); k2 = c2.cursor()
+                _confirm_match(k2, s[0], [lid], [str(twin[0])], user)
+                k2.execute("DELETE FROM record_draft WHERE line_id=%s;", (lid,))
+                c2.commit(); k2.close(); c2.close()
+                taken.add(str(twin[0])); twins += 1
+                continue
+        if dups.get(lid) and not form.get(f"dupok_{lid}"):
+            x = dups[lid][0]
+            problems.append(f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
+                            f"match it instead, or tick 'Not a duplicate'"); continue
+        if not _claim_writeback(lid, user):
             skipped += 1; continue
         used_ref, fqn = None, (acc or {}).get("fqn")
         try:
@@ -4753,7 +4870,7 @@ def record(name):
                               RETURNING txn_id;""",
                            (ORG_ID, acct_uuid, pid, d, v, ccy or "USD", desc, customers[c_id], f"Customer:{c_id}"))
                 tids.append(str(k2.fetchone()[0]))
-            _confirm_match(k2, s[0], [lid], tids)
+            _confirm_match(k2, s[0], [lid], tids, user)
         elif new_id:
             book_amt = abs(amt) if (atype == "credit_card" or not out) else -abs(amt)
             # The same row the next sync reads back (journal entries as the sync describes them).
@@ -4775,7 +4892,13 @@ def record(name):
         _after_review(s[0])
     if touched:   # the other side of each transfer can clear on its own statement straight away
         c2 = get_conn(); k2 = c2.cursor(); rematch_open(k2, touched); k2.close(); c2.close()
-    msg = f"Recorded {done} transaction{'' if done == 1 else 's'} in QuickBooks." if done else ""
+    asked = len(ids)
+    msg = (f"Recorded {done} of {asked} selected transaction{'' if asked == 1 else 's'} in QuickBooks."
+           if done and asked > 1 else f"Recorded {done} transaction{'' if done == 1 else 's'} in QuickBooks." if done else "")
+    if twins:
+        msg += (f" {twins} {'was' if twins == 1 else 'were'} already in QuickBooks, so "
+                f"{'it was' if twins == 1 else 'they were'} matched to the existing "
+                f"entr{'y' if twins == 1 else 'ies'} instead (nothing created or changed).")
     if skipped:
         msg += f" Skipped {skipped} already recorded or in progress."
     if no_acct:
@@ -4783,21 +4906,21 @@ def record(name):
                 f"{'it was' if no_acct == 1 else 'they were'} left for later.")
     if problems:
         msg += " Not recorded: " + "; ".join(problems[:5]) + (" …" if len(problems) > 5 else "")
-    session["detail_msg"] = msg.strip() or "Nothing to record."
-    return redirect(url_for("detail", name=name) + "#sec-record")
+    return msg.strip() or "Nothing to record."
 
 
-def _confirm_match(cur, sid, lids, tids):
+def _confirm_match(cur, sid, lids, tids, user=None):
     """Match bank lines to the entries just recorded for them, as if matched by hand."""
     mid = str(uuid.uuid4())
     cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
                                       created_by, confirmed_by, confirmed_at)
-                   VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, sid, session.get("name") or "user"))
+                   VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, sid, user or "user"))
     execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", [(mid, l) for l in lids])
     execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, t) for t in tids])
 
 
-def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home, hacc, hnames, names, dups, touched, token):
+def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home, hacc, hnames, names, dups, touched, token,
+                  form=None, user=None):
     """One leg of a forward deal, the way the books have always recorded them:
     USD out  -> Transfer USD bank -> FX in Transit (USD) -> FX in Transit UGX, at the month's rate;
     UGX in   -> Deposit: FX in Transit UGX (USD x the month's rate) + Forex Gain (the difference)."""
@@ -4805,7 +4928,7 @@ def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home,
     if not hi:
         return {"problem": f"{label}: no forward deal number in the bank's text"}
     try:
-        rate = Decimal((request.form.get(f"hedge_rate_{lid}") or "").replace(",", "").strip())
+        rate = Decimal((form.get(f"hedge_rate_{lid}") or "").replace(",", "").strip())
         assert rate > 0
     except Exception:
         return {"problem": f"{label}: type this month's transaction rate for deal {hi['deal']}"}
@@ -4814,18 +4937,18 @@ def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home,
     if missing:
         what = {"transit": f"FX in Transit ({hi['ccy']})", "transit_home": f"FX in Transit {home}", "gain": "Forex Gain"}
         return {"problem": f"{label}: no {', '.join(what[k] for k in missing)} account in QuickBooks"}
-    if dups.get(lid) and not request.form.get(f"dupok_{lid}"):
+    if dups.get(lid) and not form.get(f"dupok_{lid}"):
         x = dups[lid][0]
         return {"problem": f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
                            f"match it instead, or tick 'Not a duplicate'"}
     usd = None
     if not out:
         try:
-            usd = Decimal((request.form.get(f"hedge_usd_{lid}") or "").replace(",", "").strip())
+            usd = Decimal((form.get(f"hedge_usd_{lid}") or "").replace(",", "").strip())
             assert usd > 0
         except Exception:
             return {"problem": f"{label}: type the {hi['ccy']} amount of deal {hi['deal']}"}
-    if not _claim_writeback(lid, session.get("name")):
+    if not _claim_writeback(lid, user):
         return {}
     conn = get_conn(); cur = conn.cursor()
     cur.execute("INSERT INTO app_config (key, value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;",

@@ -6,7 +6,7 @@ QuickBooks is fully mocked -- no network.
 
 Run on its own with `python tests/suite_ui.py`, or all suites with `python tests/run_all.py`.
 """
-import io, os, shutil, subprocess, sys, tempfile
+import io, os, re, shutil, subprocess, sys, tempfile
 
 import harness as H
 
@@ -123,6 +123,12 @@ for (const drop of [false, true]) {
     if res.stderr.strip():
         print(res.stderr[-1500:])
     check("section menu script ran without errors", len(got) == 2 and "Error" not in res.stderr)
+    html_ = page.data.decode()
+    css = re.search(r"\.secnav\{.*?@media print", html_, re.S).group(0)
+    check("side menu has its own column beside the content (it can't overlap it)",
+          "<div class=pagecols><nav id=secnav" in html_ and "</div></div><div class=appfoot>" in html_
+          and "grid-template-columns:132px minmax(0,1000px)" in css)
+    check("…and is never pinned over the page", "position:fixed" not in css)
     full, dropped = (got + [{}, {}])[:2]
     import re
     def count(text):
