@@ -1181,6 +1181,20 @@ def match_sides(cur, match_ids):
     return sls, bts
 
 
+def match_items(cur, match_ids):
+    """{match_id: ([line_id], [txn_id])}: the items behind each match, for editing it by hand."""
+    out = {}
+    ids = [str(m) for m in match_ids]
+    if ids:
+        cur.execute("SELECT match_id, line_id FROM match_statement_line WHERE match_id = ANY(%s::uuid[]);", (ids,))
+        for mid, lid in cur.fetchall():
+            out.setdefault(str(mid), ([], []))[0].append(str(lid))
+        cur.execute("SELECT match_id, txn_id FROM match_book_txn WHERE match_id = ANY(%s::uuid[]);", (ids,))
+        for mid, tid in cur.fetchall():
+            out.setdefault(str(mid), ([], []))[1].append(str(tid))
+    return out
+
+
 def _claim_writeback(line_id, user):
     """Reserve a line for writing. Refuses if it's already done or an attempt is in flight --
     an interrupted attempt stays blocked until someone confirms it didn't reach QuickBooks."""
@@ -3114,6 +3128,8 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}" class=btnrow>
 {% if r.status=='proposed' %}<button type=submit name=status value=confirmed class=btn-sm>Confirm</button><button type=submit name=status value=rejected class=btn-sm>Reject</button>
 {% else %}<button type=submit name=status value=proposed class=btn-sm>Undo</button>{% endif %}
+{% if r.status=='confirmed' %}<button type=submit name=status value=edit class=btn-sm title="Change which items this match pairs">Edit</button>
+{% else %}<button type=button class="btn-sm mm-edit" data-lines="{{ r.lids|join(',') }}" data-txns="{{ r.tids|join(',') }}" title="Change which items this match pairs">Edit</button>{% endif %}
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
@@ -3186,6 +3202,8 @@ if(f)f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='
 {% endif %}
 {% if all_unmatched and in_books %}
 <form method=post action="{{ url_for('manual_match', name=name) }}" id=mmform>
+<input type=hidden name=orig id=mmorig value="">
+<div id=mmnote style="display:none;background:#eef4ff;border:1px solid #c7d7f5;color:#1e3a6e;padding:8px 12px;border-radius:9px;font-size:13px;margin:0 0 10px">Editing a suggested match: its items are ticked below. Untick the ones that don't belong, tick the right ones, then press <b>Match selected</b>. The old suggestion is then marked rejected.</div>
 <div class=mmgrid>
 <div class=mmcol><div class=mmhead>Bank statement ({{ all_unmatched|length }}) <input class=mmsearch data-list=mml placeholder="Search" aria-label="Search bank lines"></div>
 <div class=mmlist id=mml>{% for lid, d, a, who in all_unmatched %}<label class=mmrow data-amt="{{ a }}" data-date="{{ d }}" data-text="{{ who|lower }} {{ a }} {{ d }}"><input type=checkbox name=ml value="{{ lid }}"><span class=hint>{{ d }}</span><span class=mmw title="{{ who }}">{{ who }}</span><span class=a>{{ a|money }}</span></label>{% endfor %}</div></div>
@@ -3223,11 +3241,27 @@ document.getElementById('mmb').addEventListener('change',function(){update(false
 document.querySelectorAll('.mmsearch').forEach(function(inp){inp.addEventListener('input',function(){
   var q=inp.value.trim().toLowerCase().replace(/,/g,'');
   rowsOf(inp.getAttribute('data-list')).forEach(function(r){r.style.display=!q||r.getAttribute('data-text').indexOf(q)>-1?'':'none'})})});
-document.querySelectorAll('.mm-open').forEach(function(b){b.addEventListener('click',function(){
+// Tick these items (and only these), show them at the top of each list, and go to the form.
+function pick(ls,ts,orig){
   f.querySelectorAll('input[type=checkbox]').forEach(function(c){c.checked=false});
-  var l=f.querySelector('input[name=ml][value="'+b.getAttribute('data-line')+'"]'),t=f.querySelector('input[name=mb][value="'+b.getAttribute('data-txn')+'"]');
-  if(l)l.checked=true;if(t)t.checked=true;update(true);
-  document.getElementById('sec-manual').scrollIntoView({behavior:'smooth',block:'start'});})});
+  document.querySelectorAll('.mmsearch').forEach(function(inp){inp.value=''});
+  rowsOf('mml').concat(rowsOf('mmb')).forEach(function(r){r.style.display=''});
+  [['ml',ls,'mml'],['mb',ts,'mmb']].forEach(function(s){
+    var box=document.getElementById(s[2]);
+    s[1].slice().reverse().forEach(function(id){var c=f.querySelector('input[name='+s[0]+'][value="'+id+'"]');
+      if(c){c.checked=true;box.insertBefore(c.parentNode,box.firstChild)}});box.scrollTop=0});
+  document.getElementById('mmorig').value=orig||'';
+  document.getElementById('mmnote').style.display=orig?'':'none';
+  update(true);
+  var sec=document.getElementById('sec-manual');if(sec&&sec.scrollIntoView)sec.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function ids(b,a){return (b.getAttribute(a)||'').split(',').filter(Boolean)}
+document.querySelectorAll('.mm-open').forEach(function(b){b.addEventListener('click',function(){
+  pick([b.getAttribute('data-line')],[b.getAttribute('data-txn')],'');})});
+document.querySelectorAll('.mm-edit').forEach(function(b){b.addEventListener('click',function(){
+  var ls=ids(b,'data-lines'),ts=ids(b,'data-txns');pick(ls,ts,ls.join(',')+'|'+ts.join(','));})});
+var E={{ mm_edit|tojson }};
+if(E)pick(E.l,E.t,E.l.join(',')+'|'+E.t.join(','));
 f.addEventListener('submit',function(e){if(diff!==0&&!confirm('The two sides differ by '+fmt(diff)+'. Match anyway? The difference will show under amount differences.'))e.preventDefault()});
 update(false);
 })();</script>
@@ -3486,9 +3520,12 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                    WHERE statement_id=%s AND created_by='user' AND status='confirmed' ORDER BY confirmed_at;""", (sid,))
     umatches = cur.fetchall()
     sls_by, bts_by = match_sides(cur, [r[0] for r in rmatches] + [r[0] for r in umatches])
+    items = match_items(cur, [r[0] for r in rmatches])
     for mid, mtype, status, delta in rmatches:
+        lids, tids = items.get(str(mid), ([], []))
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
-                           "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])})
+                           "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), []),
+                           "lids": lids, "tids": tids})
     user_matches = [{"id": mid, "delta": delta, "by": by, "at": at,
                      "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), [])}
                     for mid, delta, by, at in umatches]
@@ -3708,7 +3745,8 @@ def detail(name):
     cur.close(); conn.close()
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
-                                  src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None), **d)
+                                  src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None),
+                                  mm_edit=session.pop("mm_edit", None), **d)
 
 
 def _form_amount(field):
@@ -3822,16 +3860,23 @@ def _after_review(sid):
 @app.route("/account/<name>/review/<match_id>", methods=["POST"])
 def review_match(name, match_id):
     new_status = request.form.get("status")
+    edit = new_status == "edit"      # a confirmed suggestion to change: back to review, then pick its items
+    if edit:
+        new_status = "proposed"
     if new_status in ("confirmed", "rejected", "proposed"):
         conn = get_conn(); cur = conn.cursor()
         cur.execute("""UPDATE match SET status=%s, confirmed_by=%s, confirmed_at=now(), updated_at=now()
                        WHERE match_id=%s AND statement_id IN (SELECT s.statement_id FROM statement s
                          JOIN account a ON a.account_id=s.account_id WHERE a.name=%s)
                        RETURNING statement_id;""", (new_status, session.get("name"), match_id, name))
-        row = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+        row = cur.fetchone()
+        if row and edit:
+            lids, tids = match_items(cur, [match_id]).get(str(match_id), ([], []))
+            session["mm_edit"] = {"l": lids, "t": tids}
+        conn.commit(); cur.close(); conn.close()
         if row:
             _after_review(row[0])
-    return redirect(url_for("detail", name=name) + "#sec-review")
+    return redirect(url_for("detail", name=name) + ("#sec-manual" if edit else "#sec-review"))
 
 
 @app.route("/account/<name>/review_all", methods=["POST"])
@@ -3883,6 +3928,19 @@ def manual_match(name):
         session["detail_msg"] = "Some of those items were already matched or can't be matched to this statement. Reload and try again."
         return back
     delta = sum((l[1] for l in lines), Decimal(0)) - sum((t[2] for t in txns), Decimal(0))
+    replaced = False
+    orig = request.form.get("orig") or ""
+    if "|" in orig:
+        ol, ot = (set(filter(None, x.split(","))) for x in orig.split("|", 1))
+        if (ol, ot) != (set(lids), set(tids)):
+            cur.execute("""SELECT m.match_id, array(SELECT line_id::text FROM match_statement_line WHERE match_id=m.match_id),
+                                  array(SELECT txn_id::text FROM match_book_txn WHERE match_id=m.match_id)
+                           FROM match m WHERE m.statement_id=%s AND m.status='proposed' AND m.created_by<>'user';""", (sid,))
+            old = [m for m, ls, ts in cur.fetchall() if (set(ls), set(ts)) == (ol, ot)]
+            if old:
+                cur.execute("""UPDATE match SET status='rejected', confirmed_by=%s, confirmed_at=now(), updated_at=now()
+                               WHERE match_id = ANY(%s::uuid[]);""", (session.get("name"), [str(m) for m in old]))
+                replaced = True
     mid = str(uuid.uuid4())
     cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
                                       created_by, confirmed_by, confirmed_at)
@@ -3894,7 +3952,8 @@ def manual_match(name):
     _after_review(sid)   # re-match the rest around it; suggestions that used these items are replaced
     session["detail_msg"] = (f"Matched {len(lines)} bank line{'' if len(lines) == 1 else 's'} to {len(txns)} "
                              f"QuickBooks transaction{'' if len(txns) == 1 else 's'}."
-                             + (f" The difference of {_money(delta)} shows under amount differences." if delta else ""))
+                             + (f" The difference of {_money(delta)} shows under amount differences." if delta else "")
+                             + (" The suggestion you edited is marked rejected." if replaced else ""))
     return back
 
 
