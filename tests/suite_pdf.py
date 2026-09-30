@@ -12,7 +12,8 @@ import harness as H
 from pdfgen import make_pdf, encrypt
 
 ACCT = "00000000-0000-0000-0000-0000000000a1"
-A, c = H.setup(H.account_sql((ACCT, "35", "Stanbic", "bank")))
+ACCT2 = "00000000-0000-0000-0000-0000000000a2"
+A, c = H.setup(H.account_sql((ACCT, "35", "Stanbic", "bank"), (ACCT2, "36", "DFCU USD 12477", "bank")))
 cur = c.cursor()
 T = H.Checker()
 check = T.check
@@ -35,10 +36,10 @@ def n_stmts():
     return q("SELECT count(*) FROM statement")[0][0]
 
 cl = H.login(A)
-def upload(pdf, name="statement.pdf", **form):
-    r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(pdf), name), **form},
+def upload(pdf, name="statement.pdf", acct="Stanbic", **form):
+    r = cl.post(f"/account/{acct}/upload", data={"statement": (io.BytesIO(pdf), name), **form},
                 content_type="multipart/form-data")
-    return r, cl.get("/account/Stanbic").data.decode()
+    return r, cl.get(f"/account/{acct}").data.decode()
 
 
 # ---- 1. Debit / Credit / Balance columns, two pages, wrapped descriptions ----------------------
@@ -169,6 +170,67 @@ r, page = upload(LOCKED, pdf_password="Kampala#2026")
 check("right password: imported", len(lines()) == 6 and "every running balance checks out" in page)
 check("password never stored", not q("SELECT 1 FROM app_config WHERE value LIKE %s", ("%Kampala#2026%",))
       and "Kampala#2026" not in page)
+
+# ---- 7. DFCU layout: a day's lines out of posting order, descriptions starting above the date ----
+wipe()
+def drow(y, d, deb, cre, bal, desc=None):
+    it = [(26, y, d), (93, y, d), (BC, y, bal, "r")]
+    if desc: it.append((160, y, desc))
+    if deb: it.append((DC, y, deb, "r"))
+    if cre: it.append((CC, y, cre, "r"))
+    return it
+DFCU = make_pdf([[(26, 40, "STATEMENT OF ACCOUNT"),
+    (26, 55, "Account Name : NORTH GREEN EDUCATIONAL SERVICES LIMITED Account Number : 02183656112477"),
+    (26, 70, "Statement Period : 01-06-2026 To 30-06-2026"), (26, 85, "Opening Bal. 27,161.46"),
+    (26, 100, "TRAN DATE"), (93, 100, "VALUE DATE"), (160, 100, "DESCRIPTION"), (DC, 100, "DEBIT", "r"),
+    (CC, 100, "CREDIT", "r"), (BC, 100, "BALANCE", "r"),
+    *drow(115, "02-06-2026", None, "400.00", "27,561.46", "CSD:WILLETTE YR 8"),
+    # printed cheque first, but its balance is after the two charges below it
+    *drow(130, "05-06-2026", "2,687.00", None, "24,866.73", "CHQW EDITH SUUBI"),
+    *drow(145, "05-06-2026", "6.72", None, "27,554.74", "Cash Withdrawl Charges"),
+    *drow(160, "05-06-2026", "1.01", None, "27,553.73", "Government excise duty"),
+    *drow(175, "15-06-2026", "2.00", None, "24,864.73", "INWARD RTGS CHARGES"),
+    (160, 188, "RTGS1:THE NORTH GREEN SCHOOL NORTH"),
+    *drow(193, "15-06-2026", None, "11,000.00", "35,864.43"),
+    (160, 198, "GREEN:OWN TRAN"),
+    *drow(213, "15-06-2026", "0.30", None, "24,864.43", "Govt excise duty"),
+    (160, 226, "FXPLSP~1160575~SPOT~SELL~USD/UGX~3,720"),
+    *drow(231, "15-06-2026", None, "400.00", "36,264.43"),
+    (160, 236, ".00")]])
+r, page = upload(DFCU, acct="DFCU USD 12477")
+got = q("""SELECT sl.posted_date::text, sl.amount, sl.description FROM statement_line sl JOIN statement s USING (statement_id)
+           WHERE s.account_id=%s ORDER BY sl.posted_date, sl.amount""", (ACCT2,))
+check("same-day lines out of posting order: accepted, every balance checked", len(got) == 8
+      and "every running balance checks out" in page)
+check("description above the date belongs to the line below it", ("2026-06-15", D("11000.00"),
+      "RTGS1:THE NORTH GREEN SCHOOL NORTH GREEN:OWN TRAN") in got and ("2026-06-15", D("-2.00"), "INWARD RTGS CHARGES") in got)
+check("a number split over two lines put back together", ("2026-06-15", D("400.00"),
+      "FXPLSP~1160575~SPOT~SELL~USD/UGX~3,720.00") in got)
+s2 = q("SELECT opening_balance, closing_balance FROM statement WHERE account_id=%s", (ACCT2,))[0]
+check("…opening and closing from the day's real order", s2 == (D("27161.46"), D("36264.43")))
+wipe()
+SHUFFLED_WRONG = make_pdf([[*hdr(90),
+    *row(105, "03/01/2026", "DEPOSIT", None, "500,000.00", "1,500,000.00"),
+    *row(120, "04/01/2026", "FEE", "1,000.00", None, "1,399,000.00"),
+    *row(135, "04/01/2026", "WITHDRAWAL", "100,000.00", None, "1,450,000.00")]])   # no order makes these chain
+r, page = upload(SHUFFLED_WRONG)
+check("same-day lines that chain in no order: still refused", n_stmts() == 0 and "doesn&#39;t add up" in page)
+
+# ---- 8. the statement's account number against the account it's uploaded to --------------------
+wipe()
+r, page = upload(DFCU)
+check("another account's statement: refused, naming the right account", n_stmts() == 0
+      and "02183656112477" in page and "looks like DFCU USD 12477, not Stanbic" in page)
+r, page = upload(DFCU, acct="DFCU USD 12477")
+check("…and imported on that account", n_stmts() == 1)
+wipe()
+r, page = upload(DFCU.replace(b"02183656112477", b"02183656199999"))
+check("an account number no account's name matches: imported", n_stmts() == 1)
+wipe()
+OFX = (b"<OFX><BANKACCTFROM><ACCTID>02183656112477</ACCTID></BANKACCTFROM><BANKTRANLIST>"
+       b"<STMTTRN><DTPOSTED>20260602<TRNAMT>400.00<NAME>X</STMTTRN></BANKTRANLIST></OFX>")
+r, page = upload(OFX, "s.ofx")
+check("OFX for another account: refused too", n_stmts() == 0 and "looks like DFCU USD 12477" in page)
 
 # ---- 6. the page -------------------------------------------------------------------------------
 check("upload box takes PDFs and has a password field", "accept=.pdf,.csv,.ofx" in page and "name=pdf_password" in page)

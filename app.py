@@ -2080,6 +2080,7 @@ class _Rows(list):
     def __init__(self, *a):
         super().__init__(*a); self.skipped = []; self.opening = self.closing = None
         self.period_start = self.period_end = None
+        self.account_number = None     # as the statement prints it, when it does
 
 
 def _parse_ledger(text, want_category=False):
@@ -2305,8 +2306,63 @@ def _pdf_money_tail(words, cols):
     return words[:i], money
 
 
+def _pdf_join(desc, more):
+    """A wrapped description line added to the text above it. A number split across lines
+    ("~3,720" then ".00") is put back together."""
+    if not desc:
+        return more
+    if more.startswith(".") or (desc.endswith(".") and desc[-2:-1].isdigit() and more[:1].isdigit()):
+        return desc + more
+    return desc + " " + more
+
+
 def _signed(t):
     return bool(re.search(r"^\(|^-|-$|\)$|(CR|DR)$", t.strip(), re.I))
+
+
+def _pdf_day_order(group, before):
+    """The lines of one day in an order where every balance follows from the one before, or None.
+
+    Some banks (DFCU) print a day's lines in a different order from the one they were posted in,
+    so each balance only chains with the right predecessor. From a given balance, the next line
+    must have balance == before + amount; lines that qualify share their amount and balance,
+    so taking any of them is as good as another."""
+    starts = [None] if before is not None else range(len(group))
+    for first in starts:
+        left, out, cur = list(group), [], before
+        if first is not None:
+            cur = left[first]["balance"]; out.append(left.pop(first))
+        while left:
+            k = next((i for i, r in enumerate(left) if r["balance"] == cur + r["amount"]), None)
+            if k is None:
+                break
+            cur = left[k]["balance"]; out.append(left.pop(k))
+        if not left:
+            return out
+    return None
+
+
+def _pdf_breaks(seq, start):
+    """(lines whose running balance doesn't add up, the lines in chained order).
+
+    Lines on the same date may be in any order, as long as they chain exactly."""
+    bad, out, before, i = [], [], start, 0
+    while i < len(seq):
+        j = i
+        while j < len(seq) and seq[j]["date"] == seq[i]["date"]:
+            j += 1
+        group = seq[i:j]
+        ordered = _pdf_day_order(group, before)
+        if ordered is None:
+            ordered = group
+            for r in group:
+                if before is not None and r["balance"] != before + r["amount"]:
+                    bad.append(r)
+                before = r["balance"]
+        out.extend(ordered)
+        before = ordered[-1]["balance"]
+        i = j
+    return bad, out
 
 
 def parse_pdf(data, password=None, opening_hint=None):
@@ -2339,13 +2395,15 @@ def parse_pdf(data, password=None, opening_hint=None):
     dayfirst = _detect_dayfirst([l[0]["text"] for pl in page_lines for l in pl if l])
 
     rows, raw, cols, opening, closing = _Rows(), [], None, None, None
+    desc_col = None      # where descriptions start, from the last line that had one
     for pl in page_lines:
         prev = None      # the transaction a wrapped description line belongs to (same page only)
+        above = None     # the last text-only line: it may start the next line's description (DFCU)
         for line in pl:
             text = " ".join(w["text"] for w in line)
             h = _pdf_header(line) if not _pdf_date(line, dayfirst)[0] else None
             if h:
-                cols, prev = h, None; continue
+                cols, prev, above = h, None, None; continue
             d, k = _pdf_date(line, dayfirst)
             body, money = _pdf_money_tail(line[k:] if d else line, cols)
             if d:
@@ -2359,21 +2417,36 @@ def parse_pdf(data, password=None, opening_hint=None):
                     opening = v if opening is None else opening
                 else:
                     closing = v
-                prev = None; continue
+                prev = above = None; continue
             if not d:
                 # A wrapped description: no numbers, lined up under the description, close below it.
+                owner = None
                 if (prev is not None and not money and not _PDF_SKIP.search(text)
                         and line[0]["x0"] >= prev["desc_x0"] - 4 and line[0]["top"] - prev["bottom"] < 14
                         and line[-1]["x1"] <= prev["money_x0"] + 2):
-                    prev["desc"] = (prev["desc"] + " " + text).strip()
+                    prev["desc"] = _pdf_join(prev["desc"], text)
                     prev["bottom"] = line[0]["bottom"]
+                    owner = prev
                 else:
                     prev = None
+                above = ({"text": text, "x0": line[0]["x0"], "bottom": line[0]["bottom"], "owner": owner}
+                         if not money and not _PDF_SKIP.search(text) else None)
                 continue
             if not money:
-                prev = None; continue
+                prev = above = None; continue
+            if not desc and above and line[0]["top"] - above["bottom"] < 14 and (
+                    desc_col is None or abs(above["x0"] - desc_col) <= 4):
+                # The description starts on the line above the date (DFCU centres the date on a
+                # wrapped description): it was taken as the end of the line before; it's this one's.
+                o = above["owner"]
+                if o is not None and o["desc"].endswith(above["text"]):
+                    o["desc"] = o["desc"][:-len(above["text"])].rstrip()
+                desc = above["text"]
+            above = None
+            if body:
+                desc_col = body[0]["x0"]
             r = {"date": d, "desc": desc, "debit": None, "credit": None, "amount": None, "balance": None,
-                 "known": False, "desc_x0": body[0]["x0"] if body else money[0]["x0"],
+                 "known": False, "desc_x0": body[0]["x0"] if body else (desc_col or money[0]["x0"]),
                  "money_x0": money[0]["x0"], "bottom": line[0]["bottom"]}
             if cols:
                 for w in money:
@@ -2433,15 +2506,9 @@ def parse_pdf(data, password=None, opening_hint=None):
 
     # Every running balance must agree, whichever way round the statement is sorted.
     if have_bal and len(raw) >= 1:
-        def breaks(seq, start):
-            bad, before = [], start
-            for r in seq:
-                if before is not None and r["balance"] != before + r["amount"]:
-                    bad.append(r)
-                before = r["balance"]
-            return bad
-        asc, desc_ = breaks(raw, opening), breaks(raw[::-1], opening)
-        bad = asc if len(asc) <= len(desc_) else desc_
+        asc, desc_ = _pdf_breaks(raw, opening), _pdf_breaks(raw[::-1], opening)
+        (bad, seq), is_asc = (asc, True) if len(asc[0]) <= len(desc_[0]) else (desc_, False)
+        raw = seq if is_asc else seq[::-1]      # same-day lines in the order the balances chain
         if bad:
             eg = "; ".join(f"{r['date']} {r['desc'][:30]} {_money(r['amount'])} (balance {_money(r['balance'])})" for r in bad[:3])
             raise ValueError(f"The running balance doesn't add up on {len(bad)} line{'' if len(bad) == 1 else 's'} of "
@@ -2470,7 +2537,40 @@ def parse_pdf(data, password=None, opening_hint=None):
         if a and b and a <= first and b >= last and (b - a).days <= 400:
             rows.period_start, rows.period_end = a, b
             break
+    rows.account_number = _statement_account_number(all_text)
     return rows
+
+
+def _statement_account_number(text):
+    """The account number a statement prints ("Account Number : 02183656112477", "A/C No. 9030 0123 4567")."""
+    m = re.search(r"\b(?:account|a/c|acct)\.?\s*(?:number|no\.?|num|#)\s*[:.]?\s*(\d[\d -]{4,}\d)", text, re.I)
+    return re.sub(r"\D", "", m.group(1)) if m else None
+
+
+def _name_digits(name):
+    m = re.search(r"(\d{4,})\s*$", name or "")
+    return m.group(1) if m else None
+
+
+def account_mismatch(name, number):
+    """Why a statement for account `number` doesn't belong in account `name`, or None.
+
+    Accounts carry no account number of their own, but their names end with its last digits
+    ("DFCU USD 12477"). A statement is refused only when its number ends with another
+    account's digits and not with this one's; a number nothing recognises is let through."""
+    if not number:
+        return None
+    own = _name_digits(name)
+    if own and number.endswith(own):
+        return None
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT name FROM account;")
+    others = [n for (n,) in cur.fetchall() if n != name and _name_digits(n) and number.endswith(_name_digits(n))]
+    cur.close(); conn.close()
+    if not others:
+        return None
+    return (f"This statement is for account number {number}, which looks like {others[0]}, not {name}. "
+            f"Nothing was imported. Open {others[0]} and upload it there.")
 
 
 def ingest_pdf(data, account_name, password=None, opening=None, closing=None, p_start=None, p_end=None):
@@ -3646,6 +3746,12 @@ def upload(name):
         opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
         if is_pdf:   # read it first: a wrong password shouldn't cost a QuickBooks sync
             pdf_rows = parse_pdf(data, request.form.get("pdf_password") or None, opening)
+        acctid = None if is_pdf else re.search(rb"<ACCTID>\s*([^<\r\n]+)", data, re.I)
+        wrong = account_mismatch(name, pdf_rows.account_number if is_pdf else
+                                 (re.sub(r"\D", "", acctid.group(1).decode("ascii", "ignore")) if acctid else None))
+        if wrong:
+            session["detail_msg"] = wrong
+            return redirect(url_for("detail", name=name))
     except ValueError as e:
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
