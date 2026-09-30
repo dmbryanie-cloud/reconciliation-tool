@@ -215,4 +215,20 @@ cl.post("/account/Stanbic USD/record", data={"only": F2, f"acct_{F2}": "83"})
 page = cl.get("/account/Stanbic USD").data.decode()
 check("no exchange rate: nothing sent, asks for the rate", len(POSTS) == n and "has no USD rate for 2026-09-28" in page
       and "Type the rate" in page)
+# ---- sync: amounts in each account's own currency -------------------------------------------------
+# QuickBooks gives a USD->UGX transfer as Amount 100 (USD) with ExchangeRate 3700; the UGX side is 370,000.
+A.qbo_query = _q
+QBO.append({"Id": "X1", "FromAccountRef": {"value": "37", "name": "Stanbic USD"}, "ToAccountRef": {"value": "35", "name": "Stanbic UGX"},
+            "Amount": 100, "CurrencyRef": {"value": "USD"}, "ExchangeRate": 3700, "TxnDate": "2026-09-29"})
+QBO.append({"Id": "X2", "FromAccountRef": {"value": "35", "name": "Stanbic UGX"}, "ToAccountRef": {"value": "36", "name": "Centenary UGX"},
+            "Amount": 5000, "CurrencyRef": {"value": "UGX"}, "ExchangeRate": 1, "TxnDate": "2026-09-29"})
+A.sync_from_quickbooks(full=True)
+def row(acct, tid):
+    return q1("SELECT amount, currency FROM book_txn WHERE account_id=%s AND source_txn_id=%s", (acct, tid))
+check("sync: USD side of a USD->UGX transfer stays in USD", row(USD, "X1") == (D("-100"), "USD"))
+check("sync: UGX side converted at the transfer's rate", row(UGX, "X1") == (D("370000.00"), "UGX"))
+check("sync: same-currency transfers unchanged", row(UGX, "X2") == (D("-5000"), "UGX") and row(CEN, "X2") == (D("5000"), "UGX"))
+check("sync: conversion helper leaves a record without a rate alone",
+      A._in_account_ccy(D("10"), {"CurrencyRef": {"value": "USD"}}, "UGX", "UGX") == D("10"))
 sys.exit(T.summary())
+

@@ -510,20 +510,21 @@ def _store_coa(accts):
 
 def _store_customers(custs):
     rows = [(str(c["Id"]), c.get("DisplayName"), c.get("FullyQualifiedName") or c.get("DisplayName"),
-             (c.get("CurrencyRef") or {}).get("value"), bool(c.get("Active", True))) for c in custs if c.get("Id")]
+             (c.get("CurrencyRef") or {}).get("value"), bool(c.get("Active", True)),
+             (c.get("ParentRef") or {}).get("value")) for c in custs if c.get("Id")]
     if not rows:
         return
     conn = get_conn(); cur = conn.cursor()
     cur.execute("DELETE FROM qbo_customer;")
-    execute_values(cur, "INSERT INTO qbo_customer (qbo_id, name, fqn, currency, active) VALUES %s", rows)
+    execute_values(cur, "INSERT INTO qbo_customer (qbo_id, name, fqn, currency, active, parent_id) VALUES %s", rows)
     conn.commit(); cur.close(); conn.close()
 
 
 def load_customers(cur, currency):
     """Active customers a receipt in `currency` can be recorded against (QuickBooks ties each to one currency)."""
-    cur.execute("""SELECT qbo_id, coalesce(fqn, name) FROM qbo_customer WHERE coalesce(active, true)
+    cur.execute("""SELECT qbo_id, coalesce(fqn, name), parent_id FROM qbo_customer WHERE coalesce(active, true)
                      AND (%s::text IS NULL OR currency IS NULL OR currency = %s) ORDER BY 2;""", (currency, currency))
-    return [{"id": i, "n": n or ""} for i, n in cur.fetchall()]
+    return [{"id": i, "n": n or "", **({"p": p} if p else {})} for i, n, p in cur.fetchall()]
 
 
 def import_accounts_from_qbo(token):
@@ -730,7 +731,7 @@ def _sync_plan(full=False):
     """(changed_since, ent_sig, notes) for the next sync; changed_since None means a full pull."""
     # Watermark: only pull records QBO says changed since our last good sync.
     # A newly handled entity type needs one full pull, or its older records never arrive.
-    ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|refs2"   # bump the suffix to force one full re-pull (refs2: card transfer signs)
+    ent_sig = ",".join(sorted(QBO_HANDLERS)) + "|ccy3"   # bump the suffix to force one full re-pull (ccy3: amounts in the account's currency)
     changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
         else get_config("last_sync_at")
     notes = []
@@ -747,8 +748,23 @@ def sync_full_due():
     return _sync_plan()[0] is None
 
 
-def _book_rows(etype, handler, ents, by_qbo):
-    """book_txn rows for the tracked accounts these QuickBooks records touch."""
+def _in_account_ccy(amount, e, acct_ccy, home):
+    """QuickBooks gives every amount in the transaction's currency (CurrencyRef), with ExchangeRate =
+    home units per unit. A USD transfer into a UGX account, or a USD bill paid from a UGX bank, is
+    in USD on the record but in UGX on that account."""
+    tx_ccy = (e.get("CurrencyRef") or {}).get("value")
+    rate = _D(e.get("ExchangeRate")) if e.get("ExchangeRate") else None
+    if not tx_ccy or not acct_ccy or tx_ccy == acct_ccy or not rate:
+        return amount
+    if acct_ccy == home:
+        return (amount * rate).quantize(Decimal("0.01"))
+    if tx_ccy == home:
+        return (amount / rate).quantize(Decimal("0.01"))
+    return amount
+
+
+def _book_rows(etype, handler, ents, by_qbo, home=None):
+    """book_txn rows for the tracked accounts these QuickBooks records touch, in each account's currency."""
     rows = []
     for e in ents:
         seen = set()
@@ -759,7 +775,7 @@ def _book_rows(etype, handler, ents, by_qbo):
             if ref in seen or ref not in by_qbo:
                 continue
             seen.add(ref)
-            acct_uuid, atype = by_qbo[ref]
+            acct_uuid, atype, acct_ccy = (by_qbo[ref] + (None,))[:3]
             try:
                 res = handler(e, ref, atype)
             except Exception:
@@ -767,9 +783,10 @@ def _book_rows(etype, handler, ents, by_qbo):
             if not res:
                 continue
             amount, cp, desc, cat = res
+            amount = _in_account_ccy(amount, e, acct_ccy, home)
             # QBO voids by zeroing the amounts; keep the row but out of matching.
             rows.append((ORG_ID, acct_uuid, e.get("Id"), etype, e.get("TxnDate"), amount,
-                         e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
+                         acct_ccy or e.get("CurrencyRef", {}).get("value", "USD"), desc, cp,
                          e.get("DocNumber"), cat, "unknown",
                          e.get("MetaData", {}).get("LastUpdatedTime"), amount == 0, _entity_ref(e)))
     return rows
@@ -787,11 +804,12 @@ def sync_from_quickbooks(full=False, progress=None):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
     conn.commit()
-    cur.execute("SELECT account_id, source_account_id, name, type FROM account ORDER BY type, name;")
+    cur.execute("SELECT account_id, source_account_id, name, type, currency FROM account ORDER BY type, name;")
     by_qbo = {}
-    for acct_uuid, acct_qbo, name, atype in cur.fetchall():
+    for acct_uuid, acct_qbo, name, atype, ccy in cur.fetchall():
         if acct_qbo:
-            by_qbo[str(acct_qbo)] = (acct_uuid, atype)
+            by_qbo[str(acct_qbo)] = (acct_uuid, atype, ccy)
+    home = qbo_home_currency(cur)
     cur.close(); conn.close()   # not held open through the fetch, which can take minutes
     t0 = time.time()
     # Each page becomes book rows as it arrives and only its ids are kept: a full pull of a
@@ -801,7 +819,7 @@ def sync_from_quickbooks(full=False, progress=None):
         got, seen_n = [], [0]
         step(f"Downloading {etype} records")
         def keep(batch, etype=etype, handler=handler, got=got, seen_n=seen_n):
-            got.extend(_book_rows(etype, handler, batch, by_qbo))
+            got.extend(_book_rows(etype, handler, batch, by_qbo, home))
             seen_n[0] += len(batch)
             step(f"Downloading {etype} records ({seen_n[0]:,} so far)")
             return [str(e["Id"]) for e in batch if e.get("Id")]
@@ -897,6 +915,11 @@ try:
     # Customers, so a receipt can be recorded against the customer's name.
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_customer (qbo_id text PRIMARY KEY, name text, fqn text,
                     currency text, active boolean);""")
+    _cur.execute("ALTER TABLE qbo_customer ADD COLUMN IF NOT EXISTS parent_id text;")   # a child's parent (sub-customer)
+    # The USD leg of each forward deal recorded here, so its UGX receipt can be worked out from it.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS hedge_leg (line_id uuid PRIMARY KEY, deal text NOT NULL,
+                    usd numeric NOT NULL, rate numeric NOT NULL, txn_date date, qbo_ids text,
+                    created_at timestamptz NOT NULL DEFAULT now());""")
     # What the user ticked and chose in the record table, kept until recorded or discarded.
     _cur.execute("""CREATE TABLE IF NOT EXISTS record_draft (line_id uuid PRIMARY KEY, data text NOT NULL,
                     saved_by text, saved_at timestamptz NOT NULL DEFAULT now());""")
@@ -1183,6 +1206,55 @@ def _fx(body, currency, rate):
     return body
 
 
+HEDGE_RE = re.compile(r"FXPL[A-Z]*[ ~]*(\d{5,})[ ~]*(FWD|SPOT)[ ~]*(BUY|SELL)[ ~]*([A-Z]{3})/([A-Z]{3})[ ~]*([\d][\d, ]*(?:\.\d+)?)", re.I)
+
+
+def hedge_info(desc):
+    """A forward deal's number and rate from the bank's text: 'FXPLOU~1110179~FWD~BUY~USD/UGX~3,840.0000'."""
+    m = HEDGE_RE.search((desc or "").replace("\n", " "))
+    if not m or m.group(2).upper() != "FWD":
+        return None
+    try:
+        fwd = Decimal(re.sub(r"[ ,]", "", m.group(6)).rstrip("."))
+    except Exception:
+        return None
+    return {"deal": m.group(1), "fwd": fwd, "ccy": m.group(4).upper(), "home": m.group(5).upper()}
+
+
+def hedge_accounts(cur, foreign):
+    """FX in Transit (foreign), FX in Transit (home) and Forex Gain, found by name in the chart of accounts."""
+    home = qbo_home_currency(cur)
+    cur.execute("SELECT qbo_id, name, fqn, account_type, currency FROM qbo_coa WHERE coalesce(active, true);")
+    rows = cur.fetchall()
+    def find(pred):
+        return next(({"id": i, "name": n, "fqn": f or n} for i, n, f, t, c in rows if pred(n or "", t, c)), None)
+    return {"transit": find(lambda n, t, c: t == "Bank" and c == foreign and n.lower().startswith("fx in transit")),
+            "transit_home": find(lambda n, t, c: t == "Bank" and c == home and n.lower().startswith("fx in transit")),
+            "gain": find(lambda n, t, c: "forex gain" in n.lower()), "home": home}
+
+
+def month_rate(cur, ccy, d):
+    cur.execute("SELECT value FROM app_config WHERE key=%s;", (f"fx_rate:{ccy}:{str(d)[:7]}",))
+    r = cur.fetchone()
+    return r[0] if r else ""
+
+
+def qbo_record_hedge_receipt(token, acct_qbo, transit_home, gain, amount_abs, principal, txn_date, desc):
+    """The home-currency receipt of a forward deal: principal (USD x the month's rate) clears FX in
+    Transit; the rest is the gain (or, negative, the loss) to Forex Gain."""
+    diff = Decimal(amount_abs) - principal
+    lines = [{"DetailType": "DepositLineDetail", "Amount": float(principal), "Description": desc[:4000],
+              "DepositLineDetail": {"AccountRef": {"value": transit_home}}}]
+    if diff:
+        lines.append({"DetailType": "DepositLineDetail", "Amount": float(diff),
+                      "Description": ("Gain" if diff > 0 else "Loss") + f" on forward deal: {desc}"[:3990],
+                      "DepositLineDetail": {"AccountRef": {"value": gain}}})
+    body = {"DepositToAccountRef": {"value": acct_qbo}, "TxnDate": str(txn_date), "Line": lines,
+            "PrivateNote": f"Recorded from bank reconciliation: {desc}"[:4000]}
+    res = qbo_post(token, "Deposit", body)
+    return "Deposit", str((res.get("Deposit") or {}).get("Id") or "")
+
+
 def qbo_record_payment(token, acct_qbo, customer_id, amount_abs, txn_date, desc, currency=None, rate=None):
     """Money received against a customer's name: an unapplied QuickBooks Payment into this bank."""
     body = _fx({"CustomerRef": {"value": customer_id}, "TotalAmt": float(amount_abs), "TxnDate": str(txn_date),
@@ -1211,10 +1283,12 @@ def qbo_record_journal(token, acct_qbo, money_out, parts, txn_date, desc, curren
     return "JournalEntry", str((res.get("JournalEntry") or {}).get("Id") or ""), note
 
 
-def qbo_record_transfer(token, from_qbo, to_qbo, amount_abs, txn_date, desc):
-    """One QuickBooks Transfer between two of your own accounts. Returns (entity, new id, the entity)."""
-    body = {"FromAccountRef": {"value": from_qbo}, "ToAccountRef": {"value": to_qbo}, "Amount": float(amount_abs),
-            "TxnDate": str(txn_date), "PrivateNote": f"Recorded from bank reconciliation: {desc}"[:4000]}
+def qbo_record_transfer(token, from_qbo, to_qbo, amount_abs, txn_date, desc, currency=None, rate=None):
+    """One QuickBooks Transfer between two of your own accounts. Returns (entity, new id, the entity).
+    Between USD accounts (or USD into a UGX one) it's in USD at `rate`."""
+    body = _fx({"FromAccountRef": {"value": from_qbo}, "ToAccountRef": {"value": to_qbo}, "Amount": float(amount_abs),
+                "TxnDate": str(txn_date), "PrivateNote": f"Recorded from bank reconciliation: {desc}"[:4000]},
+               currency, rate)
     res = qbo_post(token, "Transfer", body)
     ent = res.get("Transfer") or {}
     return "Transfer", str(ent.get("Id") or ""), ent or body
@@ -1227,9 +1301,12 @@ def store_transfer(cur, new_id, ent, txn_date, desc, names):
            "ToAccountRef": {**ent.get("ToAccountRef", {}), "name": names.get(ent["ToAccountRef"]["value"])}}
     ids = [ent["FromAccountRef"]["value"], ent["ToAccountRef"]["value"]]
     cur.execute("SELECT account_id, source_account_id, type, currency FROM account WHERE source_account_id = ANY(%s);", (ids,))
+    accts = cur.fetchall()
     out = {}
-    for acct_uuid, qid, atype, ccy in cur.fetchall():
+    home = qbo_home_currency(cur)
+    for acct_uuid, qid, atype, ccy in accts:
         amt, who, _note, cat = _h_transfer(ent, qid, atype)
+        amt = _in_account_ccy(amt, ent, ccy, home)
         cur.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
                           currency, description, counterparty, category, cleared_status, last_modified)
                        VALUES (%s,%s,%s,'Transfer',%s,%s,%s,%s,%s,%s,'unknown',now())
@@ -1464,6 +1541,14 @@ tbody tr:hover{background:#f7f9fb}
 .splitfoot{display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap}
 .splitrem{font-size:13px;font-weight:600}.splitrem.ok{color:#3a7d44}.splitrem.warn{color:#b3471f}
 .recbar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.hedgerow td,.kidsrow td{background:#fbfaf5;white-space:normal}
+.hedgeins{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.hedgeins label{display:flex;flex-direction:column;gap:4px}
+.hedgeins input{width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right}
+.hedgecalc{font-size:13px;color:var(--ink,#16202e);font-weight:550}
+.rowtools .hedge-btn.on{background:var(--accent-soft);color:var(--accent)}
+.kidline{display:flex;gap:10px;align-items:center;margin:5px 0;font-size:13px}
+.kidline span{min-width:220px}
 .savedsel{background:#eef4ff;border:1px solid #c7d7f5;color:#1e3a6e;padding:8px 12px;border-radius:9px;font-size:13px;margin:0 0 10px}
 .booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -2934,8 +3019,39 @@ def run_matcher(statement_id):
     # pass 3: many-to-one, BOTH directions (bounded; candidates sorted by date-closeness)
     # 3a forward: one statement line = sum of several book txns
     unmatched = [(l_id, ld, la) for (l_id, ld, la, lw) in lines if l_id not in matched_lines]
+    # A parent's lump sum is usually booked as payments for their children: try each family first.
+    cur.execute("""SELECT bt.txn_id::text, coalesce(c.parent_id, c.qbo_id) FROM book_txn bt
+                   JOIN qbo_customer c ON bt.counterparty_ref = 'Customer:' || c.qbo_id
+                   WHERE bt.txn_id = ANY(%s::uuid[]);""", ([str(t[0]) for t in txns],))
+    family = dict(cur.fetchall())
+    if len(unmatched) <= M2O_MAX_LINES and family:
+        for l_id, ld, la in unmatched:
+            if l_id in matched_lines:
+                continue
+            groups = {}
+            for (t, d, a, w) in txns:
+                if t not in used and str(t) in family and abs((ld - d).days) <= GROUP_WINDOW_DAYS:
+                    groups.setdefault(family[str(t)], []).append((t, a))
+            found = None
+            for fam_txns in groups.values():
+                if len(fam_txns) < 2 or len(fam_txns) > 12:
+                    continue
+                for k in range(len(fam_txns), 1, -1):
+                    for combo in itertools.combinations(fam_txns, k):
+                        if sum((c[1] for c in combo), Decimal(0)) == la and ok("many_to_one", [l_id], [c[0] for c in combo]):
+                            found = combo; break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                tids = [c[0] for c in found]
+                add([l_id], tids, "many_to_one", 0.85, 0)
+                matched_lines.add(l_id); used.update(tids)
     if len(unmatched) <= M2O_MAX_LINES:
         for l_id, ld, la in unmatched:
+            if l_id in matched_lines:
+                continue
             cands = sorted([(t, a, d) for (t, d, a, w) in txns
                             if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS],
                            key=lambda c: abs((ld - c[2]).days))[:M2O_MAX_CANDS]
@@ -3303,13 +3419,23 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
 <td><div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
-{% if not w.xfer_only %}<div class=rowtools><button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
+{% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
 <input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
+<input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
+{% if w.hedge %}<input type=hidden name="hedge_{{ w.line_id }}" class=hedge-on value="{{ '1' if w.hedge_on else '' }}">{% endif %}
 {% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id and not w.saved %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug and not w.saved %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
 <td><div class=custbox data-sel="{{ w.cust }}"><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class="payee acct-q" autocomplete=off aria-label="Payee"><button type=button class=acct-x title="Clear the customer" aria-label="Clear customer">&times;</button><input type=hidden name="cust_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1 {% if w.dupok %}checked{% endif %}> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm data-busy="Recording this line in QuickBooks...">Record</button></td>
 {% endif %}
-</tr>{% if w.recordable and not w.wb and not w.xfer_only %}<tr class=splitrow hidden><td></td><td colspan=6 class=splitcell></td></tr>{% endif %}{% endfor %}</table>
+</tr>{% if w.recordable and not w.wb and not w.xfer_only %}<tr class=splitrow hidden><td></td><td colspan=6 class=splitcell></td></tr>
+{% if w.hedge %}{% set h = w.hedge %}<tr class=hedgerow hidden data-leg="{{ h.leg }}" data-fwd="{{ h.fwd }}"><td></td><td colspan=6 class=hedgecell>
+<div class=splithead><b>Forward deal {{ h.deal }}</b> at {{ h.fwd|money }} {{ home_ccy }} per {{ h.ccy }}.
+{% if h.leg == 'out' %}Records it as your hedges are booked: a transfer from this account to <b>{{ hedge_accts.transit.fqn if hedge_accts.transit else 'FX in Transit (missing)' }}</b>, then on to <b>{{ hedge_accts.transit_home.fqn if hedge_accts.transit_home else 'FX in Transit ' ~ home_ccy ~ ' (missing)' }}</b> at this month's transaction rate.
+{% else %}Records the receipt as a deposit: {{ h.ccy }} amount &times; this month's transaction rate clears <b>{{ hedge_accts.transit_home.fqn if hedge_accts.transit_home else 'FX in Transit ' ~ home_ccy ~ ' (missing)' }}</b>, and the difference is the gain (or loss) on <b>{{ hedge_accts.gain.fqn if hedge_accts.gain else 'Forex Gain (missing)' }}</b>.{% if h.known %} The {{ h.ccy }} amount and rate come from the {{ h.ccy }} leg recorded here.{% endif %}{% endif %}</div>
+<div class=hedgeins>{% if h.leg == 'in' %}<label>{{ h.ccy }} amount <input name="hedge_usd_{{ w.line_id }}" class=hedge-usd inputmode=decimal value="{{ h.usd }}"></label>{% endif %}
+<label>This month's transaction rate ({{ home_ccy }} per {{ h.ccy }}) <input name="hedge_rate_{{ w.line_id }}" class=hedge-rate inputmode=decimal value="{{ h.rate }}" placeholder="e.g. 3,720"></label>
+<span class=hedgecalc></span><button type=button class="btn-sm hedge-cancel">Not a hedge</button></div></td></tr>{% endif %}
+{% if not w.out %}<tr class=kidsrow hidden><td></td><td colspan=6 class=kidscell></td></tr>{% endif %}{% endif %}{% endfor %}</table>
 <div class=recbar><button type=submit name=bulk value=1 class=btn>Record selected in QuickBooks</button>
 <button type=submit formaction="{{ url_for('record_save', name=name) }}" class=btn-sm data-busy="Saving your selection..." title="Keep what's ticked and chosen, to carry on later">Save selection</button>
 <span id=selcount class=hint></span></div>
@@ -3332,7 +3458,10 @@ function accountsFor(dir,split){
   coa.forEach(function(a){if(split?a.x===2:a.x===1)out.push(a)});
   return out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ar:a.t===AR,rank:i,low:a.n.toLowerCase()}});
 }
-var custList=custs.map(function(c,i){return {id:c.id,n:c.n,t:'Customer',rank:i,low:c.n.toLowerCase()}});
+var custList=custs.map(function(c,i){return {id:c.id,n:c.n,p:c.p||'',t:'Customer',rank:i,low:c.n.toLowerCase()}});
+function childrenOf(id){return custList.filter(function(c){return c.p===id})}
+// The panel rows (split, hedge, children) that follow a record row, up to the next record row.
+function panel(tr,cls){var n=tr.nextElementSibling;while(n&&!n.hasAttribute('data-amt')){if(n.classList.contains(cls))return n;n=n.nextElementSibling}return null}
 function lev(a,b){   // edit distance, for typos ("stationary" finds "Stationery")
   var m=a.length,n=b.length,p=[],i,j;for(j=0;j<=n;j++)p[j]=j;
   for(i=1;i<=m;i++){var prev=p[0];p[0]=i;for(j=1;j<=n;j++){var t=p[j];p[j]=Math.min(p[j]+1,p[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));prev=t}}
@@ -3415,18 +3544,65 @@ function initBox(box,list,onPick,active){
 function boxHtml(){return '<input type=text class=acct-q placeholder="Type to search accounts" autocomplete=off aria-label="Account"><button type=button class=acct-x aria-label="Clear account">&times;</button><input type=hidden class=acct-v value=""><div class=acct-list role=listbox hidden></div>'}
 document.querySelectorAll('.acctbox.main').forEach(function(box){
   var tr=box.closest('tr'),dir=box.getAttribute('data-dir'),cb=tr.querySelector('.rsel'),total=Math.abs(parseFloat(tr.getAttribute('data-amt'))||0);
-  var cbox=tr.querySelector('.custbox'),cust=null,isAr=false;
+  var cbox=tr.querySelector('.custbox'),cust=null,isAr=false,kidsRow=panel(tr,'kidsrow'),kidsV=tr.querySelector('.kids-v');
+  // A parent's lump sum: split it between the parent and some or all of their children.
+  function kids(parent,restore){
+    if(!kidsRow||!kidsV)return;
+    var ch=parent&&isAr?childrenOf(parent.id):[];
+    if(!ch.length){kidsRow.hidden=true;kidsV.value='';return}
+    var saved={};try{(restore&&kidsV.value?JSON.parse(kidsV.value):[]).forEach(function(k){saved[k.c]=k.v})}catch(e){}
+    var cell=kidsRow.querySelector('.kidscell');
+    cell.innerHTML='<div class=splithead>'+'Paid for their children? Enter how much is for each (leave the others empty). It must add up to '+fmt(total)+'; each becomes its own payment.'+'</div>';
+    var ins=[];
+    [parent].concat(ch).forEach(function(c,i){
+      var d=document.createElement('div');d.className='kidline';
+      var nm=document.createElement('span');nm.textContent=c.n+(i===0?' (the parent)':'');d.appendChild(nm);
+      var inp=document.createElement('input');inp.className='splitamt';inp.setAttribute('inputmode','decimal');inp.placeholder='0.00';inp.value=saved[c.id]||'';inp.setAttribute('data-c',c.id);d.appendChild(inp);
+      cell.appendChild(d);ins.push(inp);inp.addEventListener('input',function(){ksync(true)});
+    });
+    var rem=document.createElement('div');rem.className='splitrem';cell.appendChild(rem);
+    function ksync(byUser){
+      var sum=0,data=[];ins.forEach(function(i){var v=parseFloat(i.value.replace(/,/g,''));if(!isNaN(v)&&v){sum+=v;data.push({c:i.getAttribute('data-c'),v:i.value.replace(/,/g,'').trim()})}});
+      var left=Math.round((total-sum)*100)/100;
+      rem.textContent=!data.length?'Not split: the whole amount goes to '+parent.n+'.':left===0?'Adds up to '+fmt(total):'Left to allocate: '+fmt(left);
+      rem.className='splitrem '+(!data.length||left===0?'ok':'warn');
+      kidsV.value=data.length?JSON.stringify(data):'';
+      if(byUser&&cb)cb.checked=!data.length||left===0;count();
+    }
+    kidsRow.hidden=false;ksync(false);
+  }
   var main=initBox(box,accountsFor(dir,false),function(a,byUser){
     if(byUser&&cb)cb.checked=!!a;
     isAr=!!(a&&a.ar);
-    if(cbox){cbox.classList.toggle('ar',isAr);var pq=cbox.querySelector('.acct-q');pq.placeholder=isAr?"Type the customer's name":'optional';if(cust)cust.refresh()}
+    if(cbox){cbox.classList.toggle('ar',isAr);var pq=cbox.querySelector('.acct-q');pq.placeholder=isAr?"Type the customer's name":'optional';if(cust){cust.refresh();kids(isAr?cust.get():null,false)}}
     count();
   });
   if(cbox){cbox.setAttribute('data-none','No customer matches. Check the name, or add the customer in QuickBooks and refresh.');
-    cust=initBox(cbox,custList,function(a,byUser){if(byUser&&cb&&isAr)cb.checked=!!(a&&main.get());count()},function(){return isAr});
+    cust=initBox(cbox,custList,function(a,byUser){if(byUser&&cb&&isAr)cb.checked=!!(a&&main.get());kids(a,!byUser);count()},function(){return isAr});
     cbox.classList.toggle('ar',isAr);cust.refresh()}
+  // Hedge: a forward deal booked via FX in Transit, with its gain or loss.
+  var hbtn=tr.querySelector('.hedge-btn'),hrow=panel(tr,'hedgerow'),hon=tr.querySelector('.hedge-on');
+  if(hbtn&&hrow&&hon){
+    var hq=box.querySelector('.acct-q'),hr=hrow.querySelector('.hedge-rate'),hu=hrow.querySelector('.hedge-usd'),hc=hrow.querySelector('.hedgecalc');
+    var hleg=hrow.getAttribute('data-leg'),hfwd=parseFloat(hrow.getAttribute('data-fwd'));
+    var num2=function(i){return i?parseFloat(i.value.replace(/,/g,'')):NaN};
+    var hsync=function(byUser){
+      var r=num2(hr),u=hleg==='in'?num2(hu):total,ok=r>0&&u>0;
+      if(!ok)hc.textContent=hleg==='in'?'Type the amount and the rate.':'Type the rate.';
+      else if(hleg==='in'){var p=Math.round(u*r*100)/100,g=Math.round((total-p)*100)/100;
+        hc.textContent='FX in Transit '+fmt(p)+'  ·  '+(g>=0?'gain ':'loss ')+fmt(Math.abs(g))+' to Forex Gain';}
+      else hc.textContent=fmt(u)+' at '+fmt(r)+' = '+fmt(Math.round(u*r*100)/100)+' into FX in Transit (the deal pays '+fmt(Math.round(u*hfwd*100)/100)+')';
+      if(byUser&&cb)cb.checked=ok;count();
+    };
+    var hopen=function(){hrow.hidden=false;hon.value='1';box.classList.add('off');hq.disabled=true;hbtn.classList.add('on');hsync(false)};
+    var hclose=function(){hrow.hidden=true;hon.value='';box.classList.remove('off');hq.disabled=false;hbtn.classList.remove('on');if(cb)cb.checked=!!main.get();count()};
+    hbtn.addEventListener('click',function(){if(hrow.hidden){hopen();hsync(true)}else hclose()});
+    hrow.querySelector('.hedge-cancel').addEventListener('click',hclose);
+    [hr,hu].forEach(function(i){if(i)i.addEventListener('input',function(){hsync(true)})});
+    if(hon.value==='1')hopen();
+  }
   // Split: several accounts for this one line; they must add up to its amount.
-  var srow=tr.nextElementSibling,btn=tr.querySelector('.split-btn'),hid=tr.querySelector('.split-v');
+  var srow=panel(tr,'splitrow'),btn=tr.querySelector('.split-btn'),hid=tr.querySelector('.split-v');
   if(!srow||!srow.classList.contains('splitrow')||!btn)return;
   var cell=srow.querySelector('.splitcell'),lines=[],slist=accountsFor(dir,true);
   cell.innerHTML='<div class=splithead>Split this line across accounts. Amounts go the same way as the bank line; a negative amount goes the other way (for example a loss on a hedge). They must add up to '+fmt(total)+'.</div><div class=splitlines></div><div class=splitfoot><button type=button class=btn-sm data-add>+ Add line</button><span class=splitrem></span><button type=button class=btn-sm data-cancel>Remove split</button></div>';
@@ -3831,6 +4007,11 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     xt = transfer_targets(cur, acct_qbo, atype, acct_ccy) if coa else []
     sb = split_banks(cur, acct_qbo, acct_ccy) if coa else []
     home = qbo_home_currency(cur)
+    hedge_legs = {}
+    if unmatched_lines:
+        cur.execute("SELECT deal, usd, rate, txn_date FROM hedge_leg ORDER BY txn_date;")
+        for deal, usd, rate_, dd in cur.fetchall():
+            hedge_legs.setdefault(deal, []).append((usd, rate_, dd))
     custs = load_customers(cur, acct_ccy) if coa and unmatched_lines else []
     cust_names = {c["id"]: c["n"] for c in custs}
     drafts, draft_meta = {}, None
@@ -3875,13 +4056,29 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         item["sel"] = bool(item["acct_id"] and not item["dups"])
         pref = item["payee_ref"] or ""
         item["cust"] = pref.split(":", 1)[1] if pref.startswith("Customer:") and pref.split(":", 1)[1] in cust_names else ""
-        item["rate"] = item["split"] = ""
+        item["rate"] = item["split"] = item["kids"] = ""
         item["dupok"] = False
+        # A forward deal: its foreign leg (money out of the USD account) or its home receipt (UGX in).
+        hi = hedge_info(who) if coa else None
+        item["hedge"] = None
+        if hi and hi["ccy"] == (acct_ccy if acct_ccy != home else hi["ccy"]) and home and hi["home"] == home:
+            leg = "out" if (acct_ccy == hi["ccy"] and out) else "in" if (acct_ccy == home and not out) else None
+            if leg:
+                legs = hedge_legs.get(hi["deal"], [])
+                near = min(legs, key=lambda x: abs(((x[2] or dd) - dd).days)) if legs else None
+                usd = near[0] if near else (abs(a) / hi["fwd"]).quantize(Decimal("0.01"))
+                item["hedge"] = {**hi, "leg": leg, "usd": usd, "known": bool(near),
+                                 "rate": (near[1] if near and leg == "in" else "") or month_rate(cur, hi["ccy"], dd)}
+        item["hedge_on"] = False
         dr = drafts.get(str(lid))
         if dr:   # the user's saved choices win over suggestions
             item.update(sel=bool(dr.get("sel")), acct_id=dr.get("acct") or None, payee=dr.get("payee") or "",
                         cust=dr.get("cust") or "", rate=dr.get("rate") or "", split=dr.get("split") or "",
-                        dupok=bool(dr.get("dupok")), saved=True)
+                        kids=dr.get("kids") or "", dupok=bool(dr.get("dupok")), saved=True)
+            if item["hedge"] and dr.get("hedge"):
+                item["hedge_on"] = True
+                item["hedge"] = {**item["hedge"], "rate": dr.get("hedge_rate") or item["hedge"]["rate"],
+                                 "usd": dr.get("hedge_usd") or item["hedge"]["usd"]}
         (writebacks if out else deposits).append(item)
     _unmatched = [l for l in lines if l[0] not in ml]
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
@@ -3903,6 +4100,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                                            for a in coa + xt + sb]).replace("<", "\\u003c")),
             "cust_json": Markup(json.dumps(custs).replace("<", "\\u003c")),
             "fx_ccy": acct_ccy if acct_ccy and home and acct_ccy != home else None, "home_ccy": home,
+            "hedge_accts": hedge_accounts(cur, acct_ccy if acct_ccy != home else "USD") if coa else {},
             "draft_meta": draft_meta}
 
 
@@ -4320,7 +4518,14 @@ def record(name):
     xt = {a["id"]: a for a in transfer_targets(cur, acct_qbo, atype, ccy)}
     split_ok = {**{k: a for k, a in coa.items() if a["type"] != "Accounts Receivable"},
                 **{a["id"]: a for a in split_banks(cur, acct_qbo, ccy)}}
-    customers = {c["id"]: c["n"] for c in load_customers(cur, ccy)}
+    cust_rows = load_customers(cur, ccy)
+    customers = {c["id"]: c["n"] for c in cust_rows}
+    parent_of = {c["id"]: c.get("p") for c in cust_rows}
+    hacc = hedge_accounts(cur, ccy if ccy != home else "USD")
+    hnames = {}
+    for key in ("transit", "transit_home"):
+        if hacc.get(key):
+            hnames[hacc[key]["id"]] = hacc[key]["name"]
     names = {a["id"]: a["name"] for a in xt.values()}
     cur.execute("SELECT name FROM qbo_coa WHERE qbo_id=%s;", (acct_qbo,))
     names[acct_qbo] = (cur.fetchone() or [name])[0]
@@ -4338,6 +4543,15 @@ def record(name):
         lid = str(lid)
         label = f"{d} {desc[:30]}"
         out = _money_out(amt, atype)
+        if request.form.get(f"hedge_{lid}") == "1":
+            r_ = _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home, hacc, hnames, names,
+                               dups, touched, token)
+            token = r_.get("token") or token
+            if r_.get("problem"):
+                problems.append(r_["problem"])
+            if r_.get("done"):
+                done += 1
+            continue
         # A split: several accounts for one bank line (an FX hedge with its gain or loss).
         parts = None
         raw_split = (request.form.get(f"split_{lid}") or "").strip()
@@ -4378,14 +4592,31 @@ def record(name):
         if payee != (request.form.get(f"psug_{lid}") or "").strip():
             ref = None
         cust = request.form.get(f"cust_{lid}") or ""
+        kids = None
         if is_ar:
             if cust not in customers and ref and ref.startswith("Customer:") and ref.split(":", 1)[1] in customers:
                 cust = ref.split(":", 1)[1]
             if cust not in customers:
                 problems.append(f"{label}: choose the customer it was received from"); continue
             payee = customers[cust]
+            # A parent's lump sum split between some or all of their children (sub-customers).
+            raw_kids = (request.form.get(f"kids_{lid}") or "").strip()
+            if raw_kids:
+                try:
+                    kids = [(str(k["c"]), Decimal(str(k["v"]).replace(",", ""))) for k in json.loads(raw_kids)
+                            if str(k.get("v") or "").strip() not in ("", "0", "0.00")]
+                except Exception:
+                    problems.append(f"{label}: the split between children couldn't be read"); continue
+                family = {cust} | {c for c, p in parent_of.items() if p == cust}
+                if not kids:
+                    kids = None
+                elif any(c not in family for c, _ in kids) or any(v <= 0 for _, v in kids):
+                    problems.append(f"{label}: split only between {payee} and their children, with amounts above zero"); continue
+                elif sum((v for _, v in kids), Decimal(0)) != abs(amt):
+                    problems.append(f"{label}: the children's amounts add up to "
+                                    f"{_money(sum((v for _, v in kids), Decimal(0)))}, not {_money(abs(amt))}"); continue
         rate = None
-        if foreign and not is_xfer:
+        if foreign:
             typed = (request.form.get(f"rate_{lid}") or "").replace(",", "").strip()
             if typed:
                 try:
@@ -4412,8 +4643,14 @@ def record(name):
                 payee = ""
             elif is_xfer:
                 frm, to = transfer_ends(acct_qbo, acc["id"], amt, atype)
-                entity, new_id, ent = qbo_record_transfer(token, frm, to, abs(amt), d, desc)
+                entity, new_id, ent = qbo_record_transfer(token, frm, to, abs(amt), d, desc, foreign, rate)
                 payee = ""
+            elif is_ar and kids:
+                paid = []
+                for c_id, v in kids:
+                    _e, pid = qbo_record_payment(token, acct_qbo, c_id, v, d, desc, foreign, rate)
+                    paid.append((c_id, v, pid))
+                entity, new_id, used_ref = "Payment", ",".join(p for _, _, p in paid), f"Customer:{cust}"
             elif is_ar:
                 entity, new_id = qbo_record_payment(token, acct_qbo, cust, abs(amt), d, desc, foreign, rate)
                 used_ref = f"Customer:{cust}"
@@ -4433,6 +4670,18 @@ def record(name):
         if new_id and is_xfer:
             ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(amt)}
             touched.update(a for a in store_transfer(k2, new_id, ent, d, desc, names) if a != str(acct_uuid))
+        elif new_id and kids:
+            # One payment per child; the bank line is matched to all of them.
+            tids = []
+            for c_id, v, pid in paid:
+                k2.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
+                                  currency, description, counterparty, cleared_status, last_modified, counterparty_ref)
+                              VALUES (%s,%s,%s,'Payment',%s,%s,%s,%s,%s,'unknown',now(),%s)
+                              ON CONFLICT (account_id, source_txn_type, source_txn_id) DO UPDATE SET amount=EXCLUDED.amount
+                              RETURNING txn_id;""",
+                           (ORG_ID, acct_uuid, pid, d, v, ccy or "USD", desc, customers[c_id], f"Customer:{c_id}"))
+                tids.append(str(k2.fetchone()[0]))
+            _confirm_match(k2, s[0], [lid], tids)
         elif new_id:
             book_amt = abs(amt) if (atype == "credit_card" or not out) else -abs(amt)
             # The same row the next sync reads back (journal entries as the sync describes them).
@@ -4466,6 +4715,102 @@ def record(name):
     return redirect(url_for("detail", name=name) + "#sec-record")
 
 
+def _confirm_match(cur, sid, lids, tids):
+    """Match bank lines to the entries just recorded for them, as if matched by hand."""
+    mid = str(uuid.uuid4())
+    cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
+                                      created_by, confirmed_by, confirmed_at)
+                   VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, sid, session.get("name") or "user"))
+    execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", [(mid, l) for l in lids])
+    execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, t) for t in tids])
+
+
+def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home, hacc, hnames, names, dups, touched, token):
+    """One leg of a forward deal, the way the books have always recorded them:
+    USD out  -> Transfer USD bank -> FX in Transit (USD) -> FX in Transit UGX, at the month's rate;
+    UGX in   -> Deposit: FX in Transit UGX (USD x the month's rate) + Forex Gain (the difference)."""
+    hi = hedge_info(desc)
+    if not hi:
+        return {"problem": f"{label}: no forward deal number in the bank's text"}
+    try:
+        rate = Decimal((request.form.get(f"hedge_rate_{lid}") or "").replace(",", "").strip())
+        assert rate > 0
+    except Exception:
+        return {"problem": f"{label}: type this month's transaction rate for deal {hi['deal']}"}
+    need = ("transit", "transit_home") if out else ("transit_home", "gain")
+    missing = [k for k in need if not hacc.get(k)]
+    if missing:
+        what = {"transit": f"FX in Transit ({hi['ccy']})", "transit_home": f"FX in Transit {home}", "gain": "Forex Gain"}
+        return {"problem": f"{label}: no {', '.join(what[k] for k in missing)} account in QuickBooks"}
+    if dups.get(lid) and not request.form.get(f"dupok_{lid}"):
+        x = dups[lid][0]
+        return {"problem": f"{label}: QuickBooks may already have it ({x['date']}, {_money(x['amount'])}) — "
+                           f"match it instead, or tick 'Not a duplicate'"}
+    usd = None
+    if not out:
+        try:
+            usd = Decimal((request.form.get(f"hedge_usd_{lid}") or "").replace(",", "").strip())
+            assert usd > 0
+        except Exception:
+            return {"problem": f"{label}: type the {hi['ccy']} amount of deal {hi['deal']}"}
+    if not _claim_writeback(lid, session.get("name")):
+        return {}
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO app_config (key, value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;",
+                (f"fx_rate:{hi['ccy']}:{str(d)[:7]}", str(rate)))
+    conn.commit(); cur.close(); conn.close()
+    ids, fqn = [], None
+    try:
+        token = token or qbo_token()
+        if out:
+            names = {**names, **hnames}
+            e1, id1, ent1 = qbo_record_transfer(token, acct_qbo, hacc["transit"]["id"], abs(amt), d, desc, ccy, float(rate))
+            ids.append(id1)
+            e2, id2, ent2 = qbo_record_transfer(token, hacc["transit"]["id"], hacc["transit_home"]["id"], abs(amt), d, desc,
+                                                ccy, float(rate))
+            ids.append(id2)
+            entity, fqn = "Transfer", f"{hacc['transit']['fqn']} -> {hacc['transit_home']['fqn']}"
+        else:
+            principal = (usd * rate).quantize(Decimal("0.01"))
+            entity, id1 = qbo_record_hedge_receipt(token, acct_qbo, hacc["transit_home"]["id"], hacc["gain"]["id"],
+                                                   abs(amt), principal, d, desc)
+            ids.append(id1)
+            fqn = f"{hacc['transit_home']['fqn']} + {hacc['gain']['fqn']}"
+    except Exception as e:
+        err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
+        c2 = get_conn(); k2 = c2.cursor()
+        if ids:   # the first transfer went through: keep it on record so it isn't posted twice
+            k2.execute("UPDATE writeback_log SET status='done', qbo_type='Transfer', qbo_id=%s, error=%s WHERE line_id=%s;",
+                       (",".join(ids), err, lid))
+        else:
+            k2.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id=%s;", (err, lid))
+        c2.commit(); k2.close(); c2.close()
+        return {"token": token, "problem": (f"{label}: the transfer into FX in Transit was recorded (#{ids[0]}), but "
+                                            f"FX in Transit -> FX in Transit {home} failed: {err}. Post that one in QuickBooks."
+                                            if ids else f"{label}: QuickBooks said {err}")}
+    c2 = get_conn(); k2 = c2.cursor()
+    k2.execute("""UPDATE writeback_log SET status='done', qbo_type=%s, qbo_id=%s, account_fqn=%s WHERE line_id=%s;""",
+               (entity, ",".join(ids), fqn, lid))
+    k2.execute("DELETE FROM record_draft WHERE line_id=%s;", (lid,))
+    if out:
+        for tid, ent, frm, to in ((ids[0], ent1, acct_qbo, hacc["transit"]["id"]),
+                                  (ids[1], ent2, hacc["transit"]["id"], hacc["transit_home"]["id"])):
+            ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(amt),
+                   "CurrencyRef": {"value": ccy}, "ExchangeRate": float(rate)}
+            touched.update(a for a in store_transfer(k2, tid, ent, d, desc, names) if a != str(acct_uuid))
+        k2.execute("""INSERT INTO hedge_leg (line_id, deal, usd, rate, txn_date, qbo_ids) VALUES (%s,%s,%s,%s,%s,%s)
+                      ON CONFLICT (line_id) DO UPDATE SET usd=EXCLUDED.usd, rate=EXCLUDED.rate, qbo_ids=EXCLUDED.qbo_ids;""",
+                   (lid, hi["deal"], abs(amt), rate, d, ",".join(ids)))
+    else:
+        k2.execute("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount,
+                          currency, description, counterparty, category, cleared_status, last_modified)
+                      VALUES (%s,%s,%s,'Deposit',%s,%s,%s,%s,NULL,%s,'unknown',now())
+                      ON CONFLICT (account_id, source_txn_type, source_txn_id) DO NOTHING;""",
+                   (ORG_ID, acct_uuid, ids[0], d, abs(amt), ccy or home, desc, hacc["transit_home"]["fqn"]))
+    c2.commit(); k2.close(); c2.close()
+    return {"token": token, "done": True}
+
+
 @app.route("/account/<name>/record_save", methods=["POST"])
 def record_save(name):
     """Keep what's ticked and chosen in the record table, so a refresh or another visit starts from it."""
@@ -4483,6 +4828,10 @@ def record_save(name):
     rows = [(lid, json.dumps({"sel": lid in sel, "acct": request.form.get(f"acct_{lid}") or "",
                               "payee": request.form.get(f"payee_{lid}") or "", "cust": request.form.get(f"cust_{lid}") or "",
                               "rate": request.form.get(f"rate_{lid}") or "", "split": request.form.get(f"split_{lid}") or "",
+                              "kids": request.form.get(f"kids_{lid}") or "",
+                              "hedge": request.form.get(f"hedge_{lid}") == "1",
+                              "hedge_rate": request.form.get(f"hedge_rate_{lid}") or "",
+                              "hedge_usd": request.form.get(f"hedge_usd_{lid}") or "",
                               "dupok": bool(request.form.get(f"dupok_{lid}"))}), session.get("name") or "user")
             for lid in valid]
     if rows:
