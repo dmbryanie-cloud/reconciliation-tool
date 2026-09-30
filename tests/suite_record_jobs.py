@@ -131,4 +131,36 @@ m = msg()
 check("a job lost to a restart: reported as stopped with how far it got", "Recording stopped before finishing (4 of 10 lines done)" in m)
 cl.post("/account/Stanbic/record", data={"only": LI, f"acct_{LI}": "83"})
 check("…and recording works again", len(POSTS) == n + 1)
+# ---- bank charges pair on the exact date only ------------------------------------------------------------
+book("c0", "2026-09-26", -300, "Excise duty")          # a day before the bank's charge
+book("n0", "2026-09-26", -333, "Textbooks")            # an ordinary payment, a day before
+upload([("2026-09-27", "GOVERNMENT EXCISE DUTY CHARGE", -300), ("2026-09-27", "TEXTBOOKS", -333),
+        ("2026-09-28", "CASH WITHDRAWAL FEE", -3500), ("2026-09-29", "INWARD EFT FEE", -2300)])
+C1, N1, C2, C3 = lid("GOVERNMENT EXCISE DUTY CHARGE"), lid("TEXTBOOKS"), lid("CASH WITHDRAWAL FEE"), lid("INWARD EFT FEE")
+check("a charge isn't paired with the same amount a day earlier", not matched(C1) and not q(
+      "SELECT 1 FROM match_statement_line msl JOIN match m USING (match_id) WHERE msl.line_id=%s", (C1,)))
+check("…an ordinary payment still is", matched(N1) == [("exact", "engine")])
+check("is_bank_charge: fees and duty going out; not school fees coming in, cheques or EFT payments",
+      A.is_bank_charge("FEE  ACH INWD CR", -4000) and A.is_bank_charge("MONTHLY MANAGEMENT FEE", -36000)
+      and not A.is_bank_charge("SCHOOL FEES TERM 3", 500000) and not A.is_bank_charge("CHQW FEES REFUND", -9000)
+      and not A.is_bank_charge("EFT: 12:PAULA:EDUCATIONAL FEES", -2088) and not A.is_bank_charge("LOAN RECOVERY", -5000))
+book("c2", "2026-09-27", -3500, "Cash withdrawal fee")  # already in QuickBooks, but a day off
+book("c3", "2026-09-29", -2300, "Inward EFT fee")       # already in QuickBooks, same day
+n = len(POSTS)
+cl.post("/account/Stanbic/record", data={"only": C2, f"acct_{C2}": "83"})
+check("recording a charge: an entry a day off isn't taken as it (recorded, no duplicate warning)",
+      len(POSTS) == n + 1 and "already in QuickBooks" not in msg())
+cl.post("/account/Stanbic/record", data={"only": C3, f"acct_{C3}": "83"})
+check("…one on the same day is paired with it; nothing created", len(POSTS) == n + 1 and matched(C3))
+
+# ---- switching accounts from the account page --------------------------------------------------------
+q(H.account_sql(("00000000-0000-0000-0000-0000000000a2", "36", "DFCU Idle", "bank")) + " SELECT 1")
+p = page()
+sw = re.search(r"<select id=acctswitch.*?</select>", p, re.S)
+check("account switcher on the page, this account selected", sw and re.search(r'<option value="Stanbic"[^>]*selected', sw.group(0)))
+check("…grouped: reconciliation in progress first, accounts with no statement after",
+      sw and sw.group(0).index('label="Reconciliation in progress"') < sw.group(0).index('label="No statement yet"')
+      and sw.group(0).index("Stanbic") < sw.group(0).index('label="No statement yet"') < sw.group(0).index("DFCU Idle"))
+r = cl.get("/switch?name=DFCU Idle")
+check("…and opens the chosen account", r.status_code == 302 and r.headers["Location"].endswith("/account/DFCU%20Idle"))
 sys.exit(T.summary())

@@ -1327,6 +1327,15 @@ def rematch_open(cur, account_uuids):
 
 
 DUP_WINDOW_DAYS = 45   # how far apart a bank line and its QuickBooks twin can plausibly be dated
+CHARGE_RE = re.compile(r"\b(charges?|chgs?|fees?|excise|duty|commission|levy)\b", re.I)
+NOT_CHARGE_RE = re.compile(r"^\s*chq|\beft:", re.I)   # a cheque or payment to someone, not the bank's charge
+
+
+def is_bank_charge(text, amount):
+    """A bank charge (fee, commission, excise duty...). The bank takes the same small amounts again and
+    again, so a charge only ever pairs with a QuickBooks entry on exactly the same date."""
+    return amount is not None and amount < 0 and bool(CHARGE_RE.search(text or "")) \
+        and not NOT_CHARGE_RE.search(text or "")
 
 
 def possible_duplicates(cur, acct_uuid, lines):
@@ -1335,16 +1344,16 @@ def possible_duplicates(cur, acct_uuid, lines):
     such a line would put a duplicate in the books."""
     if not lines:
         return {}
-    cur.execute("""WITH un(line_id, d, amt) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[]))
+    cur.execute("""WITH un(line_id, d, amt, win) AS (SELECT * FROM unnest(%s::uuid[], %s::date[], %s::numeric[], %s::int[]))
                    SELECT un.line_id, bt.txn_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
                    FROM un JOIN book_txn bt ON bt.account_id=%s AND bt.amount=un.amt
-                        AND bt.posted_date BETWEEN un.d - %s AND un.d + %s
+                        AND bt.posted_date BETWEEN un.d - un.win AND un.d + un.win
                    WHERE NOT bt.is_deleted AND NOT bt.is_void
                      AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt JOIN match m ON m.match_id=mbt.match_id
                                      WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed')
                    ORDER BY abs(bt.posted_date - un.d);""",
-                ([str(l[0]) for l in lines], [l[1] for l in lines], [l[2] for l in lines], acct_uuid,
-                 DUP_WINDOW_DAYS, DUP_WINDOW_DAYS))
+                ([str(l[0]) for l in lines], [l[1] for l in lines], [l[2] for l in lines],
+                 [0 if len(l) > 3 and is_bank_charge(l[3], l[2]) else DUP_WINDOW_DAYS for l in lines], acct_uuid))
     out = {}
     for lid, tid, d, a, who in cur.fetchall():
         out.setdefault(str(lid), []).append({"txn_id": str(tid), "date": d, "amount": a, "who": who})
@@ -2955,8 +2964,12 @@ def run_matcher(statement_id):
     cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match_book_txn WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
     cur.execute("DELETE FROM match WHERE statement_id=%s;", (statement_id,))
-    cur.execute("SELECT line_id, posted_date, amount, coalesce(counterparty, description,'') FROM statement_line WHERE statement_id=%s;", (statement_id,))
-    lines = cur.fetchall()
+    cur.execute("""SELECT line_id, posted_date, amount, coalesce(counterparty, description,''),
+                          coalesce(description,'') || ' ' || coalesce(counterparty,'')
+                   FROM statement_line WHERE statement_id=%s;""", (statement_id,))
+    rows = cur.fetchall()
+    charges = {str(r[0]) for r in rows if is_bank_charge(r[4], r[2])}   # these pair on the exact date only
+    lines = [r[:4] for r in rows]
     txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
     used, matched_lines, matches = set(), set(), []
@@ -2976,6 +2989,9 @@ def run_matcher(statement_id):
     lines = [(str(a), b, c, d) for a, b, c, d in lines]
     txns = [(str(a), b, c, d) for a, b, c, d in txns]
 
+    def tol(l_id):
+        return 0 if l_id in charges else DATE_TOLERANCE_DAYS
+
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
     for l_id, ld, la, lw in lines:
@@ -2984,7 +3000,7 @@ def run_matcher(statement_id):
             if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
                 continue
             gap = abs((ld - td).days)
-            if gap <= DATE_TOLERANCE_DAYS and (best is None or gap < best[0]):
+            if gap <= tol(l_id) and (best is None or gap < best[0]):
                 best = (gap, t_id)
         if best:
             add([l_id], [best[1]], "exact", 1.0, 0); used.add(best[1]); matched_lines.add(l_id)
@@ -2993,7 +3009,7 @@ def run_matcher(statement_id):
     # tolerance (cheques presented late, items brought forward from last period). Confidence
     # below 1 puts these in the review list.
     for l_id, ld, la, lw in lines:
-        if l_id in matched_lines:
+        if l_id in matched_lines or l_id in charges:
             continue
         best = None
         for t_id, td, ta, tw in txns:
@@ -3012,7 +3028,7 @@ def run_matcher(statement_id):
         for t_id, td, ta, tw in txns:
             if t_id in used:
                 continue
-            if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= DATE_TOLERANCE_DAYS \
+            if lw and tw and lw.strip().lower() == tw.strip().lower() and abs((ld - td).days) <= tol(l_id) \
                     and ok("fuzzy", [l_id], [t_id]):
                 add([l_id], [t_id], "fuzzy", 0.6, la - ta); used.add(t_id); matched_lines.add(l_id); break
 
@@ -3052,8 +3068,9 @@ def run_matcher(statement_id):
         for l_id, ld, la in unmatched:
             if l_id in matched_lines:
                 continue
+            win = 0 if l_id in charges else GROUP_WINDOW_DAYS
             cands = sorted([(t, a, d) for (t, d, a, w) in txns
-                            if t not in used and abs((ld - d).days) <= GROUP_WINDOW_DAYS],
+                            if t not in used and abs((ld - d).days) <= win],
                            key=lambda c: abs((ld - c[2]).days))[:M2O_MAX_CANDS]
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
@@ -3071,7 +3088,7 @@ def run_matcher(statement_id):
     if len(unmatched_t) <= M2O_MAX_LINES:
         for t_id, td, ta in unmatched_t:
             cands = sorted([(l, a, d) for (l, d, a, w) in lines
-                            if l not in matched_lines and abs((td - d).days) <= GROUP_WINDOW_DAYS],
+                            if l not in matched_lines and abs((td - d).days) <= (0 if l in charges else GROUP_WINDOW_DAYS)],
                            key=lambda c: abs((td - c[2]).days))[:M2O_MAX_CANDS]
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
@@ -3095,7 +3112,7 @@ def run_matcher(statement_id):
         for t_id, td, ta, tw in txns:
             if t_id in used:
                 continue
-            if la == -ta and abs((ld - td).days) <= DATE_TOLERANCE_DAYS and ok("manual", [l_id], [t_id]):
+            if la == -ta and abs((ld - td).days) <= tol(l_id) and ok("manual", [l_id], [t_id]):
                 add([l_id], [t_id], "manual", 0.5, 0)
                 used.add(t_id); matched_lines.add(l_id); break
 
@@ -3289,7 +3306,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 @media print{.secnav{display:none}}
 </style>
 <div class=pagecols><nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
-<div class=wrap><h1>{{ name }}</h1>
+<div class=wrap><form class=acctswitch method=get action="{{ url_for('switch_account') }}"><label for=acctswitch>Account</label>
+<select id=acctswitch name=name onchange="if(this.value)location.href=this.options[this.selectedIndex].dataset.href">
+{% for label, accts in switch if accts %}<optgroup label="{{ label }}">{% for a in accts %}<option value="{{ a.name }}" data-href="{{ url_for('detail', name=a.name) }}"{% if a.name==name %} selected{% endif %}>{{ a.name }}{% if a.ccy %} · {{ a.ccy }}{% endif %}{% if a.p_end %} · to {{ a.p_end }}{% endif %}</option>{% endfor %}</optgroup>{% endfor %}
+</select><noscript><button type=submit class=btn-sm>Open</button></noscript></form>
+<style>.acctswitch{display:flex;align-items:center;gap:8px;margin:0 0 6px}.acctswitch label{font-size:13px;color:var(--muted)}
+.acctswitch select{max-width:100%;min-width:0;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:var(--panel);color:var(--ink)}
+@media print{.acctswitch{display:none}}</style>
+<h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
 <a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
@@ -4330,8 +4354,29 @@ def report(name):
                                   now=datetime.now(EAT).strftime("%d %b %Y, %H:%M"))
 
 
+def account_switch_list(cur):
+    """Active accounts for the switcher on an account page, grouped by where their reconciliation stands
+    (latest statement): in progress, signed off, or no statement yet."""
+    cur.execute("""SELECT a.name, a.currency, s.period_end, s.signed_off_at IS NOT NULL
+                   FROM account a LEFT JOIN LATERAL (SELECT period_end, signed_off_at FROM statement
+                       WHERE account_id=a.account_id ORDER BY created_at DESC LIMIT 1) s ON true
+                   WHERE coalesce(a.is_active,true) ORDER BY a.name;""")
+    groups = {"open": [], "signed": [], "none": []}
+    for n, ccy, pe, signed in cur.fetchall():
+        groups["none" if pe is None else "signed" if signed else "open"].append(
+            {"name": n, "ccy": (ccy or "").strip(), "p_end": pe.strftime("%d %b %Y") if pe else None})
+    return [("Reconciliation in progress", groups["open"]), ("Signed off", groups["signed"]),
+            ("No statement yet", groups["none"])]
+
+
 BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
                    "derived": "closing less movements", "qbo": "from QuickBooks"}
+
+
+@app.route("/switch")
+def switch_account():
+    """Account switcher without JavaScript: the form posts the name here."""
+    return redirect(url_for("detail", name=request.args.get("name", "")))
 
 
 @app.route("/account/<name>")
@@ -4343,6 +4388,7 @@ def detail(name):
         cur.close(); conn.close(); return "Unknown account", 404
     acct_uuid, atype, ccy, acct_qbo = row
     d = compute_detail(cur, acct_uuid, atype, acct_qbo)
+    switch = account_switch_list(cur)
     cur.close(); conn.close()
     rec_job = record_job(name)
     if rec_job and rec_job.get("state") in ("done", "failed", "stalled") and \
@@ -4356,7 +4402,7 @@ def detail(name):
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None),
-                                  mm_edit=session.pop("mm_edit", None), **d)
+                                  mm_edit=session.pop("mm_edit", None), switch=switch, **d)
 
 
 def _form_amount(field):
@@ -4807,7 +4853,8 @@ def _record_run(name, form, ids, user, progress=None):
                     problems.append(f"{label}: QuickBooks has no {foreign} rate for {d}. Type the rate "
                                     f"({home} per {foreign}) in the Rate box and record again"); continue
         if not kids:
-            twin = next((t for t in pool if str(t[0]) not in taken and t[2] == amt and abs((t[1] - d).days) <= TWIN_DAYS
+            twin_days = 0 if is_bank_charge(desc, amt) else TWIN_DAYS    # a bank charge: the same day only
+            twin = next((t for t in pool if str(t[0]) not in taken and t[2] == amt and abs((t[1] - d).days) <= twin_days
                          and (same_text(t[3], desc) or (payee and same_text(t[3], payee)))), None)
             if twin:
                 # QuickBooks already has it: pair the line with that entry; nothing is created or changed.
