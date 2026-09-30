@@ -3269,6 +3269,23 @@ def dashboard():
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
 <div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('manage_accounts') }}">Accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
+<style>
+.secnav{position:sticky;top:var(--navh,53px);z-index:4;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:8px max(24px,calc(50% - 476px));background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
+.secnav[hidden]{display:none}
+.secnav::-webkit-scrollbar{display:none}
+.secnav a{flex:none;white-space:nowrap;font-size:13px;color:var(--muted);padding:4px 11px;border:1px solid var(--line);border-radius:999px;background:var(--panel);transition:background .15s,color .15s,border-color .15s}
+.secnav a:hover{color:var(--ink)}
+.secnav a .n{opacity:.75;font-variant-numeric:tabular-nums}
+.secnav a.on{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:600}
+@media (max-width:760px){.secnav{padding:7px 15px}}
+@media (min-width:1260px){
+  .secnav{position:fixed;top:calc(var(--navh,53px) + 30px);left:calc(50% - 622px);width:132px;max-height:calc(100vh - var(--navh,53px) - 60px);overflow:auto;flex-direction:column;gap:2px;padding:0 0 0 10px;background:none;backdrop-filter:none;-webkit-backdrop-filter:none;border:0;border-left:1px solid var(--line)}
+  .secnav a{border:0;background:none;border-radius:calc(var(--radius) - 6px);padding:5px 9px;white-space:normal;line-height:1.35}
+  .secnav a.on{background:var(--accent-soft)}
+}
+@media print{.secnav{display:none}}
+</style>
+<nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
 <div class=wrap><h1>{{ name }}</h1>
 {% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
@@ -3782,6 +3799,61 @@ else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
 if(bt&&act.indexOf('/upload')<0&&act.indexOf('/import_books')<0&&act.indexOf('/sync')<0)t=bt;
 schedule(t);});
 window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
+})();</script>
+<script>// Section menu: built from the page's own h2[id^=sec-] headings, so conditional sections take care of themselves.
+(function(){
+var menu=document.getElementById('secnav'),topnav=document.querySelector('.nav');
+if(!menu||menu.getAttribute('data-built'))return;
+var heads=[].slice.call(document.querySelectorAll('h2[id^="sec-"]'));
+if(heads.length<2)return;
+menu.setAttribute('data-built','1');
+var NAMES={'sec-balance':'Balance','sec-review':'Suggested','sec-matched':'Matched','sec-record':'Record','sec-manual':'Match manually'};
+function label(h){
+  var t=(h.textContent||'').replace(/ +/g,' ').trim(),name=NAMES[h.id],n=null,m;
+  if(h.id==='sec-exceptions')name=/^Possible/.test(t)?'Transfers':'Not in books';
+  if(!name){name=t.split(' (')[0].split(' —')[0];if(name.length>22)name=name.slice(0,21)+'…';}
+  if((m=t.match(/([0-9]+) to review/)))n=+m[1];
+  else if((m=t.match(/[(]([^)]*)[)]/))){var ds=m[1].match(/[0-9][0-9,]*/g);if(ds){n=0;ds.forEach(function(x){n+=+x.split(',').join('');});}}
+  return {name:name,n:n};
+}
+var cur=null,offset=70;
+function wide(){return window.matchMedia?window.matchMedia('(min-width:1260px)').matches:window.innerWidth>=1260;}
+function setOn(a){
+  if(a===cur)return;if(cur)cur.classList.remove('on');cur=a;if(!a)return;a.classList.add('on');
+  if(!wide()&&menu.scrollWidth>menu.clientWidth){var l=a.offsetLeft-menu.offsetLeft;menu.scrollLeft=Math.max(0,l-(menu.clientWidth-a.offsetWidth)/2);}
+}
+var items=heads.map(function(h){
+  var l=label(h),a=document.createElement('a');a.href='#'+h.id;a.textContent=l.name;
+  if(l.n!==null){var s=document.createElement('span');s.className='n';s.textContent=' ('+l.n+')';a.appendChild(s);}
+  a.addEventListener('click',function(e){
+    if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+    e.preventDefault();
+    var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if(h.scrollIntoView)h.scrollIntoView({behavior:reduce?'auto':'smooth',block:'start'});
+    if(window.history&&history.pushState){if(location.hash!=='#'+h.id)history.pushState(null,'','#'+h.id);}else location.hash=h.id;
+    setOn(a);});
+  menu.appendChild(a);return a;});
+menu.hidden=false;
+function layout(){
+  var nh=(topnav&&topnav.offsetHeight)||53;menu.style.setProperty('--navh',nh+'px');
+  offset=nh+(wide()?0:menu.offsetHeight)+12;
+  heads.forEach(function(h){h.style.scrollMarginTop=offset+'px';});
+}
+function spy(){
+  var i=0,d=document.documentElement;
+  heads.forEach(function(h,k){if(h.getBoundingClientRect().top<=offset+8)i=k;});
+  if(d.scrollHeight>window.innerHeight&&window.innerHeight+(window.pageYOffset||d.scrollTop)>=d.scrollHeight-2)i=heads.length-1;
+  setOn(items[i]);
+}
+layout();spy();
+window.addEventListener('resize',function(){layout();spy();});
+if('IntersectionObserver' in window){
+  var io=new IntersectionObserver(function(){spy();},{rootMargin:'0px 0px -40% 0px',threshold:[0,1]});
+  heads.forEach(function(h){io.observe(h);});
+  window.addEventListener('scroll',function(){var d=document.documentElement;if(window.innerHeight+window.pageYOffset>=d.scrollHeight-2)spy();},{passive:true});
+}else{
+  var busy=false;window.addEventListener('scroll',function(){if(busy)return;busy=true;(window.requestAnimationFrame||setTimeout)(function(){busy=false;spy();});},{passive:true});
+}
 })();</script>
 </body></html>"""
 
