@@ -91,4 +91,66 @@ for (const hash of ["#sec-record", ""]) {
     check("result message says what's wrong", len(got) == 2 and "choose an account" in (got[0]["text"] or ""))
     check("…shown right under the record section heading", len(got) == 2 and got[0]["after"] == "sec-record")
     check("…and at the top when the page opens without a section", len(got) == 2 and got[1]["after"] != "sec-record")
+    # Section menu: built from the h2[id^=sec-] headings actually on the page, with their counts.
+    MENU = """
+const { JSDOM } = require("jsdom");
+const src = require("fs").readFileSync(process.argv[2], "utf8");
+for (const drop of [false, true]) {
+  // drop=true: the Suggested section isn't rendered (conditional sections must simply be left out).
+  const html = drop ? src.replace("id=sec-review", "id=x-review") : src;
+  const dom = new JSDOM(html, { runScripts: "dangerously", url: "http://app.test/account/Stanbic" });
+  const w = dom.window, d = w.document;
+  let scrolled = null; w.HTMLElement.prototype.scrollIntoView = function () { scrolled = this.id; };
+  const menu = d.getElementById("secnav");
+  const items = [...menu.querySelectorAll("a")];
+  const heads = [...d.querySelectorAll("h2[id^=sec-]")].map(h => ({ id: h.id, text: h.textContent }));
+  const out = { hidden: menu.hidden, heads, items: items.map(a => ({ href: a.getAttribute("href"), text: a.textContent })),
+                on: (menu.querySelector("a.on") || {}).textContent || null };
+  const rec = items.find(a => a.getAttribute("href") === "#sec-record");
+  if (rec) { rec.click(); out.hash = w.location.hash; out.scrolled = scrolled; out.onAfter = (menu.querySelector("a.on") || {}).textContent || null; }
+  out.overlay = d.getElementById("loadingov").classList.contains("on");
+  console.log(JSON.stringify(out));
+}"""
+    with tempfile.NamedTemporaryFile("wb", suffix=".html", delete=False) as f:
+        f.write(page.data)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8") as g:
+        g.write(MENU)
+    try:
+        res = subprocess.run([node, g.name, f.name], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+    finally:
+        os.unlink(f.name); os.unlink(g.name)
+    got = [json.loads(l) for l in res.stdout.splitlines() if l.startswith("{")]
+    if res.stderr.strip():
+        print(res.stderr[-1500:])
+    check("section menu script ran without errors", len(got) == 2 and "Error" not in res.stderr)
+    full, dropped = (got + [{}, {}])[:2]
+    import re
+    def count(text):
+        m = re.search(r"\(([^)]*)\)", text)
+        return sum(int(x) for x in re.findall(r"\d+", m.group(1))) if m else None
+    heads = full.get("heads", [])
+    items = full.get("items", [])
+    print("   menu:", " | ".join(i["text"] for i in items))
+    check("section menu is shown", full.get("hidden") is False)
+    check("…one item per section heading on the page, in page order",
+          len(heads) >= 4 and [i["href"] for i in items] == ["#" + h["id"] for h in heads])
+    rec_h = next((h for h in heads if h["id"] == "sec-record"), None)
+    rec_i = next((i for i in items if i["href"] == "#sec-record"), None)
+    check("…Record item carries the section's count",
+          rec_h and rec_i and rec_i["text"] == f"Record ({count(rec_h['text'])})")
+    man_i = next((i for i in items if i["href"] == "#sec-manual"), None)
+    check("…Match manually has no count", man_i and man_i["text"] == "Match manually")
+    mat_h = next((h for h in heads if h["id"] == "sec-matched"), None)
+    mat_i = next((i for i in items if i["href"] == "#sec-matched"), None)
+    check("…Matched shows its count", mat_h and mat_i and mat_i["text"] == f"Matched ({count(mat_h['text'])})")
+    check("…labels are short", all(len(i["text"]) <= 24 for i in items))
+    check("one item is highlighted on load", bool(full.get("on")))
+    check("clicking an item sets the hash", full.get("hash") == "#sec-record")
+    check("…scrolls to that heading", full.get("scrolled") == "sec-record")
+    check("…and highlights it", (full.get("onAfter") or "").startswith("Record"))
+    check("…without triggering the loading overlay", full.get("overlay") is False)
+    check("a section that isn't rendered isn't listed",
+          "#sec-review" in [i["href"] for i in items]
+          and "#sec-review" not in [i["href"] for i in dropped.get("items", [])]
+          and len(dropped.get("items", [])) == len(items) - 1)
 sys.exit(T.summary())
