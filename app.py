@@ -1392,6 +1392,23 @@ def match_items(cur, match_ids):
     return out
 
 
+def taken_elsewhere(cur, acct_uuid, line_ids):
+    """Lines logged as recorded whose QuickBooks entry is matched to a different bank line (an identical
+    line took it), while they themselves are unmatched: they still need recording."""
+    if not line_ids:
+        return set()
+    cur.execute("""SELECT w.line_id::text FROM writeback_log w
+                   JOIN book_txn bt ON bt.account_id=%s AND bt.source_txn_id=w.qbo_id AND bt.source_txn_type=w.qbo_type
+                   WHERE w.line_id = ANY(%s::uuid[]) AND w.status='done'
+                     AND EXISTS (SELECT 1 FROM match_book_txn mbt JOIN match m ON m.match_id=mbt.match_id
+                                 JOIN match_statement_line msl ON msl.match_id=m.match_id
+                                 WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed' AND msl.line_id<>w.line_id)
+                     AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                                     WHERE msl.line_id=w.line_id AND m.status='confirmed');""",
+                (acct_uuid, [str(x) for x in line_ids]))
+    return {r[0] for r in cur.fetchall()}
+
+
 def _claim_writeback(line_id, user):
     """Reserve a line for writing. Refuses if it's already done or an attempt is in flight --
     an interrupted attempt stays blocked until someone confirms it didn't reach QuickBooks."""
@@ -3465,6 +3482,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh.{% endif %}</div>{% endif %}</td>
 <td class=a>{{ w.amount|money }}</td>
 {% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">I checked — it's not in QuickBooks</button></td>
+{% elif w.wb == 'taken' %}<td colspan=3 style="white-space:normal"><span class=bad>The entry recorded for this line{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was paired with another identical line, so this one isn't in QuickBooks yet.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">Record this one again</button></td>
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
@@ -4134,6 +4152,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         cur.execute("SELECT line_id, status, qbo_id FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
                     ([str(l[0]) for l in unmatched_lines],))
         wb = {str(r[0]): (r[1], r[2]) for r in cur.fetchall()}
+        for l_id in taken_elsewhere(cur, acct_uuid, [k for k, v in wb.items() if v[0] == "done"]):
+            wb[l_id] = ("taken", wb[l_id][1])
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
     pool_ids = {str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
@@ -4153,7 +4173,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         status, qbo_id = wb.get(str(lid), (None, None))
         item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
                 "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
-                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done") else None,
+                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done", "taken") else None,
                 "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not, "xfer_only": xfer_only,
                 "is_xfer": bool(acct and acct.get("xfer")),
                 "dups": dups.get(str(lid), [])[:3]}
@@ -4929,6 +4949,15 @@ def _record_run(name, form, ids, user, progress=None):
                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,'unknown',now(),%s)
                           ON CONFLICT (account_id, source_txn_type, source_txn_id) DO NOTHING;""",
                        (ORG_ID, acct_uuid, new_id, entity, d, book_amt, ccy or "USD", b_desc, b_who, b_cat, used_ref))
+            # Pair the line with the entry made for it now, so a re-match can't give that entry to an
+            # identical line (the bank's charges repeat to the cent on the same day).
+            k2.execute("""SELECT txn_id::text FROM book_txn bt WHERE account_id=%s AND source_txn_type=%s AND source_txn_id=%s
+                            AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt JOIN match m ON m.match_id=mbt.match_id
+                                            WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed');""",
+                       (acct_uuid, entity, new_id))
+            mine = k2.fetchone()
+            if mine:
+                _confirm_match(k2, s[0], [lid], [mine[0]], user)
         if not parts:
             # Every recorded line teaches the suggestion engine (strongest tier).
             k2.execute("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref, currency)
@@ -5196,8 +5225,12 @@ def record_reset(name):
     lid = request.form.get("reset")
     if lid:
         conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+        a = cur.fetchone()
+        again = bool(a and taken_elsewhere(cur, a[0], [lid]))   # its entry went to an identical line
         cur.execute("""UPDATE writeback_log SET status='failed', error='cleared by ' || %s
-                       WHERE line_id=%s AND status='pending';""", (session.get("name") or "user", lid))
+                       WHERE line_id=%s AND (status='pending' OR (status='done' AND %s));""",
+                    (session.get("name") or "user", lid, again))
         conn.commit(); cur.close(); conn.close()
     return redirect(url_for("detail", name=name) + "#sec-record")
 

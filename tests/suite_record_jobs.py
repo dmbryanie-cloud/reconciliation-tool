@@ -153,6 +153,34 @@ check("recording a charge: an entry a day off isn't taken as it (recorded, no du
 cl.post("/account/Stanbic/record", data={"only": C3, f"acct_{C3}": "83"})
 check("…one on the same day is paired with it; nothing created", len(POSTS) == n + 1 and matched(C3))
 
+# ---- two identical charges on one day: each recorded entry stays with its own line --------------------------
+upload([("2026-09-30", "CASH DEPOSIT CHARGES", -925), ("2026-09-30", "CASH DEPOSIT CHARGES", -925)])
+D1, D2 = [str(r[0]) for r in q("""SELECT sl.line_id FROM statement_line sl JOIN statement s USING (statement_id)
+                                   WHERE sl.amount=-925 ORDER BY s.created_at DESC, sl.line_id LIMIT 2""")]
+sid = q("SELECT statement_id FROM statement ORDER BY created_at DESC LIMIT 1")[0][0]
+for x in (D2, D1):
+    cl.post("/account/Stanbic/record", data={"only": x, f"acct_{x}": "83"})
+    A.run_matcher(str(sid))
+own = lambda x: q("""SELECT bt.source_txn_id FROM match_statement_line msl JOIN match m USING (match_id)
+                     JOIN match_book_txn USING (match_id) JOIN book_txn bt USING (txn_id)
+                     WHERE msl.line_id=%s AND m.status='confirmed'""", (x,))
+wl = lambda x: q("SELECT qbo_id FROM writeback_log WHERE line_id=%s", (x,))
+check("identical charges: each line keeps the entry recorded for it through a re-match",
+      own(D1) == wl(D1) and own(D2) == wl(D2) and own(D1) != own(D2))
+# The old way (before the fix): a line logged as recorded whose entry an identical line took.
+q("DELETE FROM match WHERE match_id IN (SELECT match_id FROM match_statement_line WHERE line_id IN (%s,%s)) RETURNING 1", (D1, D2))
+gone = wl(D2)[0][0]                                   # QuickBooks has only one of the two
+q("UPDATE writeback_log SET qbo_id=%s WHERE line_id=%s RETURNING 1", (wl(D1)[0][0], D2))
+q("DELETE FROM book_txn WHERE source_txn_id=%s RETURNING 1", (gone,))
+A.run_matcher(str(sid))
+taken = [x for x in (D1, D2) if not own(x)]
+check("an entry taken by an identical line is flagged, with a way to record the line again",
+      len(taken) == 1 and "was paired with another identical line" in page())
+n = len(POSTS)
+cl.post("/account/Stanbic/record_reset", data={"reset": taken[0]})
+cl.post("/account/Stanbic/record", data={"only": taken[0], f"acct_{taken[0]}": "83"})
+check("…and it can be recorded again", len(POSTS) == n + 1 and own(taken[0]))
+
 # ---- switching accounts from the account page --------------------------------------------------------
 q(H.account_sql(("00000000-0000-0000-0000-0000000000a2", "36", "DFCU Idle", "bank")) + " SELECT 1")
 p = page()
