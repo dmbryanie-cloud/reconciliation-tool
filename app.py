@@ -2137,7 +2137,10 @@ def shell_data():
                        FROM account a
                        LEFT JOIN LATERAL (SELECT statement_id, signed_off_at FROM statement WHERE account_id = a.account_id
                                           ORDER BY created_at DESC LIMIT 1) s ON true
-                       WHERE coalesce(a.is_active, true) ORDER BY a.type, a.name;""")
+                       WHERE coalesce(a.is_active, true)
+                       -- no reconciliation yet first, then work in progress, then signed off (most recent last)
+                       ORDER BY (s.statement_id IS NOT NULL)::int + (s.signed_off_at IS NOT NULL)::int,
+                                s.signed_off_at NULLS FIRST, a.name;""")
         for nm, has, signed, n in cur.fetchall():
             d["accounts"].append({"name": nm, "n": n if has and not signed else 0,
                                   "state": "none" if not has else "ok" if signed or not n else "attn"})
@@ -4074,6 +4077,9 @@ def dashboard():
         cur.execute(f"""SELECT {STMT_COLS} FROM statement WHERE account_id=%s AND date_trunc('month', period_end)::date=%s
                         ORDER BY created_at DESC LIMIT 1;""", (a, month))
         rows.append(account_summary(cur, a, n, t, (ccy or "").strip() or None, cur.fetchone()))
+    # No statement yet first, then in progress, then signed off with the most recent sign-off last.
+    rows.sort(key=lambda r: ({"none": 0, "open": 1, "signed": 2}[r["status"]],
+                             r["signed_at"].timestamp() if r.get("signed_at") else 0, r["name"].lower()))
     cur.execute("SELECT count(*) FROM account WHERE NOT coalesce(is_active,true);")
     n_hidden = cur.fetchone()[0]
     cur.close(); conn.close()

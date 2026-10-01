@@ -40,6 +40,10 @@ dash = admin.get("/").data.decode()
 check("sidebar: product, company from QuickBooks, accounts with status", "<b>ReconBook</b><small>THE NORTH GREEN SCHOOL</small>" in dash
       and 'sdot attn"></span><span class=nm>Stanbic UGX</span><span class=cnt>1</span>' in dash
       and 'sdot none"></span><span class=nm>DFCU UGX' in dash)
+side = dash[dash.index("<aside class=side"):dash.index("</aside>")]
+check("…accounts with no reconciliation first, then work in progress", side.index(">DFCU UGX<") < side.index(">Stanbic UGX<"))
+tbl = dash[dash.index("<h2>Bank accounts</h2>"):]
+check("…the dashboard table in the same order", tbl.index("<b>DFCU UGX</b>") < tbl.index("<b>Stanbic UGX</b>"))
 check("…admins see Users and Settings", "Users &amp; permissions</a>" in dash and ">Settings</a>" in dash)
 check("dashboard: month close, attention list, checklist, per-currency totals", "September 2026 close" in dash
       and "Needs your attention" in dash and "Month-end checklist" in dash and '<div class=code>UGX</div>' in dash)
@@ -83,6 +87,11 @@ check("the rule can be switched off in Settings", A.rule("two_person") == 0)
 peter.post("/account/DFCU UGX/signoff")
 check("…then the preparer meets only the usual checks", "second person" not in msg(peter.get("/account/DFCU UGX").data.decode()))
 admin.post("/settings", data={"action": "signoff", "two_person": "1", "close_day": "10"})
+q("UPDATE statement SET signed_off_at=now() WHERE account_id=%s RETURNING 1", (DF,))
+q("UPDATE statement SET signed_off_at=now() - interval '1 day' WHERE account_id=%s RETURNING 1", (STB,))
+side = admin.get("/").data.decode(); side = side[side.index("<aside class=side"):side.index("</aside>")]
+check("signed off last, the most recent sign-off at the bottom", side.index(">Stanbic UGX<") < side.index(">DFCU UGX<"))
+q("UPDATE statement SET signed_off_at=NULL RETURNING 1")
 admin.post("/users", data={"action": "perm", "username": "peter.ssali", "perm": "record", "on": "0"})
 peter.post("/account/Stanbic UGX/record", data={"only": q("SELECT line_id::text FROM statement_line WHERE description='MYSTERY'")[0][0]})
 check("taking a tick away applies at once", "allow ‘record in quickbooks’" in msg(peter.get("/account/Stanbic UGX").data.decode()))
