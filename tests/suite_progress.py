@@ -153,6 +153,12 @@ out.opening = v("opening"); out.closing = v("closing"); out.book = v("book");
 const ob = d.getElementById("up-ob"); ob.value = "45000000"; ob.dispatchEvent(new w.FocusEvent("focusout", { bubbles: true })); out.typed = ob.value;
 ob.value = "1000DR"; ob.dispatchEvent(new w.FocusEvent("focusout", { bubbles: true })); out.odd = ob.value;
 const x = d.createElement("input"); x.setAttribute("inputmode", "decimal"); x.value = "9876543.21"; d.body.appendChild(x);
+const hov = el => { el.dispatchEvent(new w.MouseEvent("mouseover", { bubbles: true })); return el.getAttribute("title"); };
+out.hoverBook = hov(d.querySelector("input[name=book]"));
+const hinted = d.createElement("input"); hinted.title = "Pick it from the list"; hinted.value = "Office Supplies:Stationery"; d.body.appendChild(hinted);
+out.hoverHinted = hov(hinted);
+hinted.title = "Not in the list: pick one from it"; out.hoverChanged = hov(hinted);
+hinted.value = ""; out.hoverEmpty = hov(hinted);
 setTimeout(() => { out.added = x.value; out.errors = errors; console.log(JSON.stringify(out)); }, 30);
 """
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
@@ -168,6 +174,10 @@ setTimeout(() => { out.added = x.value; out.errors = errors; console.log(JSON.st
     check("browser: a typed amount gets its commas when you leave the box", o.get("typed") == "45,000,000")
     check("browser: …anything that isn't a plain number is left as typed", o.get("odd") == "1000DR")
     check("browser: amount boxes added later (split lines) are formatted too", o.get("added") == "9,876,543.21")
+    check("browser: hovering over a box shows what's in it", o.get("hoverBook") == "178,221,410.00")
+    check("browser: …above the box's own hint", o.get("hoverHinted") == "Office Supplies:Stationery\nPick it from the list")
+    check("browser: …keeping a hint a script changed meanwhile", o.get("hoverChanged") == "Office Supplies:Stationery\nNot in the list: pick one from it")
+    check("browser: …an empty box shows just its hint", o.get("hoverEmpty") == "Not in the list: pick one from it")
     check("browser: no script errors", o.get("errors") == [])
 r = cl.post("/account/Stanbic UGX/balances", data={"opening": "1,234,567.50", "closing": "-2,500,000.00", "book": "178,221,410.00"})
 check("amounts with commas are saved as numbers", q("SELECT opening_balance, closing_balance, book_balance FROM statement WHERE statement_id=%s", (sid,))

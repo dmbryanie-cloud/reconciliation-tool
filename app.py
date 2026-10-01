@@ -2085,13 +2085,25 @@ drawers().forEach(function(d){if(!d.hidden)dscrim.hidden=false});
 // Amount boxes (inputmode=decimal) show thousands separators: when the page opens, when a box is added,
 // and when you leave one. Decimals stay as typed; anything that isn't a plain number is left alone.
 // The server and the page scripts read amounts with the commas removed.
-function commas(inp){var v=(inp.value||'').trim(),m=v.replace(/,/g,'').match(/^(-?)(\d+)(\.\d*)?$/);
-  if(!m)return;var t=m[1]+m[2].replace(/\B(?=(\d{3})+(?!\d))/g,',')+(m[3]||'');if(t!==inp.value)inp.value=t}
+function commas(inp){var v=(inp.value||'').trim(),m=v.replace(/,/g,'').match(/^(-?)(\\d+)(\\.\\d*)?$/);
+  if(!m)return;var t=m[1]+m[2].replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+(m[3]||'');if(t!==inp.value)inp.value=t}
 function commasIn(root){[].forEach.call((root.querySelectorAll?root:document).querySelectorAll('input[inputmode=decimal]'),commas)}
 commasIn(document);
 document.addEventListener('focusout',function(e){var t=e.target;if(t&&t.matches&&t.matches('input[inputmode=decimal]'))commas(t)});
 if(window.MutationObserver)new MutationObserver(function(ms){ms.forEach(function(m){[].forEach.call(m.addedNodes,function(n){
   if(n.nodeType!==1)return;if(n.matches('input[inputmode=decimal]'))commas(n);else commasIn(n)})})}).observe(document.body,{childList:true,subtree:true});
+// Hovering over a box shows what's in it (a long account name or amount cut off by a narrow box),
+// above the box's own hint if it has one. Kept in step as the value changes.
+function hoverText(el){
+  var cur=el.getAttribute('title')||'';   // a page script may have changed the hint since: that's the hint now
+  if(!el.hasAttribute('data-hint')||cur!==(el.getAttribute('data-tset')||''))el.setAttribute('data-hint',cur);
+  var hint=el.getAttribute('data-hint'),v='';
+  if(el.tagName==='SELECT'){var o=el.options[el.selectedIndex];v=o&&o.value!==''?o.textContent.trim():''}
+  else if(!/^(password|hidden|checkbox|radio|file|submit|button)$/i.test(el.type||''))v=(el.value||'').trim();
+  var t=v&&hint&&hint!==v?v+'\\n'+hint:(v||hint);
+  if(t)el.setAttribute('title',t);else el.removeAttribute('title');el.setAttribute('data-tset',t||'')}
+document.addEventListener('mouseover',function(e){var t=e.target;if(t&&t.matches&&t.matches('input,select,textarea'))hoverText(t)});
+document.addEventListener('focusin',function(e){var t=e.target;if(t&&t.matches&&t.matches('input,select,textarea'))hoverText(t)});
 // Save & finish later: send the record table's ticks and choices along, so nothing is lost.
 var lf=document.getElementById('laterform');
 if(lf)lf.addEventListener('submit',function(){var rf=document.getElementById('recform');if(!rf)return;
@@ -3482,7 +3494,36 @@ def _pdf_lines(page):
             lines[-1].append(w)
         else:
             lines.append([w])
-    return [sorted(l, key=lambda w: w["x0"]) for l in lines]
+    lines = [sorted(l, key=lambda w: w["x0"]) for l in lines]
+    return _pdf_unwrap_amounts(lines)
+
+
+_AMT_CUT = re.compile(r"^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d?$")     # e.g. 1,488,000,000.0 (a digit short)
+_AMT_REST = re.compile(r"^\d{1,2}\)?(?:CR|DR|Cr|Dr)?$")
+
+
+def _pdf_unwrap_amounts(lines):
+    """A very large amount can overflow its column: the bank prints "1,488,000,000.0" and puts the last
+    digit on the next line, right under its end (Stanbic, billion-shilling FX deals). Join them again,
+    or the line would be read without its amount."""
+    for i, line in enumerate(lines[:-1]):
+        for w in line:
+            if not _AMT_CUT.match(w["text"]):
+                continue
+            # the wrapped end sits right under it, within a couple of text lines (a wrapped
+            # description can print in between)
+            for nxt in lines[i + 1:i + 3]:
+                if not nxt or nxt[0]["top"] - w["top"] > 3 * max(w["bottom"] - w["top"], 6):
+                    break
+                k = next((j for j, t in enumerate(nxt) if _AMT_REST.match(t["text"]) and abs(t["x1"] - w["x1"]) <= 3), None)
+                if k is None:
+                    continue
+                joined = w["text"] + nxt[k]["text"]
+                if re.search(r"\.\d{2}\)?(?:CR|DR|Cr|Dr)?$", joined):
+                    w["text"] = joined
+                    nxt.pop(k)
+                break
+    return [l for l in lines if l]
 
 
 def _pdf_header(line):
@@ -5805,6 +5846,8 @@ def detail(name):
             "Reading the statement stopped before finishing (the server restarted). Upload it again.")
         if up_job["state"] == "done":
             session["detail_ok"] = name
+        else:
+            session.pop("detail_ok", None)
         session["up_seen:" + name] = up_job.get("started")
     d["up_job"] = up_job if up_job and up_job.get("state") == "running" else None
     conn = get_conn(); cur = conn.cursor()
@@ -5898,6 +5941,7 @@ def upload(name):
     f = request.files.get("statement")
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
+    session.pop("detail_ok", None)      # a new upload: an earlier one's "uploaded" no longer applies
     job = upload_job(name)
     if job and job.get("state") == "running":
         session["detail_msg"] = "A statement for this account is still being read and matched. Wait for it to finish."

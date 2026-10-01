@@ -237,4 +237,27 @@ check("upload box takes PDFs and has a password field", "accept=.pdf,.csv,.ofx" 
 r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(b"Date,Description,Amount\n2026-04-02,X,-5\n"), "s.csv"),
             "closing_balance": "0"}, content_type="multipart/form-data")
 check("…CSV upload unaffected", r.status_code == 302 and stmt()[6] == "csv")
+# ---- an amount too wide for its column: the bank wraps its last digit onto the next line --------
+# (Stanbic year statement: "1,488,000,000.0" with the final "0" printed under it, a wrapped piece of
+# the description in between). It must be joined again, or the line is lost and balances break.
+wipe()
+WRAP = make_pdf([[
+    (40, 40, "STANBIC BANK UGANDA LIMITED"), (40, 70, "Statement Period: 01/06/2026 to 30/06/2026"),
+    (40, 85, "Account: 9030012345678  Currency: UGX"), *hdr(120),
+    (160, 135, "BALANCE B/F"), (BC, 135, "1,103,495,040.00", "r"),
+    (160, 147, "00000"),
+    *row(156, "15/06/2026", "FXPLSP~1160575~SPOT~SELL", "1,488,000,000.0", None, "-384,504,960.00"),
+    (160, 165, ".00"), (DC, 172, "0", "r"),
+    *row(185, "16/06/2026", "CASH DEPOSIT", None, "4,960.00", "-384,500,000.00"),
+    (160, 200, "Closing Balance"), (BC, 200, "-384,500,000.00", "r")]])
+r, page = upload(WRAP, period_start="2026-06-01", period_end="2026-06-30")
+got = lines()
+check("a wrapped billion-shilling amount is joined again and the line kept",
+      any(g[0] == "2026-06-15" and g[1] == D("-1488000000.00") for g in got))
+check("…and the running balances check out (nothing refused)", len(got) == 2 and "doesn" not in page)
+wipe()
+r, page = upload(make_pdf([[(40, 70, "Statement Period: 01/06/2026 to 30/06/2026"), *hdr(120), (160, 135, "BALANCE B/F"),
+                            (BC, 135, "100.00", "r"), *row(150, "15/06/2026", "X", "5.00", None, "999.00")]]))
+check("a refused PDF is never labelled as uploaded", "doesn" in page and "Statement uploaded." not in page)
+
 sys.exit(T.summary())
