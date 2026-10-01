@@ -183,4 +183,43 @@ r = cl.post("/account/Stanbic UGX/balances", data={"opening": "1,234,567.50", "c
 check("amounts with commas are saved as numbers", q("SELECT opening_balance, closing_balance, book_balance FROM statement WHERE statement_id=%s", (sid,))
       == [(D("1234567.50"), D("-2500000.00"), D("178221410.00"))])
 
+# A statement over several months (a year's PDF) that overlaps signed-off months is refused, naming
+# every one at once; any of them (not only the latest) can have its sign-off undone from Reports.
+CEN = "00000000-0000-0000-0000-0000000000c1"
+cur.execute(H.account_sql((CEN, "39", "Centenary UGX", "bank"))); c.commit()
+upload("Centenary UGX", [("2026-03-05", "MAR", 10)], "2026-03-01", "2026-03-31")
+upload("Centenary UGX", [("2026-04-05", "APR", 20)], "2026-04-01", "2026-04-30")
+upload("Centenary UGX", [("2026-05-05", "MAY", 30)], "2026-05-01", "2026-05-31")
+q("UPDATE statement SET signed_off_at=now(), signed_off_by='Jane' WHERE account_id=%s AND period_end <= '2026-04-30' RETURNING 1", (CEN,))
+year = [("2025-09-10", "SEP", 1), ("2026-03-05", "MAR", 10), ("2026-04-05", "APR", 20), ("2026-08-05", "AUG", 40)]
+body = "Date,Description,Amount\n" + "".join(f"{d},{x},{a}\n" for d, x, a in year)
+cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+        "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
+p = text("/account/Centenary UGX")
+check("a year overlapping two signed-off months is refused, naming both at once",
+      "already has 2 signed-off reconciliations inside these dates (01/09/2025 to 30/09/2026): "
+      "01/03/2026 to 31/03/2026; 01/04/2026 to 30/04/2026" in p)
+check("…says how to undo them, or upload only the later months", "Undo their sign-off under Reports" in p
+      and "upload only the months after 30/04/2026" in p and "Nothing was changed" in p)
+check("…and nothing was changed", q("SELECT count(*) FROM statement WHERE account_id=%s", (CEN,))[0][0] == 3)
+rp = text("/reports")
+mar = q("SELECT statement_id::text FROM statement WHERE account_id=%s AND period_start='2026-03-01'", (CEN,))[0][0]
+check("Reports offers Undo sign-off on every signed-off month, not just the latest", f'name=s value="{mar}"><button type=submit>Undo sign-off' in rp)
+cl.post("/account/Centenary UGX/reopen", data={"s": mar}, headers={"Referer": "http://localhost/reports"})
+check("…undoing an older month's sign-off reopens that month only",
+      q("SELECT period_start::text, signed_off_at IS NULL FROM statement WHERE account_id=%s ORDER BY period_start", (CEN,))
+      == [("2026-03-01", True), ("2026-04-01", False), ("2026-05-01", True)])
+check("…and says which", "(01/03/2026 to 31/03/2026): it&#39;s back in progress" in text("/reports"))
+cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+        "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
+check("with one still signed off, it names just that one", "already has a signed-off reconciliation inside these dates "
+      "(01/09/2025 to 30/09/2026): 01/04/2026 to 30/04/2026" in text("/account/Centenary UGX"))
+apr = q("SELECT statement_id::text FROM statement WHERE account_id=%s AND period_start='2026-04-01'", (CEN,))[0][0]
+cl.post("/account/Centenary UGX/reopen", data={"s": apr})
+cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+        "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
+check("once none is signed off, the year replaces the months it covers",
+      q("SELECT period_start::text, period_end::text FROM statement WHERE account_id=%s", (CEN,)) == [("2025-09-01", "2026-09-30")]
+      and "Statement uploaded." in text("/account/Centenary UGX"))
+
 sys.exit(T.summary())

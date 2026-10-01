@@ -1716,7 +1716,7 @@ h2{font-size:14px;font-weight:600;color:var(--ink);margin:22px 0 10px}
 .tile:last-child{border-right:0}
 .tile:hover{background:var(--row)}
 .tile .t-label{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
-.tile .t-val{font:500 18px/1.2 var(--f-num);margin-top:4px;font-variant-numeric:tabular-nums}
+.tile .t-val{font:500 18px/1.2 var(--f-num);margin-top:4px;font-variant-numeric:tabular-nums;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .tile.active{box-shadow:inset 0 -2px 0 var(--gold)}
 .tile .t-val.warn{color:var(--warn)}
 .t-top{display:flex;align-items:center;gap:6px}
@@ -2092,6 +2092,14 @@ commasIn(document);
 document.addEventListener('focusout',function(e){var t=e.target;if(t&&t.matches&&t.matches('input[inputmode=decimal]'))commas(t)});
 if(window.MutationObserver)new MutationObserver(function(ms){ms.forEach(function(m){[].forEach.call(m.addedNodes,function(n){
   if(n.nodeType!==1)return;if(n.matches('input[inputmode=decimal]'))commas(n);else commasIn(n)})})}).observe(document.body,{childList:true,subtree:true});
+// Big figures (billions) in the summary tiles shrink until they fit their box; the full figure is in the
+// tooltip either way. Redone when the window is resized.
+function fitFigs(){[].forEach.call(document.querySelectorAll('.tile .t-val,.ccy .v'),function(el){
+  el.style.fontSize='';if(!el.title)el.title=el.textContent.trim();
+  var px=parseFloat(getComputedStyle(el).fontSize)||16;
+  while(el.scrollWidth>el.clientWidth+1&&px>11){px-=1;el.style.fontSize=px+'px'}})}
+fitFigs();window.addEventListener('resize',fitFigs);
+if(document.fonts&&document.fonts.ready)document.fonts.ready.then(fitFigs);
 // Hovering over a box shows what's in it (a long account name or amount cut off by a narrow box),
 // above the box's own hint if it has one. Kept in step as the value changes.
 function hoverText(el){
@@ -2621,7 +2629,7 @@ REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ r.name }} {{ r.pe.strftime('%b %Y') }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
 <a href="{{ url_for('detail', name=r.name) }}">Open the account</a>
 <a href="{{ url_for('history', name=r.name) }}">History of this account</a>
-{% if r.signed and r.latest and can('reopen') %}<form method=post action="{{ url_for('reopen', name=r.name) }}" data-confirm="Undo the sign-off of {{ r.name }} for {{ r.ps }} to {{ r.pe }}? It goes back to in progress; sign it off again afterwards."><button type=submit>Undo sign-off</button></form>{% endif %}
+{% if r.signed and can('reopen') %}<form method=post action="{{ url_for('reopen', name=r.name) }}" data-confirm="Undo the sign-off of {{ r.name }} for {{ r.ps.strftime('%d/%m/%Y') }} to {{ r.pe.strftime('%d/%m/%Y') }}? It goes back to in progress; sign it off again afterwards, or replace it with a statement covering more months."><input type=hidden name=s value="{{ r.id }}"><button type=submit>Undo sign-off</button></form>{% endif %}
 {% if can('users') %}<div class=sep></div>{% if r.signed %}<span class=dh style="text-transform:none;letter-spacing:0">Signed off: undo the sign-off to delete it</span>
 {% else %}<form method=post action="{{ url_for('delete_reconciliation') }}" data-confirm="Delete the reconciliation of {{ r.name }} for {{ r.ps }} to {{ r.pe }}? Its statement lines, matches and review work are removed from the app. QuickBooks is not changed: anything already recorded there stays."><input type=hidden name=s value="{{ r.id }}"><button type=submit class=danger>Delete this reconciliation</button></form>{% endif %}{% endif %}
 </div></span></div></td></tr>
@@ -3940,9 +3948,15 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     signed = [o for o in overlap if o[3]]
     if signed:
         cur.close(); conn.close()
-        raise ValueError(f"Not uploaded: this account already has a signed-off reconciliation for {signed[0][1]} to "
-                         f"{signed[0][2]}, which these dates ({p_start} to {p_end}) overlap. Undo its sign-off, or "
-                         f"delete it under Reports, then upload again.")
+        dmy = lambda d: d.strftime("%d/%m/%Y")
+        periods = "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in signed)
+        n = len(signed)
+        raise ValueError(f"Not uploaded: this account already has {'a signed-off reconciliation' if n == 1 else f'{n} signed-off reconciliations'} "
+                         f"inside these dates ({dmy(p_start)} to {dmy(p_end)}): {periods}. Only one reconciliation per "
+                         f"period is kept, and a signed-off one is never replaced. Undo {'its' if n == 1 else 'their'} "
+                         f"sign-off under Reports (⋯ menu on {'its row' if n == 1 else 'each row'} → Undo sign-off), "
+                         f"then upload again; or upload only the months after {dmy(max(o[2] for o in signed))}. "
+                         f"Nothing was changed.")
     if overlap:
         delete_statements(cur, [o[0] for o in overlap])
         if has_request_context():
@@ -4290,11 +4304,11 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 {% else %}<tr><td colspan=8 class=muted>No bank accounts yet.{% if can('settings') %} Connect QuickBooks in <a href="{{ url_for('settings') }}" class=lnk>Settings</a>; its bank and card accounts appear here.{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>
 <style>.lnk{color:var(--accent);font-weight:600}
 .upto{font-size:11.5px;margin-top:3px;white-space:nowrap}
-.ccys{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:0 0 12px}
-.ccy{padding:11px 14px;display:grid;grid-template-columns:auto repeat(3,minmax(0,1fr));gap:3px 18px;align-items:center}
+.ccys{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin:0 0 12px}
+.ccy{padding:11px 14px;display:grid;grid-template-columns:auto minmax(0,2fr) minmax(0,1fr) minmax(0,1fr);gap:3px 18px;align-items:center}
 .ccy .code{font:600 21px/1 var(--f-num);color:var(--navy);grid-row:span 2;padding-right:12px;border-right:1px solid var(--line-soft)}
 .ccy .k{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
-.ccy .v{font:500 16px/1.2 var(--f-num);font-variant-numeric:tabular-nums}.ccy .v.bad{color:var(--bad)}
+.ccy .v{font:500 16px/1.2 var(--f-num);font-variant-numeric:tabular-nums;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.ccy .v.bad{color:var(--bad)}
 .dash2{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:12px;align-items:start;margin:0 0 12px}
 ul.attn{list-style:none;margin:0;padding:0}
 ul.attn li{display:grid;grid-template-columns:4px minmax(0,1fr) auto;gap:12px;align-items:center;padding:8px 14px 8px 0;border-bottom:1px solid var(--line-soft)}
@@ -4311,7 +4325,7 @@ ul.check li{display:flex;gap:10px;align-items:center;padding:5px 14px}
 .prog{display:flex;gap:8px;align-items:center}.prog .bar{flex:1}
 .tw{overflow-x:auto}
 @media (max-width:1000px){.dash2{grid-template-columns:minmax(0,1fr)}}
-@media (max-width:600px){.ccy{grid-template-columns:repeat(3,minmax(0,1fr))}.ccy .code{grid-row:auto;grid-column:1/-1;border:0}}</style>
+@media (max-width:600px){.ccy{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr)}.ccy .code{grid-row:auto;grid-column:1/-1;border:0}}</style>
 </div>""" + SHELL_END + """</body></html>"""
 
 
@@ -4467,7 +4481,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <label class=drop for=bk-file><b>Choose the QuickBooks CSV export</b><span><a href="{{ url_for('template', kind='books') }}">CSV template</a></span><input id=bk-file type=file name=books accept=.csv required></label></div>
 <div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Import books</button></div></form></aside>
 <style>
-.sumstrip{display:grid;grid-template-columns:minmax(0,1.4fr) repeat(4,minmax(0,.6fr)) minmax(0,1.1fr);background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:0 0 6px}
+.sumstrip{display:grid;grid-template-columns:minmax(0,1.3fr) repeat(3,minmax(0,.5fr)) minmax(0,1.3fr) minmax(0,1fr);background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:0 0 6px}
 .sumstrip .tile{border-right:1px solid var(--line-soft);display:flex;flex-direction:column;gap:3px;justify-content:center;padding:10px 14px;border-radius:0}
 .sumstrip .tile:first-child{border-radius:var(--radius) 0 0 var(--radius)}
 .sumstrip .t-val small{font:400 12px var(--f-ui);color:var(--faint)}
@@ -7371,15 +7385,22 @@ def reopen(name):
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if row:
-        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (row[0],))
+        sid = request.form.get("s") or ""
+        if _is_uuid(sid):        # a particular reconciliation (Reports), on this account
+            cur.execute("SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s AND statement_id=%s;",
+                        (row[0], sid))
+        else:
+            cur.execute("""SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s
+                           ORDER BY created_at DESC LIMIT 1;""", (row[0],))
         srow = cur.fetchone()
         if srow:
             cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
             conn.commit()
-            log_activity("undid the sign-off", name)
+            log_activity(f"undid the sign-off for {srow[1]} to {srow[2]}", name)
     cur.close(); conn.close()
     if "/reports" in (request.referrer or ""):
-        session["sync_msg"] = f"Sign-off undone for {name}: it's back in progress."
+        session["sync_msg"] = (f"Sign-off undone for {name}" + (f" ({srow[1]:%d/%m/%Y} to {srow[2]:%d/%m/%Y})" if row and srow else "")
+                               + ": it's back in progress.")
         return redirect(url_for("reports"))
     return redirect(url_for("detail", name=name))
 
