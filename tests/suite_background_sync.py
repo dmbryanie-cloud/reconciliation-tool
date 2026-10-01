@@ -113,7 +113,9 @@ body = r.get_data(as_text=True)
 check("upload during a sync doesn't sync", STATE["queries"] == q0)
 check("…loads the statement and explains", "Loaded 1 statement lines" in body and "sync is running" in body)
 r = cl.post("/account/Stanbic/balances", data={"action": "fetch_book"}, follow_redirects=True)
-check("balance fetch refused during a sync", STATE["queries"] == q0 and "Try again when it finishes" in r.get_data(as_text=True))
+check("balance fetch during a sync waits for it: fills in by itself when it finishes",
+      STATE["queries"] == q0 and "fills in by itself when it finishes" in r.get_data(as_text=True)
+      and "updating from QuickBooks after the sync" in r.get_data(as_text=True))
 
 # 4. a sync the server lost (restart) is shown as stopped, and can be run again
 job(beat=time.time() - A.SYNC_STALE_SECS - 5)

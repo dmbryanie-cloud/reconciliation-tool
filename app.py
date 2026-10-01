@@ -148,6 +148,9 @@ def _run_sync_job(full):
         scope = f"since {window}" if window else "all history"
         state, msg = "done", (f"Synced {n} transactions from QuickBooks ({scope}, {mode}; {timing}). "
                               f"Records fetched: {detail}.")
+        nb = refresh_book_balances()
+        if nb:
+            msg += f" Book balance updated on {nb} open reconciliation{'' if nb == 1 else 's'}."
     except Exception as e:
         state, msg = "failed", f"Sync failed: {e}"
     try:
@@ -156,6 +159,41 @@ def _run_sync_job(full):
         set_config("sync_job", json.dumps(job))
     except Exception:
         pass   # the job goes stale and the next Sync can start
+
+
+def refresh_book_balances():
+    """After a sync: set the book balance from QuickBooks on each account's open (not signed-off) latest
+    reconciliation, unless someone typed it in by hand. Covers a 'Get book balance' that had to wait for
+    the sync, and keeps an earlier fetched balance current. Returns how many were updated; a problem with
+    one account never fails the sync."""
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""SELECT DISTINCT ON (a.account_id) a.account_id, a.source_account_id, s.statement_id,
+                              s.period_end, s.signed_off_at, s.book_balance, s.book_balance_source
+                       FROM account a JOIN statement s ON s.account_id = a.account_id
+                       WHERE a.source_account_id IS NOT NULL AND coalesce(a.is_active, true)
+                       ORDER BY a.account_id, s.created_at DESC;""")
+        todo = [r for r in cur.fetchall() if not r[4] and (r[6] in ("qbo", "pending") or r[5] is None)]
+        cur.close(); conn.close()
+        if not todo:
+            return 0
+        _sync_step("Updating book balances")
+        token = qbo_token()
+    except Exception:
+        return 0
+    n = 0
+    for acct_uuid, acct_qbo, sid, pe, _, old, src in todo:
+        try:
+            bal = qbo_book_balance_at(token, acct_uuid, acct_qbo, pe)
+        except Exception:
+            continue
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""UPDATE statement SET book_balance=%s, book_balance_source='qbo'
+                       WHERE statement_id=%s AND signed_off_at IS NULL
+                         AND (book_balance_source IS NULL OR book_balance_source IN ('qbo','pending'));""", (bal, sid))
+        n += cur.rowcount if (old is None or _D(old) != _D(bal) or src != "qbo") else 0
+        conn.commit(); cur.close(); conn.close()
+    return n
 
 
 def start_sync(full=False, by=None):
@@ -1009,6 +1047,7 @@ try:
     # user / file / carried (previous signed-off closing) / derived (closing - movements) / qbo.
     for _col, _typ in (("opening_source", "text"), ("closing_source", "text"), ("book_balance", "numeric"),
                        ("book_balance_source", "text"), ("signoff_note", "text"),
+                       ("saved_later_at", "timestamptz"), ("saved_later_by", "text"),
                        ("snap_exact", "int"), ("snap_fuzzy", "int"), ("snap_m2o", "int"),
                        ("snap_exc", "int"), ("snap_diff", "numeric")):
         _cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {_col} {_typ};")
@@ -1648,6 +1687,10 @@ CSS = """<link rel=preconnect href="https://fonts.googleapis.com"><link rel=prec
 *{box-sizing:border-box}
 html{color-scheme:light}
 [hidden]{display:none!important}
+.spin-sm{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:4px}
+.bulkbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px;padding:5px 8px;font-size:13px;color:var(--muted);border:1px dashed transparent;border-radius:8px}
+.bulkbar.on{background:#f4f7fc;border-color:#c9d6ea;color:var(--ink,#1d2433)}.bulkbar .bk-n{margin-right:4px}
+.bulkbar button:disabled{opacity:.55;cursor:default}th.bk,td.bk{width:26px;padding-right:0!important}
 body{font-family:var(--f-ui);background:var(--bg);min-height:100vh;color:var(--ink);margin:0;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font-family:inherit}
 a{color:inherit;text-decoration:none}
@@ -1821,6 +1864,7 @@ td.a{white-space:nowrap}
 .snav a.on{background:var(--navy-2);color:#fff;box-shadow:inset 3px 0 0 var(--gold)}
 .snav a svg{flex:none;opacity:.85;width:16px;height:16px}
 .snav a .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.snav a .nm small.upto{display:block;font-size:10.5px;line-height:1.3;opacity:.62;font-weight:400;overflow:hidden;text-overflow:ellipsis}
 .snav a .cnt{margin-left:auto;font-size:11px;color:#8d99b1;font-variant-numeric:tabular-nums}
 .sdot{width:7px;height:7px;border-radius:50%;flex:none;background:#6b7790}
 .sdot.attn{background:#f08a3c}.sdot.ok{background:#4cc38a}
@@ -1890,6 +1934,7 @@ details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6p
 .rb-dlg p{margin:0;color:var(--muted);line-height:1.5}
 .rb-dlg .dlg-f{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px}
 .rb-dlg .btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+#flash.ok{background:#1f6b4a}#flash.ok b{display:block;margin-bottom:2px}
 #flash{position:fixed;right:16px;bottom:16px;z-index:80;background:var(--navy);color:#fff;border-radius:8px;padding:10px 38px 10px 14px;box-shadow:0 10px 26px rgba(19,33,59,.28);max-width:min(420px,calc(100% - 32px));font-size:13px;line-height:1.45;animation:tin .2s ease}
 #flash.err{background:#7a1a12}
 #flash .x{position:absolute;right:6px;top:6px;background:none;border:0;color:#cfd7e6;cursor:pointer;font-size:16px;line-height:1;padding:3px 6px}
@@ -1923,7 +1968,7 @@ SHELL_TOP = """{% set S = shell_data() %}<div class=app>
 <nav class=snav>
 <a href="{{ url_for('dashboard') }}" class="{{ 'on' if S.page=='dashboard' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11 12 4l8 7"/><path d="M6 10v9h12v-9"/></svg>Dashboard</a>
 {% if S.accounts %}<div class=lbl>Bank accounts</div>{% endif %}
-{% for a in S.accounts %}<a href="{{ url_for('detail', name=a.name) }}" class="{{ 'on' if a.name==S.acct else '' }}" data-busy="Loading {{ a.name }}..." title="{{ a.name }}"><span class="sdot {{ a.state }}"></span><span class=nm>{{ a.name }}</span>{% if a.n %}<span class=cnt>{{ a.n }}</span>{% endif %}</a>{% endfor %}
+{% for a in S.accounts %}<a href="{{ url_for('detail', name=a.name) }}" class="{{ 'on' if a.name==S.acct else '' }}" data-busy="Loading {{ a.name }}..." title="{{ a.name }}: {{ ('reconciled to ' ~ a.upto.strftime('%d/%m/%Y')) if a.upto else 'not reconciled yet' }}"><span class="sdot {{ a.state }}"></span><span class=nm>{{ a.name }}<small class=upto>{{ ('to ' ~ a.upto.strftime('%d/%m/%Y')) if a.upto else 'not reconciled yet' }}</small></span>{% if a.n %}<span class=cnt>{{ a.n }}</span>{% endif %}</a>{% endfor %}
 <div class=lbl>Manage</div>
 <a href="{{ url_for('reports') }}" class="{{ 'on' if S.page=='reports' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M9 13h6M9 16.5h6"/></svg>Reports</a>
 {% if can('users') %}<a href="{{ url_for('users') }}" class="{{ 'on' if S.page=='users' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.6-3.2 3-5 5.5-5s4.9 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2c2.2.1 4.3 1.6 5 4.3"/></svg>Users &amp; permissions</a>{% endif %}
@@ -2033,13 +2078,51 @@ window.rbOpenDrawer=function(n){var d=document.getElementById('dr-'+n);if(!d)ret
 document.addEventListener('click',function(e){var o=e.target.closest&&e.target.closest('[data-drawer]');if(o){e.preventDefault();rbOpenDrawer(o.getAttribute('data-drawer'));return}
   if(e.target.closest&&e.target.closest('[data-close]')){e.preventDefault();closeDrawers()}});
 dscrim.addEventListener('click',closeDrawers);
+document.addEventListener('submit',function(e){if(e.defaultPrevented)return;var d=e.target.closest&&e.target.closest('.drawer');
+  if(d)setTimeout(closeDrawers,0)});
 document.addEventListener('keydown',function(e){if(e.key==='Escape'&&dlg.hidden)closeDrawers()});
 drawers().forEach(function(d){if(!d.hidden)dscrim.hidden=false});
+// Amount boxes (inputmode=decimal) show thousands separators: when the page opens, when a box is added,
+// and when you leave one. Decimals stay as typed; anything that isn't a plain number is left alone.
+// The server and the page scripts read amounts with the commas removed.
+function commas(inp){var v=(inp.value||'').trim(),m=v.replace(/,/g,'').match(/^(-?)(\d+)(\.\d*)?$/);
+  if(!m)return;var t=m[1]+m[2].replace(/\B(?=(\d{3})+(?!\d))/g,',')+(m[3]||'');if(t!==inp.value)inp.value=t}
+function commasIn(root){[].forEach.call((root.querySelectorAll?root:document).querySelectorAll('input[inputmode=decimal]'),commas)}
+commasIn(document);
+document.addEventListener('focusout',function(e){var t=e.target;if(t&&t.matches&&t.matches('input[inputmode=decimal]'))commas(t)});
+if(window.MutationObserver)new MutationObserver(function(ms){ms.forEach(function(m){[].forEach.call(m.addedNodes,function(n){
+  if(n.nodeType!==1)return;if(n.matches('input[inputmode=decimal]'))commas(n);else commasIn(n)})})}).observe(document.body,{childList:true,subtree:true});
+// Save & finish later: send the record table's ticks and choices along, so nothing is lost.
+var lf=document.getElementById('laterform');
+if(lf)lf.addEventListener('submit',function(){var rf=document.getElementById('recform');if(!rf)return;
+  [].forEach.call(lf.querySelectorAll('.carry'),function(x){x.remove()});
+  new FormData(rf).forEach(function(v,k){if(typeof v!=='string')return;var h=document.createElement('input');h.type='hidden';h.className='carry';h.name=k;h.value=v;lf.appendChild(h)})});
+// Bulk bars, the same in every section: tick rows (or the header box), then act on them all at once.
+// <form class=bulkbar id=X data-one data-many> with buttons data-label / data-ask ("{n} {noun}") /
+// data-need (count only ticks carrying that attribute); tick boxes are input.bk-pick[form=X], header .bk-all[data-for=X].
+document.querySelectorAll('form.bulkbar').forEach(function(bf){
+  var id=bf.id,picks=[].slice.call(document.querySelectorAll('input.bk-pick[form="'+id+'"]')),
+      all=document.querySelector('input.bk-all[data-for="'+id+'"]'),lab=bf.querySelector('.bk-n'),empty=lab?lab.textContent:'',
+      btns=[].slice.call(bf.querySelectorAll('button[data-label]')),one=bf.getAttribute('data-one')||'item',many=bf.getAttribute('data-many')||'items';
+  function ticked(b){var need=b&&b.getAttribute('data-need');return picks.filter(function(p){return p.checked&&(!need||p.hasAttribute(need))}).length}
+  function upd(){var n=ticked(null);
+    btns.forEach(function(b){var k=ticked(b);b.disabled=!k;b.textContent=b.getAttribute('data-label')+(k?' ('+k+')':'')});
+    if(lab)lab.textContent=n?n+' '+(n==1?one:many)+' ticked':empty;
+    if(all){all.checked=n>0&&n===picks.length;all.indeterminate=n>0&&n<picks.length}
+    bf.classList.toggle('on',n>0)}
+  picks.forEach(function(p){p.addEventListener('change',upd)});
+  if(all)all.addEventListener('change',function(){picks.forEach(function(p){p.checked=all.checked});upd()});
+  bf.addEventListener('submit',function(e){if(bf._rbok){bf._rbok=false;return}var sb=e.submitter||bf.querySelector('button[data-label]:not(:disabled)');e.preventDefault();
+    if(!sb)return;var k=ticked(sb);if(!k)return;
+    rbAsk((sb.getAttribute('data-ask')||'Go ahead with {n} {noun}?').replace('{n}',k).replace('{noun}',k==1?one:many),
+      function(){rbResubmit(bf,sb)},{yes:sb.getAttribute('data-yes')||sb.getAttribute('data-label')})});
+  upd();
+});
 // The result of the last action: a message in the corner that fades (problems stay until closed).
 var fl=document.getElementById('flash');
-if(fl){var bad=/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
+if(fl){var bad=!fl.classList.contains('ok')&&/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
   var x=document.createElement('button');x.type='button';x.className='x';x.setAttribute('aria-label','Close');x.textContent='\\u00d7';
-  x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad)setTimeout(function(){fl.hidden=true},6000)}
+  x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad&&!fl.hasAttribute('data-stay'))setTimeout(function(){fl.hidden=true},6000)}
 })();</script>
 """
 
@@ -2140,6 +2223,8 @@ def shell_data():
             d["synced"] = _ago(age) if age < 5400 else last_sync_label()
         conn = get_conn(); cur = conn.cursor()
         cur.execute("""SELECT a.name, s.statement_id IS NOT NULL, s.signed_off_at IS NOT NULL,
+                              (SELECT max(period_end) FROM statement x WHERE x.account_id = a.account_id
+                                 AND x.signed_off_at IS NOT NULL),
                               (SELECT count(*) FROM statement_line sl WHERE sl.statement_id = s.statement_id AND sl.amount <> 0
                                  AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
                                                  WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
@@ -2150,8 +2235,8 @@ def shell_data():
                        -- no reconciliation yet first, then work in progress, then signed off (most recent last)
                        ORDER BY (s.statement_id IS NOT NULL)::int + (s.signed_off_at IS NOT NULL)::int,
                                 s.signed_off_at NULLS FIRST, a.name;""")
-        for nm, has, signed, n in cur.fetchall():
-            d["accounts"].append({"name": nm, "n": n if has and not signed else 0,
+        for nm, has, signed, upto, n in cur.fetchall():
+            d["accounts"].append({"name": nm, "n": n if has and not signed else 0, "upto": upto,
                                   "state": "none" if not has else "ok" if signed or not n else "attn"})
         cur.close(); conn.close()
     except Exception:
@@ -3014,8 +3099,8 @@ def require_login():
 
 # Which tick each action needs (anything not listed: any signed-in user).
 PERM_BY_ENDPOINT = {
-    "upload": "upload", "import_books": "upload", "balances": "upload",
-    "review_match": "review", "review_all": "review", "manual_match": "review", "unmatch": "review",
+    "upload": "upload", "upload_status": "upload", "import_books": "upload", "balances": "upload",
+    "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
     "transfer_change": "record", "record_reset": "record",
@@ -3512,7 +3597,7 @@ def _pdf_breaks(seq, start):
     return bad, out
 
 
-def parse_pdf(data, password=None, opening_hint=None):
+def parse_pdf(data, password=None, opening_hint=None, progress=None):
     """Statement lines from a bank's PDF statement. Returns _Rows like the CSV/OFX parsers."""
     try:
         import pdfplumber
@@ -3532,7 +3617,15 @@ def parse_pdf(data, password=None, opening_hint=None):
     try:
         if len(pages) > PDF_MAX_PAGES:
             raise ValueError(f"That PDF has {len(pages)} pages; the limit is {PDF_MAX_PAGES}. Split it by month.")
-        page_lines = [_pdf_lines(p) for p in pages]
+        page_lines = []
+        for i, p in enumerate(pages):
+            page_lines.append(_pdf_lines(p))
+            try:
+                p.close()          # drop the page's parsed objects; only its text lines are kept
+            except Exception:
+                pass
+            if progress and (i % 10 == 9 or i == len(pages) - 1):
+                progress(f"Reading the PDF: page {i + 1} of {len(pages)}")
     finally:
         pdf.close()
     if not any(page_lines):
@@ -4073,9 +4166,29 @@ def run_matcher(statement_id):
     return None
 
 
+def reconciled_to(cur, acct_uuid):
+    """The date an account is reconciled up to: the end of its latest signed-off reconciliation (or None)."""
+    cur.execute("SELECT max(period_end) FROM statement WHERE account_id=%s AND signed_off_at IS NOT NULL;", (acct_uuid,))
+    return cur.fetchone()[0]
+
+
+def cleared_to(cur, sid, ps, pe):
+    """How far an open reconciliation has got: every bank line dated up to this day is matched (or
+    recorded). The period end once all are; None while the first day still has open lines."""
+    cur.execute("""SELECT min(sl.posted_date) FROM statement_line sl WHERE sl.statement_id=%s AND sl.amount <> 0
+                     AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                                     WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');""", (sid,))
+    first_open = cur.fetchone()[0]
+    if first_open is None:
+        return pe
+    day = first_open - timedelta(days=1)
+    return day if day >= ps else None
+
+
 def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
     s = _latest_statement(cur, acct_uuid) if stmt is False else stmt
-    if not s: return {"name": name, "type": atype, "status": "none", "currency": currency}
+    rec_to = reconciled_to(cur, acct_uuid)
+    if not s: return {"name": name, "type": atype, "status": "none", "currency": currency, "rec_to": rec_to}
     sid, ps, pe, signed = s[:4]
     cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
                           count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
@@ -4083,8 +4196,9 @@ def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
                               WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
                    FROM statement_line sl WHERE sl.statement_id = %s;""", (sid,))
     n_lines, n_matched = cur.fetchone()
-    cur.execute("SELECT prepared_by, signed_off_by FROM statement WHERE statement_id=%s;", (sid,))
-    prep, by = cur.fetchone() or (None, None)
+    cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (sid,))
+    prep, by, saved_at, saved_by = cur.fetchone() or (None, None, None, None)
+    clr = None if signed else cleared_to(cur, sid, ps, pe)
     cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status='confirmed' GROUP BY match_type;", (sid,))
     mc = dict(cur.fetchall())
     rec = reconcile(cur, acct_uuid, s)
@@ -4094,7 +4208,8 @@ def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
             "m2o": mc.get("many_to_one", 0), "exc": exc, "rec_status": rec["status"],
             "rec_diff": rec["rec_diff"], "missing": rec["missing"], "n_lines": n_lines, "n_matched": n_matched,
             "n_unmatched": n_lines - n_matched, "n_pending": rec["n_pending"], "prep": prep, "by": by,
-            "signed_at": signed, "pct": int(n_matched * 100 / n_lines) if n_lines else 100}
+            "signed_at": signed, "pct": int(n_matched * 100 / n_lines) if n_lines else 100,
+            "rec_to": rec_to, "cleared_to": clr, "saved_at": None if signed else saved_at, "saved_by": saved_by}
 
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · ReconBook</title>""" + CSS + """</head><body>
@@ -4121,18 +4236,19 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <div class=tw><table>
 <thead><tr><th>Account</th><th>Currency</th><th>Statement period</th><th style="min-width:170px">Progress</th><th>Status</th><th class=a>Difference</th><th>Prepared / approved</th><th></th></tr></thead>
 <tbody>{% for r in rows %}<tr data-status="{{ r.status }}">
-<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a></td>
+<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a><div class="upto {{ '' if r.rec_to else 'faint' }}">{% if r.rec_to %}Reconciled to <b>{{ r.rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</div></td>
 <td>{{ r.currency or '—' }}</td>
 {% if r.status=='none' %}<td class=faint>{{ 'No ' ~ month_label ~ ' statement' }}</td><td></td><td><span class="pill none">Not started</span></td><td class="a faint">—</td><td class=faint>—</td>
 <td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}?upload=1" data-busy="Loading {{ r.name }}...">Upload</a></td>
 {% else %}<td>{{ r.p_start.strftime('%d %b') }} – {{ r.p_end.strftime('%d %b %Y') }}</td>
-<td><div class=prog><div class="bar{{ '' if r.pct == 100 else ' attn' }}"><i style="width:{{ r.pct }}%"></i></div><span class="faint num">{{ r.n_matched }}/{{ r.n_lines }}</span></div></td>
+<td><div class=prog><div class="bar{{ '' if r.pct == 100 else ' attn' }}"><i style="width:{{ r.pct }}%"></i></div><span class="faint num">{{ r.n_matched }}/{{ r.n_lines }}</span></div>{% if r.status=='open' %}<div class="faint upto">{% if r.cleared_to %}Cleared to {{ r.cleared_to.strftime('%d/%m/%Y') }}{% else %}Nothing cleared yet{% endif %}</div>{% endif %}</td>
 <td>{% if r.status=='signed' %}<span class="pill ok">Signed off</span>{% elif r.rec_status=='balanced' %}<span class="pill info">Balanced</span>{% elif r.rec_status=='out' %}<span class="pill bad">Out of balance</span>{% else %}<span class="pill attn">In progress</span>{% endif %}</td>
 <td class=a>{% if r.rec_status=='balanced' %}0.00{% elif r.rec_status=='out' %}<span class=bad>{{ r.rec_diff|money }}</span>{% else %}<span class=faint>needs {{ r.missing }}</span>{% endif %}</td>
 <td class=muted>{{ r.prep or '—' }}{% if r.by %} / {{ r.by }}{% endif %}</td>
-<td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}...">{{ 'Open' if r.status=='signed' else 'Continue' }}</a></td>{% endif %}</tr>
+<td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}...">{{ 'Open' if r.status=='signed' else 'Continue' }}</a>{% if r.saved_at %}<div class="faint upto" title="Saved for later">Saved {{ r.saved_at.astimezone(eat).strftime('%d/%m %H:%M') }}{% if r.saved_by %} · {{ r.saved_by }}{% endif %}</div>{% endif %}</td>{% endif %}</tr>
 {% else %}<tr><td colspan=8 class=muted>No bank accounts yet.{% if can('settings') %} Connect QuickBooks in <a href="{{ url_for('settings') }}" class=lnk>Settings</a>; its bank and card accounts appear here.{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>
 <style>.lnk{color:var(--accent);font-weight:600}
+.upto{font-size:11.5px;margin-top:3px;white-space:nowrap}
 .ccys{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:0 0 12px}
 .ccy{padding:11px 14px;display:grid;grid-template-columns:auto repeat(3,minmax(0,1fr));gap:3px 18px;align-items:center}
 .ccy .code{font:600 21px/1 var(--f-num);color:var(--navy);grid-row:span 2;padding-right:12px;border-right:1px solid var(--line-soft)}
@@ -4255,9 +4371,12 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div class=ph><div><h1>{{ name }}</h1>
 <div class=meta>{% if not has_results %}<span class="pill none">No statement yet</span>{% elif signed_off %}<span class="pill ok">Signed off</span>{% elif rec.status=='balanced' %}<span class="pill info">Balanced</span>{% elif rec.status=='out' %}<span class="pill bad">Out of balance</span>{% else %}<span class="pill attn">In progress</span>{% endif %}
 {% if ccy %}<span>{{ ccy }}</span>{% endif %}{% if atype=='credit_card' %}<span class=faint>·</span><span>Credit card</span>{% endif %}
-{% if has_results %}<span class=faint>·</span><span>Statement {{ p_start }} to {{ p_end }}</span>{% endif %}
+<span class=faint>·</span><span title="The end of the latest signed-off reconciliation">{% if rec_to %}Reconciled to <b>{{ rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</span>
+{% if has_results %}<span class=faint>·</span><span>Statement {{ p_start }} to {{ p_end }}</span>{% if not signed_off %}<span class=faint>·</span><span title="Every bank line up to this date is matched or recorded">{% if cleared %}Cleared to <b>{{ cleared.strftime('%d/%m/%Y') }}</b>{% else %}Nothing cleared yet{% endif %}</span>{% endif %}{% endif %}
+{% if saved_at and not signed_off %}<span class=faint>·</span><span>Saved for later {{ saved_at.strftime('%d/%m/%Y %H:%M') }}{% if saved_by %} by {{ saved_by }}{% endif %}</span>{% endif %}
 {% if prep %}<span class=faint>·</span><span>Prepared by {{ prep }}</span>{% endif %}{% if signed_by %}<span class=faint>·</span><span>Approved by {{ signed_by }}{% if signed_off %} on {{ signed_off }}{% endif %}</span>{% endif %}</div></div>
 <div class=acts>
+{% if has_results and not signed_off %}<form method=post action="{{ url_for('save_later', name=name) }}" id=laterform class=btnrow style="margin:0"><button type=submit class=btn-sm data-busy="Saving your work..." title="Keep everything as it is (including what's ticked and chosen to record) and continue another time">Save &amp; finish later</button></form>{% endif %}
 {% if can('upload') %}<button type=button class=btn-sm data-drawer=upload><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 16v4h16v-4"/></svg>Upload statement</button>{% endif %}
 <a href="{{ url_for('history', name=name) }}" class=btn-sm>History</a>
 {% if has_results %}<a href="{{ url_for('report', name=name) }}" class=btn-sm target=_blank rel=noopener title="Print reconciliation report">Report</a>{% endif %}
@@ -4273,7 +4392,15 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </div></div>
 {% if atype=='credit_card' %}<div class=help>Credit card: charges are positive and payments or refunds negative, as in your QuickBooks card register.</div>{% endif %}
 {{ sync_banner() }}
-{% if detail_msg %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}
+{% if up_job %}<div id=upjob class=syncbar data-url="{{ url_for('upload_status', name=name) }}" style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;font-weight:550;line-height:1.5"><span class=spin-sm></span> Reading and matching your statement{% if up_job.file %} ({{ up_job.file }}){% endif %}: <span class=uj-step>{{ up_job.step }}</span>. A year's statement takes a few minutes; you can keep working, and this page refreshes when it's done.</div>
+<script>(function(){var b=document.getElementById('upjob');if(!b||!window.fetch)return;var dirty=false;
+document.addEventListener('input',function(){dirty=true},true);
+function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
+  if(j.state==='running'){b.querySelector('.uj-step').textContent=j.step||'';setTimeout(tick,3000)}
+  else if(dirty){b.innerHTML='The statement is ready. <a href="" onclick="location.reload();return false">Reload to see it</a>'}
+  else location.reload()}).catch(function(){setTimeout(tick,6000)})}
+setTimeout(tick,3000)})();</script>{% endif %}
+{% if detail_msg %}{% if detail_ok %}<div id=flash role=status class=ok data-stay><b>Statement uploaded.</b> {{ detail_msg }}</div>{% else %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}{% endif %}
 {% if not has_results %}<div class="panel empty"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M12 11v6"/><path d="m9.5 13.5 2.5-2.5 2.5 2.5"/></svg>
 <div><b>No statement yet.</b> Upload this account's bank statement (PDF, CSV or OFX) to start the reconciliation.</div>
 {% if can('upload') %}<button type=button class=btn data-drawer=upload>Upload statement</button>{% endif %}</div>{% endif %}
@@ -4292,7 +4419,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></details>
 <div class=help style="margin:0">{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}</div>
 </div>
-<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Upload &amp; reconcile</button></div></form></aside>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Uploading the file...">Upload &amp; reconcile</button></div></form></aside>
 <aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
 <div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b><div class=help style="margin:0">For working offline: a QuickBooks register exported as CSV. When QuickBooks is connected the books are read directly, with no export needed.</div>
@@ -4359,12 +4486,12 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <form method=post action="{{ url_for('balances', name=name) }}" class=balform>
 <div><label>Period start</label><input type=date name=period_start value="{{ p_start }}"></div>
 <div><label>Period end</label><input type=date name=period_end value="{{ p_end }}"></div>
-<div><label>Opening balance</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening }}"></div>
-<div><label>Closing balance (statement)</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing }}"></div>
-<div><label>Book balance at {{ p_end }}</label><input name=book inputmode=decimal value="{{ '' if rec.book is none else rec.book }}"></div>
+<div><label>Opening balance</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening|money }}"></div>
+<div><label>Closing balance (statement)</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing|money }}"></div>
+<div><label>Book balance at {{ p_end }}</label><input name=book inputmode=decimal value="{{ '' if rec.book is none else rec.book|money }}"></div>
 <button type=submit class=btn-sm>Save balances</button>
 </form>
-{% if qbo_linked %}<form method=post action="{{ url_for('balances', name=name) }}" style="margin:8px 0 0"><input type=hidden name=action value=fetch_book><button type=submit class=btn-sm>Get book balance from QuickBooks</button> <span class=muted style="font-size:12px">Syncs first, then reads the account balance as at {{ p_end }}.</span></form>{% endif %}
+{% if qbo_linked %}<form method=post action="{{ url_for('balances', name=name) }}" style="margin:8px 0 0"><input type=hidden name=action value=fetch_book><button type=submit class=btn-sm>Get book balance from QuickBooks</button> <span class=muted style="font-size:12px">Reads the account balance as at {{ p_end }} (refreshing the books first if needed). A balance from QuickBooks updates by itself after each sync; one you type in is kept.</span></form>{% endif %}
 <div class=muted style="font-size:12px;margin-top:8px;line-height:1.5">Book balance is the account's register (or Balance Sheet) balance in QuickBooks as at the statement end date{{ ' — enter what you owe as a positive number' if cc else '' }}. Blank opening falls back to the last signed-off closing balance.</div>
 </details>
 <div style="margin-bottom:8px">
@@ -4376,9 +4503,13 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px" data-sec data-state="{{ 'attn' if n_pending else 'done' }}" data-note="{{ (n_pending ~ ' to review') if n_pending else 'All reviewed' }}">Suggested matches{% if n_pending %} — {{ n_pending }} to review{% endif %}</h2>
 <div class=help>Close but not exact pairs. They only count once you confirm them. <details class=how><summary>How this works</summary><div>Suggested when the payee matches but the amount differs slightly, a bank line cleared later than it was booked, or several bank lines add up to one QuickBooks entry (batched).{% if n_signflip %} {{ n_signflip }} {{ 'is an' if n_signflip==1 else 'are' }} opposite-sign pairing{{ '' if n_signflip==1 else 's' }} (same amount, flipped sign): usually a transfer entered the wrong way round.{% endif %} Confirm the right ones and reject the rest; Edit pairing changes which items are paired.</div></details></div>
-{% if n_pending > 1 %}<form method=post action="{{ url_for('review_all', name=name) }}" style="margin:0 0 4px" data-confirm="Confirm all {{ n_pending }} suggested matches? They count as matched; you can undo each one afterwards."><button type=submit class=btn-sm>Confirm all {{ n_pending }}</button></form>{% endif %}
-<table><tr><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
+{% if n_pending %}<form method=post action="{{ url_for('review_bulk', name=name) }}" id=revbulk class=bulkbar data-one="suggested match" data-many="suggested matches">
+<span class=bk-n>Tick suggestions to confirm or reject them together</span>
+<button type=submit name=status value=confirmed class="btn-sm pri" data-label="Confirm selected" data-yes="Confirm" data-busy="Confirming the matches..." data-ask="Confirm {n} {noun}? They count as matched; you can undo each one afterwards.">Confirm selected</button>
+<button type=submit name=status value=rejected class=btn-sm data-label="Reject selected" data-yes="Reject" data-busy="Rejecting the suggestions..." data-ask="Reject {n} {noun}? Their bank lines stay unmatched; you can undo each one afterwards.">Reject selected</button></form>{% endif %}
+<table><tr><th class=bk>{% if n_pending %}<input type=checkbox class=bk-all data-for=revbulk title="Select all to review" aria-label="Select all suggestions to review">{% endif %}</th><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
+<td class=bk>{% if r.status=='proposed' %}<input type=checkbox name=mid value="{{ r.id }}" form=revbulk class=bk-pick aria-label="Select this suggestion">{% endif %}</td>
 <td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched total')) }}</span></td>
 <td class=desc>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
@@ -4503,7 +4634,7 @@ function ranked(list,q){
   hits.sort(function(x,y){return x.sc-y.sc||x.a.rank-y.a.rank});
   return hits.map(function(h){return h.a});
 }
-var fmt=function(v){return v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})};
+var fmt=function(v){return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})};
 var bulk=document.querySelector('#recform button[name=bulk]'),cnt=document.getElementById('selcount');
 // "Selected 3 of 25 transactions" next to the button, and on the button's progress message.
 function count(){
@@ -4698,7 +4829,7 @@ f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='bulk'
   var n=0,t=0;document.querySelectorAll('.rsel:checked').forEach(function(c){n++;t+=Math.abs(parseFloat(c.getAttribute('data-amt'))||0)});
   if(!n){e.preventDefault();return}
   if(f._rbok){f._rbok=false;return}
-  e.preventDefault();rbAsk('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString(undefined,{minimumFractionDigits:2})+' in QuickBooks? Each is posted dated as on the statement.',function(){rbResubmit(f,b)},{yes:'Record'});});}
+  e.preventDefault();rbAsk('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString('en-US',{minimumFractionDigits:2})+' in QuickBooks? Each is posted dated as on the statement.',function(){rbResubmit(f,b)},{yes:'Record'});});}
 count();
 })();</script>
 {% endif %}
@@ -4732,7 +4863,7 @@ var f=document.getElementById('mmform');if(!f)return;
 function num(x){return parseFloat(x)||0}
 function rowsOf(id){return Array.prototype.slice.call(document.querySelectorAll('#'+id+' .mmrow'))}
 function picked(id){return rowsOf(id).filter(function(r){return r.querySelector('input').checked})}
-function fmt(v){return v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function fmt(v){return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
 var diff=0;
 function update(rank){
   var L=picked('mml'),B=picked('mmb'),sl=0,sb=0;
@@ -4786,11 +4917,12 @@ update(false);
 {% endif %}
 {% if n_xfer or xfer_recorded or xfer_dismissed %}<h2 id=sec-transfers style="font-size:15px" data-sec data-state="{{ 'attn' if n_xfer else 'done' }}" data-note="{{ (n_xfer ~ ' to check') if n_xfer else 'None to check' }}">Possible transfers between your own accounts ({{ n_xfer }})</h2>
 <div class=help>Suggestions only. A real transfer is recorded once, as one QuickBooks Transfer. <details class=how><summary>How this works</summary><div>Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it. <em>Edit</em> picks a different counterpart (or just the other account, when its statement isn't uploaded); <em>Not a transfer</em> hides a wrong suggestion.</div></details></div>
-{% if n_xfer %}<form method=post action="{{ url_for('transfer_dismiss', name=name) }}" id=xferbulk class=xferbar>
-<span class=xb-n>Tick the suggestions that aren't transfers</span><button type=submit class=btn-sm data-busy="Hiding the suggestions..." disabled>Not a transfer (selected)</button></form>
-<table class=xfertbl><tr><th><input type=checkbox class=xb-all title="Select all" aria-label="Select all suggestions"></th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
+{% if n_xfer %}<form method=post action="{{ url_for('transfer_dismiss', name=name) }}" id=xferbulk class=bulkbar data-one=suggestion data-many=suggestions>
+<span class=bk-n>Tick suggestions to act on them together</span><button type=submit class=btn-sm data-label="Not a transfer" data-yes="Not a transfer" data-busy="Hiding the suggestions..." data-ask="Mark {n} {noun} as not a transfer? They can be restored from the hidden list." disabled>Not a transfer</button>
+{% if can('record') %}<button type=submit class="btn-sm pri" formaction="{{ url_for('record_transfer', name=name) }}" data-need=data-rec data-label="Record selected as transfers" data-yes="Record" data-busy="Recording the transfers in QuickBooks..." data-ask="Record {n} ticked {noun} in QuickBooks? Each becomes one Transfer between the two accounts, with both bank lines matched to it." disabled>Record selected as transfers</button>{% endif %}</form>
+<table class=xfertbl><tr><th class=bk><input type=checkbox class="xb-all bk-all" data-for=xferbulk title="Select all" aria-label="Select all suggestions"></th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
-<tr><td><input type=checkbox name=pick value="{{ lid }}|{{ c.key }}" form=xferbulk class=xb-pick aria-label="Not a transfer"></td><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
+<tr><td class=bk><input type=checkbox name=pick value="{{ lid }}|{{ c.key }}" form=xferbulk class="xb-pick bk-pick"{% if c.rule == 'unrecorded' and acct_linked and c.other_linked and not signed_off and not c.other_signed %} data-rec{% endif %} aria-label="Select this suggestion"></td><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
 <td class=desc><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
 <td style="font-size:12px;color:var(--muted);white-space:normal;min-width:220px">{{ c.note }}<div class=btnrow style="margin-top:6px;flex-wrap:wrap">
 {% if c.rule == 'unrecorded' %}{% if not acct_linked or not c.other_linked %}<span>Both accounts must be linked to QuickBooks to record it here.</span>{% elif signed_off or c.other_signed %}<span>A statement is signed off \u2014 reopen it to record this.</span>{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" data-confirm="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class="btn-sm pri">Record as one transfer</button></form>{% endif %}{% endif %}
@@ -4810,10 +4942,12 @@ update(false);
 </form></td></tr>{% endif %}
 {% endfor %}{% endif %}{% endfor %}</table>{% endif %}
 {% if xfer_recorded %}<details class=xferrec id=xferrec style="margin:4px 0 14px"{% if not n_xfer %} open{% endif %}><summary style="cursor:pointer;font-size:13.5px;font-weight:600">Transfers recorded from this statement ({{ xfer_recorded|length }}) <span class=hint style="font-weight:400">— Edit changes the other side; Undo deletes it in QuickBooks</span></summary>
-<table class=xferdone><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Other account</th><th></th></tr>
-{% for t in xfer_recorded %}<tr><td>{{ t.date }}</td><td class=desc>{{ t.who }}</td><td class=a>{{ t.amount|money }}</td><td class=desc>{{ t.other or '' }}<br><span class=hint>QuickBooks #{{ t.qbo_id }}{% if t.by %} \u00b7 {{ t.by }}{% endif %}</span></td>
+{% set bulk_undo = not signed_off and can('undo') %}{% if bulk_undo %}<form method=post action="{{ url_for('transfer_undo', name=name) }}" id=xferrecbulk class=bulkbar data-one=transfer data-many=transfers style="margin-top:6px">
+<span class=bk-n>Tick transfers to undo them together</span><button type=submit class="btn-sm danger" data-label="Undo selected" data-yes="Undo" data-busy="Undoing the transfers (deleting them in QuickBooks)..." data-ask="Undo {n} {noun}? Each is deleted in QuickBooks, and its bank lines go back to the list to record again." disabled>Undo selected</button></form>{% endif %}
+<table class=xferdone><tr><th class=bk>{% if bulk_undo %}<input type=checkbox class=bk-all data-for=xferrecbulk title="Select all" aria-label="Select all recorded transfers">{% endif %}</th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Other account</th><th></th></tr>
+{% for t in xfer_recorded %}<tr><td class=bk>{% if bulk_undo %}<input type=checkbox name=qbo_ids value="{{ t.qbo_id }}" form=xferrecbulk class=bk-pick aria-label="Select transfer {{ t.qbo_id }}">{% endif %}</td><td>{{ t.date }}</td><td class=desc>{{ t.who }}</td><td class=a>{{ t.amount|money }}</td><td class=desc>{{ t.other or '' }}<br><span class=hint>QuickBooks #{{ t.qbo_id }}{% if t.by %} \u00b7 {{ t.by }}{% endif %}</span></td>
 <td>{% if not signed_off %}<div class=btnrow><button type=button class="btn-sm xfer-edit" data-line="r{{ t.qbo_id }}" aria-expanded=false>Edit</button><span class=kebab><button type=button class=icon-btn data-dd aria-label="More" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden><form method=post action="{{ url_for('transfer_undo', name=name) }}" data-confirm="Undo transfer #{{ t.qbo_id }}? It is deleted in QuickBooks, and its bank lines go back to the list to record again."><input type=hidden name=qbo_id value="{{ t.qbo_id }}"><button type=submit class=danger data-busy="Undoing the transfer (deleting it in QuickBooks)...">Undo (delete in QuickBooks)</button></form></div></span></div>{% else %}<span class=hint>signed off</span>{% endif %}</td></tr>
-{% if not signed_off %}<tr class=xferedit id="xe-r{{ t.qbo_id }}" hidden><td></td><td colspan=4 style="white-space:normal;background:#f8faff">
+{% if not signed_off %}<tr class=xferedit id="xe-r{{ t.qbo_id }}" hidden><td></td><td colspan=5 style="white-space:normal;background:#f8faff">
 <form method=post action="{{ url_for('transfer_change', name=name) }}" class=xe-form data-amt="{{ t.amount|abs|money }}" data-verb="Change transfer #{{ t.qbo_id }} of"><input type=hidden name=qbo_id value="{{ t.qbo_id }}">
 <div class=splithead>Change the other side of transfer #{{ t.qbo_id }} (now {{ t.other or 'unknown' }}). It's updated in QuickBooks, keeping its number; the old counterpart line goes back to its list.</div>
 {% for o in xfer_rec_choices.get(t.line_id, []) %}<label class=xe-opt><input type=radio name=other value="{{ o.line_id }}"{% if not o.linked %} disabled{% endif %}> <b>{{ o.account }}</b> · {{ o.date }} · {{ o.amount|money }}{% if o.who %} · {{ o.who }}{% endif %}{% if not o.linked %} <span class=hint>(not linked to QuickBooks)</span>{% endif %}</label>
@@ -4826,28 +4960,14 @@ update(false);
 try{var v=sessionStorage.getItem(k);if(v!==null)d.open=v==='1'}catch(e){}
 d.addEventListener('toggle',function(){try{sessionStorage.setItem(k,d.open?'1':'0')}catch(e){}})})();</script>{% endif %}
 {% if xfer_dismissed %}<details class=xferhid style="margin:0 0 22px"><summary class=hint style="cursor:pointer">{{ xfer_dismissed|length }} suggestion{{ '' if xfer_dismissed|length == 1 else 's' }} marked \u2018Not a transfer\u2019</summary>
-<table><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Suggested counterpart</th><th></th></tr>
-{% for x in xfer_dismissed %}<tr><td>{{ x.date }}</td><td class=desc>{{ x.who }}</td><td class=a>{{ x.amount|money }}</td><td class=desc>{{ x.c.account }} \u00b7 {{ x.c.date }} \u00b7 {{ x.c.amount|money }}{% if x.by %}<br><span class=hint>hidden by {{ x.by }}</span>{% endif %}</td>
+<form method=post action="{{ url_for('transfer_restore', name=name) }}" id=xferhidbulk class=bulkbar data-one=suggestion data-many=suggestions style="margin-top:6px">
+<span class=bk-n>Tick suggestions to restore them together</span><button type=submit class=btn-sm data-label="Restore selected" data-yes="Restore" data-busy="Restoring the suggestions..." data-ask="Restore {n} {noun}? They are suggested as transfers again." disabled>Restore selected</button></form>
+<table><tr><th class=bk><input type=checkbox class=bk-all data-for=xferhidbulk title="Select all" aria-label="Select all hidden suggestions"></th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Suggested counterpart</th><th></th></tr>
+{% for x in xfer_dismissed %}<tr><td class=bk><input type=checkbox name=pick value="{{ x.line_id }}|{{ x.c.key }}" form=xferhidbulk class=bk-pick aria-label="Select this suggestion"></td><td>{{ x.date }}</td><td class=desc>{{ x.who }}</td><td class=a>{{ x.amount|money }}</td><td class=desc>{{ x.c.account }} \u00b7 {{ x.c.date }} \u00b7 {{ x.c.amount|money }}{% if x.by %}<br><span class=hint>hidden by {{ x.by }}</span>{% endif %}</td>
 <td><form method=post action="{{ url_for('transfer_restore', name=name) }}"><input type=hidden name=line value="{{ x.line_id }}"><input type=hidden name=other value="{{ x.c.key }}"><button type=submit class=btn-sm data-busy="Restoring the suggestion...">Restore</button></form></td></tr>{% endfor %}</table></details>{% endif %}
 <style>.xe-opt{display:block;padding:5px 0;font-size:13px}.xe-opt select{margin-left:6px;padding:4px 6px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:100%}
 .xfertbl .btnrow form{margin:0}
-.xferbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 6px;font-size:13px;color:var(--muted)}</style>
-<script>(function(){
-// Bulk 'Not a transfer': tick rows (or the header box), then hide them all at once.
-var bf=document.getElementById('xferbulk');if(!bf)return;
-var picks=[].slice.call(document.querySelectorAll('.xb-pick')),all=document.querySelector('.xb-all'),
-    btn=bf.querySelector('button'),lab=bf.querySelector('.xb-n');
-function upd(){var n=picks.filter(function(p){return p.checked}).length;btn.disabled=!n;
-  btn.textContent=n?'Not a transfer ('+n+')':'Not a transfer (selected)';
-  lab.textContent=n?n+' suggestion'+(n==1?'':'s')+' ticked':'Tick the suggestions that aren’t transfers';
-  if(all){all.checked=n&&n===picks.length;all.indeterminate=n>0&&n<picks.length}}
-picks.forEach(function(p){p.addEventListener('change',upd)});
-if(all)all.addEventListener('change',function(){picks.forEach(function(p){p.checked=all.checked});upd()});
-bf.addEventListener('submit',function(e){if(bf._rbok){bf._rbok=false;return}var n=picks.filter(function(p){return p.checked}).length;
-  e.preventDefault();if(!n)return;var sb=e.submitter;
-  rbAsk('Mark '+n+' suggestion'+(n==1?'':'s')+' as not a transfer? They can be restored from the hidden list.',function(){rbResubmit(bf,sb)},{yes:'Not a transfer'})});
-upd();
-})();</script>
+</style>
 <script>(function(){
 // Edit: open the chooser under the line; picking an account ticks "Only the account".
 document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.getElementById('xe-'+b.getAttribute('data-line'));if(!row)return;
@@ -5648,7 +5768,8 @@ def account_switch_list(cur):
 
 
 BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
-                   "derived": "closing less movements", "qbo": "from QuickBooks"}
+                   "derived": "closing less movements", "qbo": "from QuickBooks",
+                   "pending": "updating from QuickBooks after the sync"}
 
 
 @app.route("/switch")
@@ -5677,13 +5798,24 @@ def detail(name):
         session["detail_msg"] = " ".join(x for x in (extra, session.get("detail_msg")) if x)
         session["rec_seen:" + name] = rec_job.get("started")
     d["rec_job"] = rec_job if rec_job and rec_job.get("state") == "running" else None
+    up_job = upload_job(name)
+    if up_job and up_job.get("state") in ("done", "failed", "stalled") and \
+            up_job.get("started") != session.get("up_seen:" + name):     # each upload's result shown once
+        session["detail_msg"] = up_job.get("msg") if up_job["state"] != "stalled" else (
+            "Reading the statement stopped before finishing (the server restarted). Upload it again.")
+        if up_job["state"] == "done":
+            session["detail_ok"] = name
+        session["up_seen:" + name] = up_job.get("started")
+    d["up_job"] = up_job if up_job and up_job.get("state") == "running" else None
     conn = get_conn(); cur = conn.cursor()
     st = _latest_statement(cur, acct_uuid)
-    prep = signed_by = None
+    prep = signed_by = saved_at = saved_by = clr = None
+    rec_to = reconciled_to(cur, acct_uuid)
     n_lines = n_matched_lines = 0
     if st:
-        cur.execute("SELECT prepared_by, signed_off_by FROM statement WHERE statement_id=%s;", (st[0],))
-        prep, signed_by = cur.fetchone() or (None, None)
+        cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (st[0],))
+        prep, signed_by, saved_at, saved_by = cur.fetchone() or (None, None, None, None)
+        clr = None if st[3] else cleared_to(cur, st[0], st[1], st[2])
         cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
                               count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
                                   SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
@@ -5698,11 +5830,21 @@ def detail(name):
                    "Balance the reconciliation first" if rec.get("status") != "balanced" else
                    "You prepared it: a second person (or an admin) signs off" if self_prepared else "")
     open_upload = bool(request.args.get("upload") or request.args.get("pdfpw")) and can("upload")
+    # The upload's result stays while the QuickBooks refresh it started is running (the page reloads
+    # when that finishes), so it isn't lost; otherwise each message is shown once.
+    detail_ok = session.get("detail_ok") == name
+    if detail_ok and sync_job().get("state") == "running":
+        detail_msg = session.get("detail_msg")
+    else:
+        detail_msg = session.pop("detail_msg", None)
+        if session.pop("detail_ok", None) != name:
+            detail_ok = False
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   prep=prep, signed_by=signed_by, n_lines=n_lines, n_matched_lines=n_matched_lines,
                                   self_prepared=self_prepared, signoff_why=signoff_why, open_upload=open_upload,
+                                  rec_to=rec_to, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
-                                  src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None),
+                                  src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, **d)
 
 
@@ -5730,62 +5872,149 @@ def _skipped_note(skipped):
             f"be read and {'was' if len(skipped)==1 else 'were'} skipped (dates: {eg}). Check the file before signing off.")
 
 
+UPLOAD_STALE_SECS = 900     # an upload job silent this long was lost (a restart); say so
+
+
+def _upload_key(name):
+    return f"upload_job:{name}"
+
+
+def upload_job(name):
+    """The account's latest background upload, or None. A running one gone silent is 'stalled'."""
+    try:
+        job = json.loads(get_config(_upload_key(name)) or "null")
+    except ValueError:
+        return None
+    if job and job.get("state") == "running" and time.time() - (job.get("beat") or 0) > UPLOAD_STALE_SECS:
+        job["state"] = "stalled"
+    return job
+
+
 @app.route("/account/<name>/upload", methods=["POST"])
 def upload(name):
+    """Upload a statement. The request only takes the file and checks the basics; reading it (a year's
+    PDF is hundreds of pages), saving and matching run in the background, so a big statement isn't cut
+    off by the server's time limit. The page shows the progress and then the result."""
     f = request.files.get("statement")
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
+    job = upload_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = "A statement for this account is still being read and matched. Wait for it to finish."
+        return redirect(url_for("detail", name=name))
     data = f.read()
     is_pdf = data[:5] == b"%PDF-" or f.filename.lower().endswith(".pdf")
+    password = request.form.get("pdf_password") or None
     try:
         opening, closing = _form_amount("opening_balance"), _form_amount("closing_balance")
-        if is_pdf:   # read it first: a wrong password shouldn't cost a QuickBooks sync
-            pdf_rows = parse_pdf(data, request.form.get("pdf_password") or None, opening)
-        acctid = None if is_pdf else re.search(rb"<ACCTID>\s*([^<\r\n]+)", data, re.I)
-        wrong = account_mismatch(name, pdf_rows.account_number if is_pdf else
-                                 (re.sub(r"\D", "", acctid.group(1).decode("ascii", "ignore")) if acctid else None))
-        if wrong:
-            session["detail_msg"] = wrong
-            return redirect(url_for("detail", name=name))
+        if is_pdf:
+            pdf_check(data, password)        # a wrong password or a file that isn't a PDF: say so now
+        else:
+            acctid = re.search(rb"<ACCTID>\s*([^<\r\n]+)", data, re.I)
+            wrong = account_mismatch(name, re.sub(r"\D", "", acctid.group(1).decode("ascii", "ignore")) if acctid else None)
+            if wrong:
+                session["detail_msg"] = wrong
+                return redirect(url_for("detail", name=name))
     except ValueError as e:
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
-    try:
-        checked = ""
-        if is_pdf:
-            sid = _save_statement(pdf_rows, name, "pdf", opening, closing, _form_date("period_start"), _form_date("period_end"))
-            n, skipped = len(pdf_rows), pdf_rows.skipped
-            checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
-                       " Read from the PDF. It has no running balance to check against, so compare the totals with "
-                       "the statement before signing off.")
-        else:
-            sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
-                                          _form_date("period_start"), _form_date("period_end"))
-        note = run_matcher(sid)
-    except ValueError as e:
-        session["detail_msg"] = str(e)
+    args = dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password, opening=opening,
+                closing=closing, p_start=_form_date("period_start"), p_end=_form_date("period_end"),
+                user={k: session.get(k) for k in ("name", "username", "is_admin")})
+    if not SYNC_IN_BACKGROUND:                      # the tests run it inline
+        ok, msg = _upload_run(**args)
+        session["detail_msg"] = msg
+        if ok:
+            session["detail_ok"] = name
         return redirect(url_for("detail", name=name))
-    except Exception as e:
-        return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
-    # Fresh books come from a background sync, never inside this request: even a quick one
-    # re-matches every open reconciliation, and a slow response is cut off before the page
-    # comes back. The statement is matched now; the sync re-matches it when it finishes.
-    refreshed = ""
-    if qbo_is_connected():
+    job = {"state": "running", "by": session.get("name"), "started": time.time(), "beat": time.time(),
+           "step": "Starting", "file": f.filename}
+    set_config(_upload_key(name), json.dumps(job))
+
+    def progress(step):
+        job.update(step=step, beat=time.time())
+        set_config(_upload_key(name), json.dumps(job))
+
+    def run():
         try:
-            refreshed = (" Refreshing books from QuickBooks in the background; the matches update when it finishes."
-                         if start_sync(False, session.get("username")) else
-                         " A QuickBooks sync is running; this statement is re-matched automatically when it finishes.")
+            ok, msg = _upload_run(progress=progress, **args)
+            job.update(state="done" if ok else "failed", msg=msg, finished=time.time())
         except Exception as e:
-            refreshed = f" (Couldn't start a QuickBooks refresh: {e}. Matched against the last sync.)"
-    replaced = getattr(g, "replaced", None)
-    log_activity(f"uploaded a statement ({n} lines)" + (f", replacing the one for {replaced}" if replaced else ""), name)
-    if replaced:
-        checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
-    session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
-                             + (f" {note}" if note else "") + refreshed)
+            job.update(state="failed", finished=time.time(), msg=f"The statement couldn't be processed: {e}")
+        set_config(_upload_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="upload").start()
     return redirect(url_for("detail", name=name))
 
+
+@app.route("/account/<name>/upload_status")
+def upload_status(name):
+    job = upload_job(name) or {}
+    return {k: job.get(k) for k in ("state", "step")}
+
+
+def pdf_check(data, password=None):
+    """Open a PDF just far enough to know it's readable with this password (no text is read)."""
+    try:
+        import pdfplumber
+        from pdfminer.pdfdocument import PDFPasswordIncorrect
+    except ImportError:
+        raise ValueError("PDF import isn't installed on this server (pdfplumber). Upload the CSV or OFX instead.")
+    try:
+        pdf = pdfplumber.open(io.BytesIO(data), password=password or "")
+    except Exception as e:
+        if (isinstance(e, PDFPasswordIncorrect) or any(isinstance(a, PDFPasswordIncorrect) for a in e.args)
+                or "password" in repr(e).lower()):
+            raise PdfPasswordError("This PDF is password-protected. Enter its password and upload again." if not password
+                                   else "That PDF password isn't right. Check it and upload again.")
+        raise ValueError("That file couldn't be read as a PDF.")
+    pdf.close()
+
+
+def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None):
+    """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
+    context (the background job has none), as the user who uploaded it. Returns (ok, message)."""
+    with app.test_request_context():
+        session.update({k: v for k, v in user.items() if v is not None})
+        step = progress or (lambda m: None)
+        try:
+            checked = ""
+            if is_pdf:
+                step("Reading the PDF")
+                pdf_rows = parse_pdf(data, password, opening, progress=step)
+                wrong = account_mismatch(name, pdf_rows.account_number)
+                if wrong:
+                    return False, wrong
+                step(f"Saving {len(pdf_rows)} statement lines")
+                sid = _save_statement(pdf_rows, name, "pdf", opening, closing, p_start, p_end)
+                n, skipped = len(pdf_rows), pdf_rows.skipped
+                checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
+                           " Read from the PDF. It has no running balance to check against, so compare the totals with "
+                           "the statement before signing off.")
+            else:
+                step("Reading the statement")
+                sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), filename, name, opening, closing,
+                                              p_start, p_end)
+            step(f"Matching {n} lines against your books")
+            note = run_matcher(sid)
+        except ValueError as e:
+            return False, (f"PDF not imported: {e}" if is_pdf and not str(e).startswith("Not uploaded") else str(e))
+        # Fresh books come from a background sync, never inside the upload: it re-matches every open
+        # reconciliation. The statement is matched now; the sync re-matches it when it finishes.
+        refreshed = ""
+        if qbo_is_connected():
+            try:
+                refreshed = (" Refreshing books from QuickBooks in the background; the matches update when it finishes."
+                             if start_sync(False, user.get("username")) else
+                             " A QuickBooks sync is running; this statement is re-matched automatically when it finishes.")
+            except Exception as e:
+                refreshed = f" (Couldn't start a QuickBooks refresh: {e}. Matched against the last sync.)"
+        replaced = getattr(g, "replaced", None)
+        log_activity(f"uploaded a statement ({n} lines)" + (f", replacing the one for {replaced}" if replaced else ""), name)
+        if replaced:
+            checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
+        return True, (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
+                      + (f" {note}" if note else "") + refreshed)
 
 @app.route("/account/<name>/import_books", methods=["POST"])
 def import_books(name):
@@ -5841,6 +6070,33 @@ def review_match(name, match_id):
         if row:
             _after_review(row[0])
     return redirect(url_for("detail", name=name) + ("#sec-manual" if edit else "#sec-review"))
+
+
+@app.route("/account/<name>/review_bulk", methods=["POST"])
+def review_bulk(name):
+    """Confirm or reject the ticked suggested matches at once (only ones still to review, on this account)."""
+    status = request.form.get("status")
+    ids = [i for i in request.form.getlist("mid") if _is_uuid(i)][:500]
+    rows = []
+    if status in ("confirmed", "rejected") and ids:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""UPDATE match SET status=%s, confirmed_by=%s, confirmed_at=now(), updated_at=now()
+                       WHERE match_id = ANY(%s::uuid[]) AND status='proposed'
+                         AND statement_id IN (SELECT s.statement_id FROM statement s
+                           JOIN account a ON a.account_id=s.account_id WHERE a.name=%s)
+                       RETURNING statement_id;""", (status, session.get("name"), ids, name))
+        rows = cur.fetchall()
+        conn.commit(); cur.close(); conn.close()
+    n = len(rows)
+    for sid in {r[0] for r in rows}:
+        _after_review(sid)
+    if n:
+        verb = "Confirmed" if status == "confirmed" else "Rejected"
+        session["detail_msg"] = f"{verb} {n} suggested match{'' if n == 1 else 'es'}."
+        log_activity(f"{verb.lower()} {n} suggested match{'' if n == 1 else 'es'}", name)
+    else:
+        session["detail_msg"] = "Nothing changed: tick the suggestions to confirm or reject first."
+    return redirect(url_for("detail", name=name) + "#sec-review")
 
 
 @app.route("/account/<name>/review_all", methods=["POST"])
@@ -6421,18 +6677,38 @@ def _record_hedge(lid, d, amt, desc, label, out, acct_uuid, acct_qbo, ccy, home,
     return {"token": token, "done": True}
 
 
-@app.route("/account/<name>/record_save", methods=["POST"])
-def record_save(name):
-    """Keep what's ticked and chosen in the record table, so a refresh or another visit starts from it."""
-    back = redirect(url_for("detail", name=name) + "#sec-record")
+@app.route("/account/<name>/later", methods=["POST"])
+def save_later(name):
+    """Save & finish later: everything done so far is already kept; this also keeps the record table's
+    ticks and choices, notes who saved it and when, and goes back to the dashboard."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     s = _latest_statement(cur, row[0]) if row else None
+    if not s or s[3]:
+        cur.close(); conn.close()
+        return redirect(url_for("detail", name=name))
+    kept = ""
+    if request.form.getlist("rowid") and can("record"):
+        n, total = _save_record_draft(cur, s[0])
+        kept = f" Your selection to record ({n} of {total} line{'' if total == 1 else 's'} ticked) is kept too."
+    cur.execute("UPDATE statement SET saved_later_at=now(), saved_later_by=%s WHERE statement_id=%s;",
+                (session.get("name") or "user", s[0]))
+    clr = cleared_to(cur, s[0], s[1], s[2]); upto = reconciled_to(cur, row[0])
+    conn.commit(); cur.close(); conn.close()
+    log_activity("saved the reconciliation for later", name)
+    session["sync_msg"] = (f"Saved {name} ({s[1]:%d/%m/%Y} to {s[2]:%d/%m/%Y}) to finish later"
+                           + (f": cleared to {clr:%d/%m/%Y}" if clr else "") + "." + kept
+                           + (f" Reconciled to {upto:%d/%m/%Y} until it's signed off." if upto else "")
+                           + " Continue from the dashboard or the sidebar any time.")
+    return redirect(url_for("dashboard"))
+
+
+def _save_record_draft(cur, sid):
+    """Keep the record table's ticks and choices (from this request) for statement `sid`.
+    Returns (lines ticked, lines kept)."""
     ids = list(dict.fromkeys(request.form.getlist("rowid")))
-    if not s or not ids:
-        cur.close(); conn.close(); session["detail_msg"] = "Nothing to save."; return back
-    cur.execute("SELECT line_id::text FROM statement_line WHERE statement_id=%s AND line_id = ANY(%s::uuid[]);", (s[0], ids))
+    cur.execute("SELECT line_id::text FROM statement_line WHERE statement_id=%s AND line_id = ANY(%s::uuid[]);", (sid, ids))
     valid = [r[0] for r in cur.fetchall()]
     sel = set(request.form.getlist("sel"))
     rows = [(lid, json.dumps({"sel": lid in sel, "acct": request.form.get(f"acct_{lid}") or "",
@@ -6448,9 +6724,24 @@ def record_save(name):
         execute_values(cur, """INSERT INTO record_draft (line_id, data, saved_by) VALUES %s
                                ON CONFLICT (line_id) DO UPDATE SET data=EXCLUDED.data, saved_by=EXCLUDED.saved_by,
                                  saved_at=now()""", rows)
+    return sum(1 for lid in valid if lid in sel), len(valid)
+
+
+@app.route("/account/<name>/record_save", methods=["POST"])
+def record_save(name):
+    """Keep what's ticked and chosen in the record table, so a refresh or another visit starts from it."""
+    back = redirect(url_for("detail", name=name) + "#sec-record")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    ids = list(dict.fromkeys(request.form.getlist("rowid")))
+    if not s or not ids:
+        cur.close(); conn.close(); session["detail_msg"] = "Nothing to save."; return back
+    n, total = _save_record_draft(cur, s[0])
     conn.commit(); cur.close(); conn.close()
-    n = sum(1 for lid in valid if lid in sel)
-    session["detail_msg"] = (f"Saved your selection: {n} of {len(valid)} line{'' if len(valid) == 1 else 's'} ticked, "
+
+    session["detail_msg"] = (f"Saved your selection: {n} of {total} line{'' if total == 1 else 's'} ticked, "
                              f"with the accounts and payees chosen. It stays until you record those lines or discard it.")
     return back
 
@@ -6500,16 +6791,46 @@ def _record_transfer_one_side(name, lid, other_acct, back):
 @app.route("/account/<name>/transfer", methods=["POST"])
 def record_transfer(name):
     """Money visibly left one of your accounts and arrived at another, and neither side is in
-    QuickBooks: record ONE Transfer and match both bank lines to it."""
+    QuickBooks: record ONE Transfer and match both bank lines to it. Several at once from the ticked
+    suggestions (pick = "line|line:other")."""
     back = redirect(url_for("detail", name=name) + "#sec-transfers")
+    picks = [p.split("|", 1) for p in request.form.getlist("pick") if "|line:" in p]
+    if picks:
+        done, problems, seen = [], [], set()
+        for lid, other in picks[:100]:
+            other = other[len("line:"):]
+            if lid in seen or other in seen:
+                continue      # a line ticked twice (two possible counterparts): only the first is recorded
+            ok, msg = _record_transfer_pair(name, lid, other)
+            (done if ok else problems).append(msg)
+            if ok:
+                seen.update((lid, other))
+        skipped = len(request.form.getlist("pick")) - len(picks)
+        parts = [f"Recorded {len(done)} transfer{'' if len(done) == 1 else 's'} in QuickBooks." if done else "Nothing recorded."]
+        if problems:
+            parts.append(f"{len(problems)} not recorded: " + " ".join(dict.fromkeys(problems)))
+        if skipped:
+            parts.append(f"{skipped} ticked suggestion{'' if skipped == 1 else 's'} can't be recorded from here "
+                         f"(already in QuickBooks on the other side): use Edit or Not a transfer.")
+        if done:
+            log_activity(f"recorded {len(done)} transfers", name)
+        session["detail_msg"] = " ".join(parts)
+        return back
     lid, other = request.form.get("line") or "", request.form.get("other") or ""
     other_acct = (request.form.get("other_acct") or "").strip()
     if not other and other_acct:
         return _record_transfer_one_side(name, lid, other_acct, back)
+    session["detail_msg"] = _record_transfer_pair(name, lid, other)[1]
+    return back
+
+
+def _record_transfer_pair(name, lid, other):
+    """Record one Transfer for bank line `lid` (on `name`) and line `other` (another account).
+    Returns (recorded?, message)."""
     try:
         uuid.UUID(lid); uuid.UUID(other)
     except ValueError:
-        session["detail_msg"] = "Nothing to record."; return back
+        return False, "Nothing to record."
     conn = get_conn(); cur = conn.cursor()
     q = """SELECT sl.line_id, sl.posted_date, sl.amount, coalesce(sl.description,''), s.statement_id, s.signed_off_at,
                   a.account_id, a.source_account_id, a.type, a.currency, a.name,
@@ -6533,16 +6854,16 @@ def record_transfer(name):
     elif (me[2] * (-1 if me[8] == "credit_card" else 1)) != -(them[2] * (-1 if them[8] == "credit_card" else 1)):
         problem = "The two lines aren't the same money moving in opposite directions."
     if problem:
-        cur.close(); conn.close(); session["detail_msg"] = problem; return back
+        cur.close(); conn.close(); return False, problem
     frm, to = transfer_ends(me[7], them[7], me[2], me[8])
     out_line = me if frm == me[7] else them   # dated when the money left
     d, desc = out_line[1], out_line[3]
     if not _claim_writeback(str(me[0]), session.get("name")):
-        cur.close(); conn.close(); session["detail_msg"] = "Already recorded or in progress."; return back
+        cur.close(); conn.close(); return False, "Already recorded or in progress."
     if not _claim_writeback(str(them[0]), session.get("name")):
         cur.execute("UPDATE writeback_log SET status='failed', error='released' WHERE line_id=%s;", (str(me[0]),))
         conn.commit(); cur.close(); conn.close()
-        session["detail_msg"] = "The other bank line is already recorded or in progress."; return back
+        return False, "The other bank line is already recorded or in progress."
     try:
         entity, new_id, ent = qbo_record_transfer(qbo_token(), frm, to, abs(me[2]), d, desc)
     except Exception as e:
@@ -6550,7 +6871,7 @@ def record_transfer(name):
         cur.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id = ANY(%s::uuid[]);",
                     (err, [str(me[0]), str(them[0])]))
         conn.commit(); cur.close(); conn.close()
-        session["detail_msg"] = f"Not recorded: QuickBooks said {err}"; return back
+        return False, f"Not recorded: QuickBooks said {err}"
     cur.execute("SELECT qbo_id, name FROM qbo_coa WHERE qbo_id = ANY(%s);", ([frm, to],))
     names = dict(cur.fetchall())
     names.setdefault(me[7], me[10]); names.setdefault(them[7], them[10])
@@ -6585,12 +6906,10 @@ def record_transfer(name):
     conn.commit(); cur.close(); conn.close()
     for sid in {me[4], them[4]}:
         _after_review(sid)
-    session["detail_msg"] = (f"Recorded a transfer of {_money(abs(me[2]))} from {names.get(frm)} to {names.get(to)} "
+    return True, (f"Recorded a transfer of {_money(abs(me[2]))} from {names.get(frm)} to {names.get(to)} "
                              f"in QuickBooks" + (f" (#{new_id})" if new_id else "") +
                              (" and matched both bank lines." if matched == 2 else
                               ". It will match on the next refresh."))
-    return back
-
 
 def _xfer_line_of(cur, name, lid):
     """The statement line `lid` on account `name`'s latest statement, or None."""
@@ -6631,22 +6950,50 @@ def transfer_dismiss(name):
 
 @app.route("/account/<name>/transfer_restore", methods=["POST"])
 def transfer_restore(name):
-    lid, other = request.form.get("line") or "", request.form.get("other") or ""
+    """Bring back hidden 'Not a transfer' suggestions: one (line + other) or the ticked ones (pick)."""
+    pairs = [p.split("|", 1) for p in request.form.getlist("pick") if "|" in p]
+    if request.form.get("line"):
+        pairs.append([request.form.get("line"), request.form.get("other") or ""])
     conn = get_conn(); cur = conn.cursor()
-    if _xfer_line_of(cur, name, lid):
-        cur.execute("DELETE FROM transfer_dismissal WHERE line_id=%s AND other=%s;", (lid, other))
-        conn.commit()
-        session["detail_msg"] = "Restored: the suggestion is back."
+    n = 0
+    for lid, other in pairs[:500]:
+        if _xfer_line_of(cur, name, lid):
+            cur.execute("DELETE FROM transfer_dismissal WHERE line_id=%s AND other=%s;", (lid, other[:80]))
+            n += cur.rowcount
+    conn.commit()
+    if n:
+        session["detail_msg"] = "Restored: the suggestion is back." if n == 1 else f"Restored {n} suggestions."
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name) + "#sec-transfers")
 
 
 @app.route("/account/<name>/transfer_undo", methods=["POST"])
 def transfer_undo(name):
-    """Undo a transfer the app recorded: delete it in QuickBooks, unpair its bank lines (they go back
-    to the list), and take it out of the books here. Only while none of its statements is signed off."""
+    """Undo transfers the app recorded: one (qbo_id) or the ticked ones (qbo_ids)."""
     back = redirect(url_for("detail", name=name) + "#sec-transfers")
-    qid = (request.form.get("qbo_id") or "").strip()
+    many = [q.strip() for q in request.form.getlist("qbo_ids") if q.strip()]
+    if not many:
+        session["detail_msg"] = _undo_transfer(name, (request.form.get("qbo_id") or "").strip())[1]
+        return back
+    done, problems = 0, []
+    for qid in list(dict.fromkeys(many))[:100]:
+        ok, msg = _undo_transfer(name, qid)
+        if ok:
+            done += 1
+        else:
+            problems.append(f"#{qid}: {msg}")
+    session["detail_msg"] = (f"Undone {done} transfer{'' if done == 1 else 's'}: deleted in QuickBooks, and their bank lines "
+                             f"are back in the list to record again." if done else "Nothing undone.") + \
+                            (f" {len(problems)} not undone. " + " ".join(problems) if problems else "")
+    if done:
+        log_activity(f"undid {done} transfers", name)
+    return back
+
+
+def _undo_transfer(name, qid):
+    """Delete one app-recorded Transfer in QuickBooks, unpair its bank lines (they go back to the list)
+    and take it out of the books here. Only while none of its statements is signed off.
+    Returns (undone?, message)."""
     user = session.get("name") or "user"
     conn = get_conn(); cur = conn.cursor()
     # Every bank line the app recorded as this Transfer, and every book row of it.
@@ -6670,7 +7017,7 @@ def transfer_undo(name):
     elif any(l[2] for l in lines) or any(m[1] for m in matches):
         problem = "A statement it's matched on is signed off. Reopen it first, then undo the transfer."
     if problem:
-        cur.close(); conn.close(); session["detail_msg"] = problem; return back
+        cur.close(); conn.close(); return False, problem
     try:
         token = qbo_token()
         ent = qbo_read(token, "Transfer", qid)
@@ -6679,7 +7026,7 @@ def transfer_undo(name):
     except Exception as e:
         err = f"HTTP {e.code}: {str(e.reason)[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
         cur.close(); conn.close()
-        session["detail_msg"] = f"Not undone: QuickBooks said {err}. Nothing was changed."; return back
+        return False, f"Not undone: QuickBooks said {err}. Nothing was changed."
     ids = [m[0] for m in matches]
     if ids:
         cur.execute("DELETE FROM match WHERE match_id = ANY(%s::uuid[]);", (ids,))
@@ -6690,10 +7037,8 @@ def transfer_undo(name):
     conn.commit(); cur.close(); conn.close()
     for sid in {l[1] for l in lines} | {m[2] for m in matches}:
         _after_review(sid)
-    session["detail_msg"] = (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
+    return True, (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
                              f"{'s are' if len(lines) > 1 else ' is'} back in the list to record again.")
-    return back
-
 
 @app.route("/account/<name>/transfer_change", methods=["POST"])
 def transfer_change(name):
@@ -6860,14 +7205,29 @@ def balances(name):
             cur.close(); conn.close()
             if not acct_qbo:
                 raise ValueError("This account isn't linked to a QuickBooks account.")
-            if sync_running():
-                raise ValueError("A QuickBooks sync is running. Try again when it finishes.")
             # The calculation needs freshly synced transactions. Syncing here would outlast the
-            # request, so use a sync from the last few minutes or start one in the background.
-            if sync_full_due() or _sync_age_secs(get_config("last_sync_at")) > BOOK_BALANCE_FRESH_SECS:
-                start_sync(False, session.get("username"))
-                raise ValueError("Refreshing books from QuickBooks first (see the banner). Press Get book balance "
-                                 "again when it finishes.")
+            # request, so use a sync from the last few minutes or start one in the background; the
+            # balance is then filled in when that sync finishes (refresh_book_balances).
+            stale = sync_full_due() or _sync_age_secs(get_config("last_sync_at")) > BOOK_BALANCE_FRESH_SECS
+            if sync_running() or stale:
+                c2 = get_conn(); k2 = c2.cursor()
+                k2.execute("""UPDATE statement SET book_balance_source='pending' WHERE statement_id=%s
+                              AND (book_balance_source IS NULL OR book_balance_source <> 'qbo');""", (sid,))
+                k2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
+                c2.commit(); k2.close(); c2.close()
+                running = sync_running()
+                if not running:
+                    start_sync(False, session.get("username"))
+                c2 = get_conn(); k2 = c2.cursor()
+                k2.execute("SELECT book_balance, book_balance_source FROM statement WHERE statement_id=%s;", (sid,))
+                bb, bsrc = k2.fetchone(); k2.close(); c2.close()
+                if bsrc == "qbo" and not sync_running():      # the sync already finished and filled it in
+                    session["detail_msg"] = f"Books refreshed from QuickBooks. Book balance at {pe}: {_money(bb)}."
+                    return redirect(url_for("detail", name=name) + "#sec-balance")
+                session["detail_msg"] = (("A QuickBooks sync is running" if running else "Refreshing books from QuickBooks first")
+                                         + f". The book balance at {pe} fills in by itself when it finishes "
+                                         f"(the page refreshes); no need to press again.")
+                return redirect(url_for("detail", name=name) + "#sec-balance")
             bal = qbo_book_balance_at(qbo_token(), acct_uuid, acct_qbo, pe)
             conn = get_conn(); cur = conn.cursor()
             cur.execute("UPDATE statement SET book_balance=%s, book_balance_source='qbo' WHERE statement_id=%s;", (bal, sid))
@@ -6875,6 +7235,10 @@ def balances(name):
         else:
             opening, closing, book = _form_amount("opening"), _form_amount("closing"), _form_amount("book")
             new_ps, new_pe = _form_date("period_start") or ps, _form_date("period_end") or pe
+            cur.execute("SELECT book_balance, book_balance_source FROM statement WHERE statement_id=%s;", (sid,))
+            old_book, old_bsrc = cur.fetchone()
+            book_src = None if book is None else (
+                old_bsrc if old_bsrc in ("qbo", "pending") and old_book is not None and _D(old_book) == _D(book) else "user")
             cur.execute("SELECT coalesce(sum(amount),0), min(posted_date), max(posted_date) FROM statement_line WHERE statement_id=%s;", (sid,))
             moves, first, last = cur.fetchone()
             rematch = (new_ps, new_pe) != (ps, pe)
@@ -6888,7 +7252,7 @@ def balances(name):
                 closing, "user" if closing is not None else None, exclude_sid=sid)
             cur.execute("""UPDATE statement SET opening_balance=%s, opening_source=%s, closing_balance=%s, closing_source=%s,
                            book_balance=%s, book_balance_source=%s WHERE statement_id=%s;""",
-                        (opening or 0, o_src, closing or 0, c_src, book, "user" if book is not None else None, sid))
+                        (opening or 0, o_src, closing or 0, c_src, book, book_src, sid))
             session["detail_msg"] = "Balances saved."
             if rematch:
                 conn.commit(); cur.close(); conn.close()

@@ -240,9 +240,9 @@ const press = (win, btn) => btn.closest("form").dispatchEvent(new win.SubmitEven
   press(w, d.querySelector('button[formaction$="/record_save"]')); await later(300);
   out.busySave = d.getElementById("loadingmsg").textContent;
   const w2 = load(process.argv[3]), d2 = w2.document; await later(100);
-  press(w2, d2.querySelector("button[value=confirmed]")); await later(300);
+  press(w2, d2.querySelector("form.btnrow button[value=confirmed]")); await later(300);
   out.busyConfirm = d2.getElementById("loadingmsg").textContent;
-  press(w2, d2.querySelector("button[value=rejected]")); await later(300);
+  press(w2, d2.querySelector("form.btnrow button[value=rejected]")); await later(300);
   out.busyReject = d2.getElementById("loadingmsg").textContent;
   out.errors = errors;
   console.log(JSON.stringify(out));

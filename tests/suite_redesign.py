@@ -38,7 +38,7 @@ upload(admin, "Stanbic UGX", [("2026-09-04", "SUPPLIER X", -80000), ("2026-09-06
 # ---- the frame and the dashboard ------------------------------------------------------------------------------------
 dash = admin.get("/").data.decode()
 check("sidebar: product, company from QuickBooks, accounts with status", "<b>ReconBook</b><small>THE NORTH GREEN SCHOOL</small>" in dash
-      and 'sdot attn"></span><span class=nm>Stanbic UGX</span><span class=cnt>1</span>' in dash
+      and 'sdot attn"></span><span class=nm>Stanbic UGX<small class=upto>not reconciled yet</small></span><span class=cnt>1</span>' in dash
       and 'sdot none"></span><span class=nm>DFCU UGX' in dash)
 side = dash[dash.index("<aside class=side"):dash.index("</aside>")]
 check("…accounts with no reconciliation first, then work in progress", side.index(">DFCU UGX<") < side.index(">Stanbic UGX<"))
