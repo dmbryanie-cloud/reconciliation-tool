@@ -146,6 +146,49 @@ cl.post("/account/Stanbic UGX/transfer_undo", data={"qbo_id": ZID})
 check("QuickBooks refuses the delete: nothing changes here", matched(S1) and matched(D1) and "Not undone" in msg())
 # ---- the Edit panel in the browser ---------------------------------------------------------------------------------
 A.qbo_delete = fake_delete
+
+# ---- Edit a recorded transfer: another line, then just another account ---------------------------------------------
+upload("Stanbic UGX", [("2026-07-25", "TO DFCU X", -900000)])
+upload("DFCU UGX", [("2026-07-25", "IN X1", 900000), ("2026-07-27", "IN X2", 900000)])
+S4, X1, X2 = lid("TO DFCU X"), lid("IN X1"), lid("IN X2")
+cl.post("/account/Stanbic UGX/transfer", data={"line": S4, "other": X1})
+WID = str(800 + len(POSTS))
+check("(set up: S4 and X1 recorded as one transfer)", matched(S4) and matched(X1))
+sec = section(page())
+check("recorded transfers fold into their own list", '<details class=xferrec id=xferrec' in sec)
+check("…each with Edit and Undo", f'data-line="r{WID}"' in sec and f'id="xe-r{WID}"' in sec
+      and f'name=qbo_id value="{WID}"' in sec)
+edit = re.search(rf'<tr class=xferedit id="xe-r{WID}".*?</tr>', sec, re.S).group(0)
+check("Edit offers the other unmatched line, and your other accounts", f'value="{X2}"' in edit and f'value="{X1}"' not in edit
+      and '<option value="38">Centenary UGX</option>' in edit and "transfer_change" in edit)
+n = len(POSTS)
+cl.post("/account/Stanbic UGX/transfer_change", data={"qbo_id": WID, "other": X2})
+cm = msg()
+check("Edit to another line on the same account: nothing to change in QuickBooks", len(POSTS) == n)
+check("…X2 now matched, X1 back in its list, this line still matched", matched(X2) and not matched(X1) and matched(S4)
+      and f'value="{X1}" class=rsel' in page("DFCU UGX"))
+check("…and it says so", f"transfer #{WID}" in cm and "matched to that bank line" in cm)
+cl.post("/account/Stanbic UGX/transfer_change", data={"qbo_id": WID, "other": "", "other_acct": "83"})
+check("only your own accounts can be the other side", len(POSTS) == n and "same currency" in msg())
+sid = q("SELECT statement_id FROM statement WHERE account_id=%s", (DF,))[0][0]
+q("UPDATE statement SET signed_off_at=now() WHERE statement_id=%s RETURNING 1", (sid,))
+cl.post("/account/Stanbic UGX/transfer_change", data={"qbo_id": WID, "other": "", "other_acct": "38"})
+check("refused while the other side's statement is signed off", len(POSTS) == n and "signed off" in msg())
+q("UPDATE statement SET signed_off_at=NULL WHERE statement_id=%s RETURNING 1", (sid,))
+cl.post("/account/Stanbic UGX/transfer_change", data={"qbo_id": WID, "other": "", "other_acct": "38"})
+ent, body = POSTS[-1]
+check("Edit to just Centenary: the same transfer updated in QuickBooks", len(POSTS) == n + 1 and ent == "Transfer"
+      and body.get("Id") == WID and body.get("SyncToken") == "3" and body["ToAccountRef"]["value"] == "38"
+      and body["FromAccountRef"]["value"] == "35")
+check("…X2 unpaired, and its DFCU side gone from the books here", not matched(X2) and matched(S4)
+      and q("""SELECT count(*) FROM book_txn bt WHERE source_txn_type='Transfer' AND source_txn_id=%s
+               AND account_id=%s AND NOT is_deleted""", (WID, DF))[0][0] == 0)
+check("…Centenary's side is in the books", q("""SELECT count(*) FROM book_txn WHERE source_txn_type='Transfer'
+                                              AND source_txn_id=%s AND account_id=%s AND NOT is_deleted""", (WID, CEN))[0][0] == 1)
+check("…and the list says Centenary", "Centenary UGX<br><span class=hint>QuickBooks #" + WID in section(page()))
+QBO.pop(WID)
+cl.post("/account/Stanbic UGX/transfer_change", data={"qbo_id": WID, "other": "", "other_acct": "36"})
+check("deleted in QuickBooks meanwhile: says to use Undo, nothing changes", "Use Undo" in msg() and len(POSTS) == n + 1)
 upload("Stanbic UGX", [("2026-07-20", "TO DFCU LATER", -700000)])
 upload("DFCU UGX", [("2026-07-21", "IN FROM STANBIC", 700000)])
 S3 = lid("TO DFCU LATER")
