@@ -64,7 +64,7 @@ check("January balances", r1["status"] == "balanced" and r1["adj_bank"] == D(122
 page = cl.get("/account/Stanbic UGX").data.decode()
 check("balanced banner shown", "Balanced — adjusted bank and book balances agree" in page)
 dash = cl.get("/").data.decode()
-check("dashboard shows balanced", "0.00 · balanced" in dash)
+check("dashboard shows balanced", 'class="pill info">Balanced' in dash)
 cl.post("/account/Stanbic UGX/signoff")
 cur.execute("SELECT signed_off_at, snap_diff FROM statement"); row = cur.fetchone(); c.rollback()
 check("January signed off with 0 snapshot", row[0] is not None and row[1] == 0)

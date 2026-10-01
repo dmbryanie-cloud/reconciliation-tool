@@ -201,7 +201,7 @@ else:
 const { JSDOM, VirtualConsole } = require("jsdom");
 const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => errors.push(String(e.message || e)));
 const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
-const w = dom.window, d = w.document; let asked = null; w.confirm = m => { asked = m; return false; };
+const w = dom.window, d = w.document; let asked = null; w.confirm = m => { asked = m; return false; }; w.rbAsk = m => { asked = m; };
 const out = {}, lid = process.argv[3];
 const btn = d.querySelector(`.xfer-edit[data-line="${lid}"]`), row = d.getElementById("xe-" + lid);
 out.closed0 = row.hidden; btn.click(); out.open = !row.hidden;

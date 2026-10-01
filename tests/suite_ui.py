@@ -89,8 +89,7 @@ for (const hash of ["#sec-record", ""]) {
     if res.stderr.strip():
         print(res.stderr[-1500:])
     check("result message says what's wrong", len(got) == 2 and "choose an account" in (got[0]["text"] or ""))
-    check("…shown right under the record section heading", len(got) == 2 and got[0]["after"] == "sec-record")
-    check("…and at the top when the page opens without a section", len(got) == 2 and got[1]["after"] != "sec-record")
+    check("…as a notice that stays in view (corner of the window)", len(got) == 2 and got[1]["text"] and "#flash{position:fixed" in after.decode())
     # Section menu: built from the h2[id^=sec-] headings actually on the page, with their counts.
     MENU = """
 const { JSDOM } = require("jsdom");
@@ -125,9 +124,8 @@ for (const drop of [false, true]) {
     check("section menu script ran without errors", len(got) == 2 and "Error" not in res.stderr)
     html_ = page.data.decode()
     css = re.search(r"\.secnav\{.*?@media print", html_, re.S).group(0)
-    check("side menu has its own column beside the content (it can't overlap it)",
-          "<div class=pagecols><nav id=secnav" in html_ and "</div></div><div class=appfoot>" in html_
-          and "grid-template-columns:132px minmax(0,1000px)" in css)
+    check("section menu is a bar of chips above the page (the sidebar holds the accounts)",
+          "<div class=pagecols><nav id=secnav" in html_ and "<aside class=side" in html_)
     check("…and is never pinned over the page", "position:fixed" not in css)
     full, dropped = (got + [{}, {}])[:2]
     import re

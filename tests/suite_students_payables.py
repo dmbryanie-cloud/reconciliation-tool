@@ -223,11 +223,6 @@ out.unpickedStopped = sev.defaultPrevented; out.pickHint = (lc.querySelector(".p
 fire(lq, "focus"); lq.value = "office supplies"; fire(lq, "input"); fire(lq, "keydown", { key: "Enter" });
 const sev2 = new w.SubmitEvent("submit", { cancelable: true, bubbles: true, submitter: rb }); d.getElementById("recform").dispatchEvent(sev2);
 out.pickedGoes = !sev2.defaultPrevented && !lc.querySelector(".pickhint");
-// the account switcher
-const sel = d.getElementById("acctswitch"), go = d.querySelector(".acctgo");
-out.goDisabled0 = go.disabled;
-sel.value = "DFCU USD"; fire(sel, "change");
-out.goEnabled = !go.disabled; out.goBusy = go.getAttribute("data-busy");
 out.errors = errors;
 console.log(JSON.stringify(out));
 """
@@ -257,7 +252,5 @@ console.log(JSON.stringify(out));
     check("browser: Record with an account typed but not picked is stopped, saying why", o.get("unpickedStopped")
           and "Pick it from the list" in (o.get("pickHint") or ""))
     check("browser: …once picked, Record goes ahead", o.get("pickedGoes"))
-    check("browser: Reconcile waits until another account is chosen, then says what's loading",
-          o.get("goDisabled0") and o.get("goEnabled") and (o.get("goBusy") or "").startswith("Loading DFCU USD"))
     check("browser: no script errors", o.get("errors") == [])
 sys.exit(T.summary())

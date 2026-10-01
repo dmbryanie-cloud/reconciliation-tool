@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from psycopg2.extras import execute_values
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta, date
-from flask import Flask, render_template_string, request, redirect, session, url_for, Response
+from flask import Flask, has_request_context, render_template_string, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
@@ -24,6 +24,23 @@ DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
 CLEARING_WINDOW_DAYS = 31  # a cheque/payment can hit the bank this long after it's booked
+# Defaults for the rules an admin can change under Settings (stored in app_config as rule_<key>).
+RULES = {"date_days": (DATE_TOLERANCE_DAYS, 0, 10, "Days a bank line and its entry may differ and still match exactly"),
+         "clear_days": (CLEARING_WINDOW_DAYS, 3, 120, "Days a payment may clear the bank after it was booked"),
+         "transfer_days": (4, 0, 14, "Days apart the two sides of a transfer may be"),
+         "charges_exact": (1, 0, 1, "Bank charges match on the exact date only"),
+         "two_person": (1, 0, 1, "Sign-off needs a second person (admins excepted)"),
+         "close_day": (10, 1, 28, "Month-end close is due on this day of the next month")}
+
+
+def rule(key):
+    """A rule's current value (whole number), falling back to its default."""
+    default, lo, hi, _ = RULES[key]
+    try:
+        v = int(str(get_config("rule_" + key)).strip())
+        return min(hi, max(lo, v))
+    except (TypeError, ValueError):
+        return default
 GROUP_WINDOW_DAYS = 60
 MAX_GROUP = 5         # max items combined in a batch
 M2O_MAX_LINES = 1000  # skip combinatorial pass above this many unmatched items
@@ -208,6 +225,54 @@ def _ensure_users(cur):
     cur.execute("""CREATE TABLE IF NOT EXISTS app_users (
         username text PRIMARY KEY, name text, password_hash text,
         is_admin boolean DEFAULT false, created_at timestamptz DEFAULT now());""")
+    # perms: comma-separated ticks (NULL = from before permissions: everything but users & settings)
+    for col, typ in (("perms", "text"), ("title", "text"), ("active", "boolean DEFAULT true"),
+                     ("expires", "date"), ("last_seen", "timestamptz")):
+        cur.execute(f"ALTER TABLE app_users ADD COLUMN IF NOT EXISTS {col} {typ};")
+
+
+# What each tick lets a person do. Everyone can view; admins can do everything.
+PERMS = [("upload", "Upload statements"), ("review", "Match & review"), ("record", "Record in QuickBooks"),
+         ("undo", "Undo / delete in QuickBooks"), ("signoff", "Sign off"), ("reopen", "Reopen sign-off"),
+         ("users", "Users & settings")]
+PERM_PRESETS = {"assistant": ("Accounts assistant", ["upload", "review", "record"]),
+                "approver": ("Approver", ["review", "signoff", "reopen"]),
+                "viewer": ("Viewer", []),
+                "admin": ("Admin", [k for k, _ in PERMS])}
+
+
+def user_row(username):
+    """(username, name, is_admin, perms or None, title, active, expires) for a named user, or None."""
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        _ensure_users(cur); conn.commit()
+        cur.execute("""SELECT username, name, is_admin, perms, title, coalesce(active, true), expires
+                       FROM app_users WHERE username=%s;""", (username.strip().lower(),))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row
+    except Exception:
+        return None
+
+
+def _load_session_user(row):
+    """Copy who the user is and what they may do into the session."""
+    un, nm, adm, perms, title, active, expires = row
+    session["username"], session["name"], session["is_admin"] = un, nm or un, bool(adm)
+    session["perms"] = None if perms is None else [p for p in perms.split(",") if p]
+    session["title"] = title or ""
+
+
+def log_activity(action, account=None):
+    """One line in the activity log: who did what, where."""
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS activity_log (id serial PRIMARY KEY, at timestamptz NOT NULL DEFAULT now(),
+                       username text, name text, action text NOT NULL, account text);""")
+        cur.execute("INSERT INTO activity_log (username, name, action, account) VALUES (%s,%s,%s,%s);",
+                    (session.get("username"), session.get("name"), action[:400], account))
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass   # the log must never stop the work it records
 
 
 def get_user(username):
@@ -226,7 +291,8 @@ def get_user(username):
 def list_users():
     conn = get_conn(); cur = conn.cursor()
     _ensure_users(cur); conn.commit()
-    cur.execute("SELECT username, name, is_admin, created_at FROM app_users ORDER BY created_at;")
+    cur.execute("""SELECT username, name, is_admin, created_at, perms, title, coalesce(active, true), expires, last_seen
+                   FROM app_users ORDER BY is_admin DESC, created_at;""")
     rows = cur.fetchall(); cur.close(); conn.close()
     return rows
 
@@ -937,6 +1003,7 @@ try:
     _c = get_conn(); _cur = _c.cursor()
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_at timestamptz;")
     _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS signed_off_by text;")
+    _cur.execute("ALTER TABLE statement ADD COLUMN IF NOT EXISTS prepared_by text;")
     _cur.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;")
     # Balance reconciliation. A *_source of NULL means "not known yet"; otherwise one of
     # user / file / carried (previous signed-off closing) / derived (closing - movements) / qbo.
@@ -1559,173 +1626,413 @@ def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
 
 
 # ---------------- shared styling ----------------
-CSS = """<style>
+CSS = """<link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link rel=stylesheet href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* ReconBook: navy sidebar + compact working area. Navy for structure and primary actions, gold for the
+   brand and the one decisive action (Sign off); orange/red/green only for state. */
 :root{
-  --bg:#eef1f5;--panel:#fff;--ink:#16202e;--muted:#667085;
-  --line:#e4e7ec;--line-soft:#eef0f3;
-  --accent:#0f766e;--accent-soft:#d6efea;
-  --ok:#047857;--ok-soft:#d7f3e3;--warn:#b45309;--warn-soft:#fbedcf;
-  --bad:#b42318;--bad-soft:#fbe2de;--none:#667085;--none-soft:#ebedf0;
-  --radius:14px;--shadow:0 1px 2px rgba(16,24,40,.04),0 2px 6px rgba(16,24,40,.04),0 10px 28px rgba(16,24,40,.05);
-  --lift:0 14px 32px rgba(16,24,40,.13);
+  --navy:#13213b;--navy-2:#1c2e4f;--navy-line:#2a3d61;--navy-text:#b9c3d6;
+  --gold:#c8a23a;--gold-soft:#f6eed6;
+  --bg:#f3f4f7;--panel:#fff;--ink:#18202f;--muted:#5d6779;--faint:#8a93a3;
+  --line:#e1e4ea;--line-soft:#eef0f4;--row:#f8f9fb;
+  --accent:#2b5797;--accent-soft:#e5ecf7;
+  --ok:#1f7a4d;--ok-soft:#e1f2e8;--warn:#c2570c;--warn-soft:#fdebdc;
+  --bad:#b42318;--bad-soft:#fbe4e1;--none:#5d6779;--none-soft:#eef0f4;
+  --radius:8px;--shadow:0 1px 2px rgba(19,33,59,.05);
+  --lift:0 10px 28px rgba(19,33,59,.14);
+  --f-ui:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --f-brand:'IBM Plex Serif',Georgia,serif;
+  --f-num:'IBM Plex Mono',ui-monospace,Consolas,monospace;
 }
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:radial-gradient(1100px 520px at 85% -8%,rgba(15,118,110,.07),transparent 60%),linear-gradient(180deg,#eff3f8 0%,#e6ecf3 65%,#e1e8f0 100%);background-attachment:fixed;min-height:100vh;color:var(--ink);margin:0;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+html{color-scheme:light}
+[hidden]{display:none!important}
+body{font-family:var(--f-ui);background:var(--bg);min-height:100vh;color:var(--ink);margin:0;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font-family:inherit}
 a{color:inherit;text-decoration:none}
-.nav{background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line);padding:15px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:5;box-shadow:0 1px 0 rgba(16,24,40,.03)}
-.nav .brand{font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
-.nav .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.nav .links a{color:var(--muted);font-size:14px;margin-left:18px}
-.nav .links a:hover{color:var(--ink)}
-.wrap{max-width:1000px;margin:0 auto;padding:34px 24px 64px}
-h1{font-size:26px;font-weight:680;letter-spacing:-.02em;margin:0 0 5px}
-h2{font-size:15px;font-weight:650;letter-spacing:-.01em;color:var(--ink);margin:30px 0 12px;border-radius:7px;padding:2px 6px;margin-left:-6px}
-.sub{color:var(--muted);margin:0 0 26px;font-size:14px}
-.btn{background:linear-gradient(180deg,#243244,#16202e);color:#fff;border:none;padding:10px 18px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:550;box-shadow:0 1px 2px rgba(16,24,40,.24),0 2px 8px rgba(16,24,40,.14);transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
-.btn:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(16,24,40,.28),0 6px 18px rgba(16,24,40,.16);filter:brightness(1.07)}
-.btn:active{transform:translateY(0)}
-.btn-go{background:linear-gradient(180deg,#059669,#047857);color:#fff;border:none;padding:9px 17px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:550;box-shadow:0 1px 2px rgba(4,120,87,.3),0 2px 8px rgba(4,120,87,.18);transition:transform .15s ease,filter .15s ease}
-.btn-go:hover{transform:translateY(-1px);filter:brightness(1.07)}
-.btn-sm{background:var(--panel);border:1px solid var(--line);padding:6px 12px;border-radius:7px;cursor:pointer;font-size:13px;font-weight:500;color:var(--ink);transition:border-color .15s,background .15s}
-.btn-sm:hover{border-color:#cdd2da;background:#fafbfc}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:8px}
-.tile{appearance:none;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;cursor:pointer;font:inherit;color:inherit;box-shadow:var(--shadow);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
-.tile:hover{transform:translateY(-2px);box-shadow:var(--lift)}
-.tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.tile .t-label{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
-.tile .t-val{font-size:30px;font-weight:700;margin-top:9px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-.tile.active{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),var(--shadow)}
-.tile.active .t-label{color:var(--accent)}
-.tile .t-val.warn{color:var(--bad)}
-.t-top{display:flex;align-items:center;gap:7px}
-.t-ic{color:var(--muted);display:inline-flex}.t-ic svg{width:16px;height:16px;display:block}
-.tile.active .t-ic{color:var(--accent)}
-.flash{animation:flashbg 1.3s ease}@keyframes flashbg{0%{background:var(--accent-soft)}100%{background:transparent}}
-.fbar{font-size:13.5px;color:var(--muted);margin:14px 0 0;display:none}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.wrap{max-width:1240px;margin:0;padding:18px 24px 60px}
+h1{font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0 0 3px;text-wrap:balance}
+h2{font-size:14px;font-weight:600;color:var(--ink);margin:22px 0 10px}
+.sub{color:var(--muted);margin:0 0 16px;font-size:13px}
+.btn{display:inline-flex;align-items:center;gap:6px;background:var(--navy);color:#fff;border:1px solid var(--navy);padding:6px 13px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap}
+.btn:hover{background:var(--navy-2)}
+.btn-go{display:inline-flex;align-items:center;gap:6px;background:var(--gold);color:var(--navy);border:1px solid var(--gold);padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
+.btn-go:hover{filter:brightness(1.05)}
+.btn-go[disabled],.btn[disabled],.btn-sm[disabled]{opacity:.45;cursor:not-allowed;filter:none}
+.btn-sm{display:inline-flex;align-items:center;gap:5px;background:var(--panel);border:1px solid var(--line);padding:3px 10px;border-radius:6px;cursor:pointer;font-size:12.5px;font-weight:500;color:var(--ink);white-space:nowrap}
+.btn-sm:hover{border-color:#c9ced8;background:#fbfbfc}
+.btn-sm.pri{background:var(--navy);border-color:var(--navy);color:#fff}
+.btn-sm.danger,.danger{color:var(--bad)}
+.btn-sm.danger{border-color:#efc6c0}
+.icon-btn{border:1px solid var(--line);background:var(--panel);border-radius:6px;width:26px;height:24px;display:inline-grid;place-items:center;cursor:pointer;color:var(--muted);padding:0;vertical-align:middle}
+.icon-btn:hover{color:var(--ink);border-color:#c9ced8}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0;margin:0 0 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.tile{appearance:none;text-align:left;background:none;border:0;border-right:1px solid var(--line-soft);padding:11px 14px;cursor:pointer;font:inherit;color:inherit}
+.tile:last-child{border-right:0}
+.tile:hover{background:var(--row)}
+.tile .t-label{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.tile .t-val{font:500 18px/1.2 var(--f-num);margin-top:4px;font-variant-numeric:tabular-nums}
+.tile.active{box-shadow:inset 0 -2px 0 var(--gold)}
+.tile .t-val.warn{color:var(--warn)}
+.t-top{display:flex;align-items:center;gap:6px}
+.t-ic{color:var(--faint);display:inline-flex}.t-ic svg{width:14px;height:14px;display:block}
+.flash{animation:flashbg 1.3s ease}@keyframes flashbg{0%{background:var(--gold-soft)}100%{background:transparent}}
+.fbar{font-size:13px;color:var(--muted);margin:10px 0 0;display:none}
 .fbar a{color:var(--accent);font-weight:600;cursor:pointer}
-.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
-.card .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
-.card .val{font-size:23px;font-weight:680;margin-top:7px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);margin:14px 0 26px}
-th,td{text-align:left;padding:13px 16px;border-bottom:1px solid var(--line-soft);font-size:14px;white-space:nowrap}
-th{background:#fafbfc;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
-tbody tr:last-child td{border-bottom:none}
-tbody tr{transition:background .12s ease}
-tbody tr:hover{background:#f7f9fb}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
+.card .label{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.card .val{font:500 18px var(--f-num);margin-top:5px;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:8px 0 18px}
+table tr:first-child>th:first-child{border-top-left-radius:var(--radius)}table tr:first-child>th:last-child{border-top-right-radius:var(--radius)}
+th,td{text-align:left;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-size:13px;white-space:nowrap}
+th{background:#fbfbfc;color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600;border-bottom-color:var(--line)}
+tbody tr:last-child td,table tr:last-child td{border-bottom:none}
+tr:hover>td{background:var(--row)}
 .a{text-align:right;font-variant-numeric:tabular-nums}
-.pill{font-size:12px;padding:4px 11px;border-radius:999px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
-.pill::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
+.pill{font-size:11.5px;padding:1px 9px;border-radius:999px;font-weight:600;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .pill.none{background:var(--none-soft);color:var(--none)}
-.pill.open{background:var(--warn-soft);color:var(--warn)}
-.pill.signed{background:var(--ok-soft);color:var(--ok)}
-.tag{font-size:11px;padding:2px 9px;border-radius:999px;font-weight:600}
-.tag.exact{background:var(--ok-soft);color:var(--ok)}
-.tag.fuzzy{background:var(--warn-soft);color:var(--warn)}
-.upload{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:26px;box-shadow:var(--shadow)}
-.u-label{font-size:13px;color:var(--muted);margin-bottom:7px;font-weight:550}
-.upload input[type=file]{font-size:13px}
-.exc th{background:#fdf2ef;color:var(--bad)}
-.recgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.pill.open,.pill.attn{background:var(--warn-soft);color:var(--warn)}
+.pill.signed,.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.pill.info{background:var(--accent-soft);color:var(--accent)}
+.pill.gold{background:var(--gold-soft);color:#7a5d0e}
+.tag{font-size:11px;padding:1px 7px;border-radius:4px;font-weight:500;background:var(--line-soft);color:var(--muted)}
+.tag.exact{background:var(--accent-soft);color:var(--accent)}
+.tag.fuzzy{background:#fff4e5;color:#9a5b00}
+.upload{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px;margin-bottom:18px}
+.u-label{font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:600}
+.upload input[type=file]{font-size:12.5px}
+.exc th{color:var(--bad)}
+.recgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .recgrid table{margin:0}
 .rec td{white-space:normal}
-.rec tr.tot td{font-weight:650;background:#fafbfc;border-top:1px solid var(--line)}
-.rec .src{color:var(--muted);font-size:12px;font-weight:400}
-.recres{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:14px 0 8px;padding:14px 18px;border-radius:var(--radius);font-weight:600;font-variant-numeric:tabular-nums}
+.rec tr.tot td{font-weight:600;background:#fbfbfc;border-top:1px solid var(--line)}
+.rec .src{color:var(--faint);font-size:11.5px;font-weight:400}
+.recres{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:10px 0 8px;padding:9px 12px;border-radius:6px;font-weight:600;font-variant-numeric:tabular-nums}
 .recres.balanced{background:var(--ok-soft);color:var(--ok)}
 .recres.out{background:var(--bad-soft);color:var(--bad)}
 .recres.incomplete{background:var(--none-soft);color:var(--none)}
-.recnote{font-size:13px;padding:9px 13px;border-radius:9px;margin:8px 0;line-height:1.5}
+.recnote{font-size:12.5px;padding:8px 12px;border-radius:6px;margin:6px 0;line-height:1.5}
 .recnote.bad{background:var(--bad-soft);color:var(--bad)}
-.recnote.warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a}
-.balform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:12px 0 4px}
-.balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-.balform input{width:170px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;font-variant-numeric:tabular-nums}
+.recnote.warn{background:var(--warn-soft);color:#8a3d08}
+.balform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:10px 0 4px}
+.balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600}
+.balform input{width:170px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;font-variant-numeric:tabular-nums}
 .tag.bf{background:var(--none-soft);color:var(--none)}
 .tag.pending{background:var(--warn-soft);color:var(--warn)}
-.hint{color:var(--muted);font-size:12px;line-height:1.4;white-space:normal}
+.hint{color:var(--faint);font-size:11.5px;line-height:1.4;white-space:normal}
 .rectbl td{vertical-align:top}
 /* Bank wording with no spaces (FXPLOU~1110179~FWD~BUY~USD/UGX~3,840.0000) wraps inside its cell instead of
    running into the amount beside it; dates and amounts stay on one line. */
 td.desc{white-space:normal;overflow-wrap:anywhere;word-break:break-word;min-width:140px;max-width:300px}
 td.a{white-space:nowrap}
-.rectbl select,.rectbl input.payee{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:230px;background:#fff}
-.rectbl select{width:230px}.rectbl input.payee{width:150px}
-.acctbox{position:relative;width:230px;max-width:100%}
-.ttype-why{margin:-2px 0 5px;max-width:230px;white-space:normal}
-.ttype{display:block;width:230px;max-width:100%;margin:0 0 5px;padding:4px 6px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;color:var(--ink);background:var(--panel)}
-.acctbox .acct-q{width:100%;box-sizing:border-box;padding:6px 26px 6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:#fff}
+.rectbl select,.rectbl input.payee{padding:3px 7px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;max-width:220px;background:#fff}
+.rectbl select{width:220px}.rectbl input.payee{width:150px}
+.acctbox{position:relative;width:220px;max-width:100%}
+.ttype-why{margin:-2px 0 5px;max-width:220px;white-space:normal}
+.ttype{display:block;width:220px;max-width:100%;margin:0 0 4px;padding:2px 5px;border:1px solid var(--line);border-radius:5px;font-size:12px;color:var(--ink);background:#fbfbfc}
+.acctbox .acct-q{width:100%;box-sizing:border-box;padding:3px 24px 3px 7px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;background:#fff}
 .acctbox .acct-q.bad{border-color:#d97706;background:#fffbeb}
-.acctbox .acct-x{position:absolute;right:3px;top:4px;border:0;background:none;color:var(--muted);font-size:17px;line-height:1;cursor:pointer;padding:2px 5px}
-.acctbox .acct-x:hover{color:#b3471f}
-.acct-list{position:absolute;z-index:30;top:100%;left:0;width:min(340px,86vw);max-height:280px;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 22px rgba(15,23,42,.14);margin-top:3px}
-.acct-list .ao{padding:6px 10px;font-size:13px;cursor:pointer;white-space:normal;display:flex;justify-content:space-between;gap:10px}
-.acct-list .ao .at{color:var(--muted);font-size:11px;white-space:nowrap}
-.acct-list .ao.hi{background:#eef4ff}
-.acct-list .ag{padding:7px 10px 3px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.acctbox .acct-x{position:absolute;right:2px;top:1px;border:0;background:none;color:var(--faint);font-size:16px;line-height:1;cursor:pointer;padding:2px 5px}
+.acctbox .acct-x:hover{color:var(--bad)}
+.acct-list{position:absolute;z-index:30;top:100%;left:0;width:min(340px,86vw);max-height:280px;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:var(--lift);margin-top:3px}
+.acct-list .ao{padding:5px 10px;font-size:12.5px;cursor:pointer;white-space:normal;display:flex;justify-content:space-between;gap:10px}
+.acct-list .ao .at{color:var(--faint);font-size:11px;white-space:nowrap}
+.acct-list .ao.hi{background:var(--accent-soft)}
+.acct-list .ag{padding:7px 10px 3px;font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
 .acct-list .none{padding:9px 10px;font-size:12px;color:var(--muted);white-space:normal}
 .acctbox.off{opacity:.45}
-.custbox{position:relative;width:170px;max-width:100%}
-.custbox .acct-q{width:100%;box-sizing:border-box;padding:6px 26px 6px 8px}
+.custbox{position:relative;width:160px;max-width:100%}
+.custbox .acct-q{width:100%;box-sizing:border-box;padding:3px 24px 3px 7px}
 .custbox .acct-q.bad{border-color:#d97706;background:#fffbeb}
-.custbox .acct-x{position:absolute;right:3px;top:4px;border:0;background:none;color:var(--muted);font-size:17px;line-height:1;cursor:pointer;padding:2px 5px}
-.rowtools{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap}
-.rowtools .split-btn.on{background:var(--accent-soft);color:var(--accent)}
-.rectbl input.rate{width:118px;padding:5px 7px;border:1px solid var(--line);border-radius:7px;font-size:12px;background:#fff}
-.splitrow td{background:#f8faff;white-space:normal}
+.custbox .acct-x{position:absolute;right:2px;top:1px;border:0;background:none;color:var(--faint);font-size:16px;line-height:1;cursor:pointer;padding:2px 5px}
+.rowtools{display:flex;gap:6px;align-items:center;margin-top:5px;flex-wrap:wrap}
+.rowtools .split-btn.on,.split-btn.on{background:var(--accent-soft);color:var(--accent)}
+.rectbl input.rate{width:118px;padding:3px 7px;border:1px solid var(--line);border-radius:5px;font-size:12px;background:#fff}
+.splitrow td{background:#f7f9fd;white-space:normal}
 .splithead{font-size:12px;color:var(--muted);margin:2px 0 6px}
-.splitline{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
-.splitamt{width:130px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
+.splitline{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
+.splitamt{width:130px;padding:4px 8px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
 .splitfoot{display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap}
-.splitrem{font-size:13px;font-weight:600}.splitrem.ok{color:#3a7d44}.splitrem.warn{color:#b3471f}
-.recbar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
-.hedgerow td,.kidsrow td{background:#fbfaf5;white-space:normal}
+.splitrem{font-size:12.5px;font-weight:600}.splitrem.ok{color:var(--ok)}.splitrem.warn{color:var(--warn)}
+.recbar{position:sticky;bottom:0;z-index:5;display:flex;gap:10px;align-items:center;margin-top:0;flex-wrap:wrap;padding:9px 14px;background:#f7f8fa;border:1px solid var(--line);border-radius:0 0 var(--radius) var(--radius)}
+.hedgerow td,.kidsrow td{background:#fbfaf3;white-space:normal}
 .hedgeins{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;font-size:12px;color:var(--muted)}
 .hedgeins label{display:flex;flex-direction:column;gap:4px}
-.hedgeins input{width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right}
-.hedgecalc{font-size:13px;color:var(--ink,#16202e);font-weight:550}
-.rowtools .hedge-btn.on{background:var(--accent-soft);color:var(--accent)}
-.kidline{display:flex;gap:10px;align-items:center;margin:5px 0;font-size:13px}
+.hedgeins input{width:150px;padding:4px 8px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;text-align:right}
+.hedgecalc{font-size:12.5px;color:var(--ink);font-weight:500}
+.hedge-btn.on{background:var(--accent-soft);color:var(--accent)}
+.kidline{display:flex;gap:10px;align-items:center;margin:5px 0;font-size:12.5px}
 .kidline span{min-width:220px}
-.savedsel{background:#eef4ff;border:1px solid #c7d7f5;color:#1e3a6e;padding:8px 12px;border-radius:9px;font-size:13px;margin:0 0 10px}
-.booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px}
-.btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.dupwarn{margin-top:6px;padding:7px 9px;border-radius:7px;background:#fffbeb;border:1px solid #fde68a;color:#92400e;font-size:12.5px;line-height:1.45;white-space:normal}
+.savedsel{background:var(--accent-soft);border:1px solid #c8d6ec;color:#24406b;padding:7px 12px;border-radius:6px;font-size:12.5px;margin:0 0 10px}
+.booksrc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px}
+.btnrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.btnrow form{margin:0}
+.dupwarn{margin-top:5px;padding:6px 9px;border-radius:6px;background:var(--warn-soft);color:#8a3d08;font-size:12px;line-height:1.45;white-space:normal}
 .dupwarn .btn-sm{margin-top:5px}
-.mmgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.mmcol{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
-.mmhead{padding:10px 12px;border-bottom:1px solid var(--line-soft);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;color:var(--muted);display:flex;gap:8px;align-items:center;justify-content:space-between}
-.mmsearch{padding:5px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;width:55%;text-transform:none;letter-spacing:0}
+.mmgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.mmcol{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.mmhead{padding:8px 12px;border-bottom:1px solid var(--line-soft);font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;color:var(--faint);display:flex;gap:8px;align-items:center;justify-content:space-between}
+.mmsearch{padding:4px 8px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;width:55%;text-transform:none;letter-spacing:0}
 .mmlist{max-height:340px;overflow:auto}
-.mmrow{display:grid;grid-template-columns:22px 86px minmax(0,1fr) auto;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
-.mmrow:hover{background:#f7f9fb}.mmrow.on{background:var(--accent-soft)}
+.mmrow{display:grid;grid-template-columns:22px 86px minmax(0,1fr) auto;gap:8px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-size:12.5px;cursor:pointer}
+.mmrow:hover{background:var(--row)}.mmrow.on{background:var(--accent-soft)}
 .mmrow .mmw{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mmrow .a{font-variant-numeric:tabular-nums}
-.mmbar{position:sticky;bottom:0;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0 26px;padding:12px 16px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);font-size:14px;font-variant-numeric:tabular-nums}
+.mmbar{position:sticky;bottom:0;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0 18px;padding:9px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);font-size:13px;font-variant-numeric:tabular-nums}
 .mmbar .ok{color:var(--ok);font-weight:600}.mmbar .warn{color:var(--warn);font-weight:600}
 @media (max-width:760px){.mmgrid{grid-template-columns:1fr}}
-.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
-@media (max-width:760px){
-  .tiles{grid-template-columns:repeat(2,1fr)}
-  .cards{grid-template-columns:repeat(2,1fr)}
-  .recgrid{grid-template-columns:1fr}
-  .wrap{padding:22px 15px 48px}
-  h1{font-size:22px}
-  .nav{padding:13px 16px}
-}
-@media (prefers-reduced-motion:reduce){*{transition:none !important}}
-#loadingov{position:fixed;inset:0;background:rgba(238,243,248,.82);display:none;align-items:center;justify-content:center;flex-direction:column;gap:16px;z-index:9999}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}.faint{color:var(--faint)}
+.num{font-variant-numeric:tabular-nums}
+#loadingov{position:fixed;inset:0;background:rgba(243,244,247,.78);display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:9999}
 #loadingov.on{display:flex}
-#loadingov .spin{width:44px;height:44px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
-#loadingov .msg{color:var(--muted);font-size:14px;font-weight:600}
+#loadingov .spin{width:38px;height:38px;border:3px solid var(--line);border-top-color:var(--navy);border-radius:50%;animation:spin .8s linear infinite}
+#loadingov .msg{color:var(--muted);font-size:13px;font-weight:600}
 @keyframes spin{to{transform:rotate(360deg)}}
-.appfoot{max-width:1000px;margin:0 auto;padding:22px 24px 44px;color:#9ca3af;font-size:13px;text-align:center}.appfoot a{color:#6b7280;font-weight:500}.appfoot a:hover{color:var(--accent)}
+.appfoot{padding:18px 24px 30px;color:var(--faint);font-size:12px}.appfoot a{color:var(--muted)}.appfoot a:hover{color:var(--ink)}
 .pw-wrap{position:relative}
 .pw-wrap input{padding-right:42px !important}
-.pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;height:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:var(--muted);display:flex}
+.pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;height:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:var(--faint);display:flex}
 .pw-toggle:hover{color:var(--ink)}
-.pw-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* ---- shell ---- */
+.app{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
+.side{background:var(--navy);color:var(--navy-text);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto;z-index:50}
+.side .brand{display:flex;gap:10px;align-items:center;padding:16px 18px 13px;border-bottom:1px solid var(--navy-line);color:#fff}
+.side .brand svg{flex:none;color:var(--gold);width:28px;height:28px}
+.side .brand b{display:block;font:600 19px/1.1 var(--f-brand);color:#fff;letter-spacing:.2px}
+.side .brand small{display:block;font-size:10px;letter-spacing:.9px;text-transform:uppercase;color:var(--navy-text);margin-top:3px;line-height:1.3}
+.snav{padding:8px;display:flex;flex-direction:column;gap:1px}
+.snav .lbl{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#7f8ba3;padding:12px 10px 5px}
+.snav a{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:6px;color:var(--navy-text);font-weight:500;min-width:0}
+.snav a:hover{background:var(--navy-2);color:#fff}
+.snav a.on{background:var(--navy-2);color:#fff;box-shadow:inset 3px 0 0 var(--gold)}
+.snav a svg{flex:none;opacity:.85;width:16px;height:16px}
+.snav a .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.snav a .cnt{margin-left:auto;font-size:11px;color:#8d99b1;font-variant-numeric:tabular-nums}
+.sdot{width:7px;height:7px;border-radius:50%;flex:none;background:#6b7790}
+.sdot.attn{background:#f08a3c}.sdot.ok{background:#4cc38a}
+.sfoot{margin-top:auto;padding:12px;border-top:1px solid var(--navy-line);display:flex;flex-direction:column;gap:10px}
+.qbo{background:var(--navy-2);border-radius:8px;padding:9px 10px;font-size:12px}
+.qbo .st{display:flex;align-items:center;gap:6px;color:#fff;font-weight:600}
+.qbo .st i{width:7px;height:7px;border-radius:50%;background:#4cc38a}
+.qbo .st i.off{background:#e06b5a}
+.qbo .when{color:#8d99b1;margin:2px 0 7px}
+.qbo .row{display:flex;gap:6px;align-items:center}
+.qbo form{margin:0}
+.btn-dk{background:transparent;border:1px solid var(--navy-line);color:#dfe5f0;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:12px;font-family:inherit}
+.btn-dk:hover{border-color:var(--gold);color:#fff}
+.me{display:flex;align-items:center;gap:9px;padding:4px 2px;cursor:pointer;border-radius:6px;width:100%;background:none;border:0;text-align:left;color:inherit;font:inherit}
+.me .av{width:28px;height:28px;border-radius:50%;background:var(--gold);color:var(--navy);display:grid;place-items:center;font-weight:700;font-size:12px;flex:none}
+.me b{color:#fff;font-weight:600;display:block;font-size:12.5px}.me small{font-size:11px;color:#8d99b1}
+.main{min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:12px;padding:9px 24px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;min-height:46px}
+.crumb{color:var(--muted);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.crumb b{color:var(--ink);font-weight:600}
+.crumb a:hover{color:var(--ink)}
+.topbar .sp{flex:1}
+.tsearch{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:6px;padding:4px 9px;color:var(--faint);width:280px;max-width:40vw;background:var(--bg);margin:0}
+.tsearch input{border:0;background:none;outline:none;width:100%;color:var(--ink);font-size:12.5px}
+.menu-btn{display:none}
+.kebab{position:relative;display:inline-block;vertical-align:middle}
+.dd{position:absolute;right:0;top:calc(100% + 4px);background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--lift);min-width:200px;padding:4px;z-index:45;color:var(--ink);text-align:left;white-space:normal}
+.dd.up{top:auto;bottom:calc(100% + 4px)}.dd.left{left:0;right:auto}
+.dd form{margin:0;display:block}
+.dd button,.dd a{display:flex;width:100%;text-align:left;background:none;border:0;padding:6px 10px;border-radius:5px;cursor:pointer;gap:8px;align-items:center;font:inherit;font-size:12.5px;color:inherit}
+.dd button:hover,.dd a:hover{background:var(--bg)}
+.dd .sep{height:1px;background:var(--line-soft);margin:4px 2px}
+.dd .dh{font-size:10.5px;color:var(--faint);padding:5px 10px 2px;text-transform:uppercase;letter-spacing:.6px}
+.dd .danger{color:var(--bad)}
+.ph{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap;margin:0 0 14px}
+.ph h1{margin:0}
+.ph .meta{color:var(--muted);margin-top:4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px}
+.ph .acts{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius)}
+.panel-h{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line-soft)}
+.panel-h h2{font-size:13.5px;margin:0}
+.panel-h .r{margin-left:auto;display:flex;gap:8px;align-items:center}
+.panel table{border:0;border-radius:0;margin:0}
+.help{color:var(--muted);font-size:12.5px;margin:0 0 8px}
+details.how{display:inline}
+details.how>summary{display:inline;cursor:pointer;color:var(--accent);list-style:none}
+details.how>summary::-webkit-details-marker{display:none}
+details.how[open]>summary{color:var(--faint)}
+details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6px;background:var(--accent-soft);color:#24406b;line-height:1.55;max-width:860px}
+.bar{height:6px;border-radius:99px;background:var(--line-soft);overflow:hidden;min-width:70px}
+.bar i{display:block;height:100%;background:var(--ok);border-radius:99px}
+.bar.attn i{background:#e08a3e}
+.scrim{position:fixed;inset:0;background:rgba(19,33,59,.35);z-index:60}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(460px,100%);background:var(--panel);z-index:61;box-shadow:-12px 0 40px rgba(19,33,59,.18);display:flex;flex-direction:column}
+.drawer-h{display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line)}
+.drawer-h h2{font-size:15px;margin:0}
+.drawer-b{padding:16px 18px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.drawer-f{margin-top:auto;padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;align-items:center}
+.drawer h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin:6px 0 0}
+.fld{display:flex;flex-direction:column;gap:4px}
+.fld label{font-size:12px;font-weight:600;color:var(--muted)}
+.fld input,.fld select{border:1px solid var(--line);border-radius:6px;padding:6px 9px;background:var(--panel);font-size:13px}
+.fld small{color:var(--faint);font-size:11.5px}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.rb-dlg{position:fixed;left:50%;top:20%;transform:translateX(-50%);width:min(440px,calc(100% - 32px));background:var(--panel);border-radius:10px;z-index:61;box-shadow:0 24px 60px rgba(19,33,59,.28);overflow:hidden}
+.rb-dlg .dlg-b{padding:18px 20px 6px}
+.rb-dlg h3{font-size:15px;margin:0 0 6px}
+.rb-dlg p{margin:0;color:var(--muted);line-height:1.5}
+.rb-dlg .dlg-f{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px}
+.rb-dlg .btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+#flash{position:fixed;right:16px;bottom:16px;z-index:80;background:var(--navy);color:#fff;border-radius:8px;padding:10px 38px 10px 14px;box-shadow:0 10px 26px rgba(19,33,59,.28);max-width:min(420px,calc(100% - 32px));font-size:13px;line-height:1.45;animation:tin .2s ease}
+#flash.err{background:#7a1a12}
+#flash .x{position:absolute;right:6px;top:6px;background:none;border:0;color:#cfd7e6;cursor:pointer;font-size:16px;line-height:1;padding:3px 6px}
+#flash a{color:var(--gold);font-weight:600}
+@keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:860px){
+  .app{grid-template-columns:minmax(0,1fr)}
+  .side{position:fixed;left:0;top:0;bottom:0;width:250px;transform:translateX(-100%);transition:transform .2s}
+  .side.open{transform:none;box-shadow:12px 0 40px rgba(0,0,0,.3)}
+  .menu-btn{display:inline-grid}
+  .tsearch{display:none}
+  .wrap{padding:14px 16px 50px}
+  .topbar{padding:8px 16px}
+  .recgrid,.two{grid-template-columns:1fr}
+  .cards{grid-template-columns:repeat(2,1fr)}
+}
+@media print{.side,.topbar,#flash{display:none}.app{display:block}}
 </style>"""
+
+# The page frame every signed-in page shares: the navy sidebar (brand, bank accounts, QuickBooks
+# status, the user menu) and the top bar (where you are, search). SHELL_END closes it and adds the
+# confirmation dialog, the loading overlay and the small scripts every page uses.
+SCALE_ICON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" '
+              'stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5v17"/><path d="M7 6.5h10"/>'
+              '<path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg>')
+DOTS_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>'
+SHELL_TOP = """{% set S = shell_data() %}<div class=app>
+<aside class=side id=side aria-label="Main menu">
+<a class=brand href="{{ url_for('dashboard') }}">""" + SCALE_ICON + """<div><b>ReconBook</b>{% if S.company %}<small>{{ S.company }}</small>{% endif %}</div></a>
+<nav class=snav>
+<a href="{{ url_for('dashboard') }}" class="{{ 'on' if S.page=='dashboard' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11 12 4l8 7"/><path d="M6 10v9h12v-9"/></svg>Dashboard</a>
+{% if S.accounts %}<div class=lbl>Bank accounts</div>{% endif %}
+{% for a in S.accounts %}<a href="{{ url_for('detail', name=a.name) }}" class="{{ 'on' if a.name==S.acct else '' }}" data-busy="Loading {{ a.name }}..." title="{{ a.name }}"><span class="sdot {{ a.state }}"></span><span class=nm>{{ a.name }}</span>{% if a.n %}<span class=cnt>{{ a.n }}</span>{% endif %}</a>{% endfor %}
+<div class=lbl>Manage</div>
+<a href="{{ url_for('reports') }}" class="{{ 'on' if S.page=='reports' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M9 13h6M9 16.5h6"/></svg>Reports</a>
+{% if can('users') %}<a href="{{ url_for('users') }}" class="{{ 'on' if S.page=='users' else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.6-3.2 3-5 5.5-5s4.9 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2c2.2.1 4.3 1.6 5 4.3"/></svg>Users &amp; permissions</a>{% endif %}
+{% if can('settings') %}<a href="{{ url_for('settings') }}" class="{{ 'on' if S.page in ('settings','manage_accounts') else '' }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></svg>Settings</a>{% endif %}
+</nav>
+<div class=sfoot>
+<div class=qbo>{% if S.qbo %}<div class=st><i></i>QuickBooks connected</div><div class=when>{% if S.synced %}Synced {{ S.synced }}{% else %}Not synced yet{% endif %}</div>
+<div class=row><form method=post action="{{ url_for('sync') }}"><button type=submit class=btn-dk>Sync now</button></form>
+<span class=kebab><button type=button class=btn-dk data-dd aria-label="More sync options" aria-expanded=false>&#9662;</button><div class="dd up left" hidden>
+<form method=post action="{{ url_for('sync') }}" data-confirm="Full resync? It re-reads every transaction in the window, ignoring the last-sync marker. Slower, but use it if you think something was missed."><input type=hidden name=full value="1"><button type=submit>Full resync</button></form>
+{% if can('settings') %}<a href="{{ url_for('settings') }}">Connection settings</a>{% endif %}</div></span></div>
+{% else %}<div class=st><i class=off></i>QuickBooks not connected</div><div class=when>Books can't refresh</div>{% if can('settings') %}<div class=row><a class=btn-dk href="{{ url_for('settings') }}">Connect</a></div>{% endif %}{% endif %}</div>
+<span class=kebab style="display:block"><button type=button class=me data-dd aria-expanded=false><span class=av>{{ S.initials }}</span><span><b>{{ session.name or 'Signed in' }}</b><small>{{ S.role }}</small></span></button>
+<div class="dd up left" hidden><a href="{{ url_for('change_password') }}">Change password</a><div class=sep></div><a href="{{ url_for('logout') }}">Sign out</a></div></span>
+</div>
+</aside>
+<div class=main>
+<header class=topbar><button type=button class="icon-btn menu-btn" id=menubtn aria-label="Menu"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<div class=crumb>{{ S.crumb|safe }}</div><span class=sp></span>
+<form class=tsearch method=get action="{{ url_for('search') }}" role=search><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></svg><input name=q value="{{ request.args.get('q','') if S.page=='search' else '' }}" placeholder="Find an amount, payee or reference" aria-label="Search"></form>
+</header>
+"""
+SHELL_END = """<div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
+</div></div>
+<div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
+<div class=scrim id=rb-scrim hidden></div>
+<div class=rb-dlg id=rb-dlg hidden role=dialog aria-modal=true aria-labelledby=rb-dlg-t><div class=dlg-b><h3 id=rb-dlg-t>Please confirm</h3><p id=rb-dlg-msg></p></div>
+<div class=dlg-f><button type=button class=btn-sm id=rb-no>Cancel</button><button type=button class=btn id=rb-yes>Confirm</button></div></div>
+<script>(function(){
+var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
+function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(ov)ov.classList.remove('on');},40000);}
+function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
+// "Confirm" -> "Confirming...", "Save balances" -> "Saving balances...": say what's being done.
+var VERB={Confirm:'Confirming',Reject:'Rejecting',Undo:'Undoing',Edit:'Opening',Record:'Recording',Save:'Saving',Get:'Getting',
+  Sign:'Signing',Match:'Matching',Import:'Importing',Clear:'Clearing',Delete:'Deleting',Set:'Setting',Update:'Updating',
+  Create:'Creating',Remove:'Removing',Check:'Checking',Disconnect:'Disconnecting',Refresh:'Refreshing',Discard:'Discarding',
+  Upload:'Uploading',Add:'Adding',Sync:'Syncing',Full:'Starting a full resync'};
+function busy(label){var w=label.split(' '),v=VERB[w[0]];if(!v)return '';var rest=label.slice(w[0].length).trim();
+  return v+(rest?' '+rest.charAt(0).toLowerCase()+rest.slice(1):'')+'...';}
+document.addEventListener('click',function(e){
+var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
+var href=a.getAttribute('href')||'';if(!href)return;
+if(a.target==='_blank'||a.hasAttribute('download'))return;
+if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
+if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1||href.indexOf('/csv')>-1)return;
+if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+schedule(a.getAttribute('data-busy')||'Loading...');});
+document.addEventListener('submit',function(e){
+if(e.defaultPrevented)return;
+var f=e.target,act=(f.getAttribute&&f.getAttribute('action'))||'';var t='Please wait...';
+if((f.getAttribute('method')||'get').toLowerCase()!=='post'&&act.indexOf('/search')>-1)t='Searching...';
+var sb=e.submitter,bt=sb&&(sb.getAttribute('data-busy')||busy((sb.textContent||sb.value||'').trim()));
+if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
+else if(act.indexOf('/match')>-1||act.indexOf('/unmatch')>-1)t='Matching...';
+if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
+else if(act.indexOf('/import_books')>-1)t='Importing your books...';
+else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
+else if(act.indexOf('/clear')>-1)t='Clearing account data...';
+else if(act.indexOf('/signoff')>-1)t='Signing off...';
+else if(act.indexOf('/reopen')>-1)t='Reopening...';
+else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
+else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
+if(bt&&act.indexOf('/upload')<0&&act.indexOf('/import_books')<0&&act.indexOf('/sync')<0)t=bt;
+schedule(t);});
+window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
+// Menus: a button with data-dd opens the .dd beside it; a click elsewhere or Escape closes it.
+function closeDD(except){[].forEach.call(document.querySelectorAll('.dd'),function(d){if(d!==except&&!d.hidden){d.hidden=true;var b=d.parentNode.querySelector('[data-dd]');if(b)b.setAttribute('aria-expanded','false')}})}
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-dd]');
+  if(b){e.preventDefault();var d=b.parentNode.querySelector('.dd');if(!d)return;var open=d.hidden;closeDD(d);d.hidden=!open;b.setAttribute('aria-expanded',String(open));if(open)place(b,d);return}
+  var inDD=e.target.closest&&e.target.closest('.dd');
+  if(!inDD)closeDD();else if(e.target.closest('button,a')&&!e.target.closest('input,select,label'))setTimeout(function(){closeDD()},0);});
+// A menu opens beside its button even inside a table or a scrolling box (fixed to the window).
+function place(b,d){if(!b.getBoundingClientRect)return;var r=b.getBoundingClientRect();if(!r.width&&!r.height)return;
+  var W=window.innerWidth,Hh=window.innerHeight;d.style.position='fixed';d.style.zIndex='70';
+  var up=d.classList.contains('up')||(r.bottom+260>Hh&&r.top>260);
+  if(up){d.style.top='auto';d.style.bottom=(Hh-r.top+4)+'px'}else{d.style.bottom='auto';d.style.top=(r.bottom+4)+'px'}
+  if(d.classList.contains('left')){d.style.left=Math.max(8,r.left)+'px';d.style.right='auto'}else{d.style.right=Math.max(8,W-r.right)+'px';d.style.left='auto'}}
+window.addEventListener('scroll',function(e){if(e.target&&e.target.closest&&e.target.closest('.dd'))return;closeDD()},true);
+window.addEventListener('resize',function(){closeDD()});
+var mb=document.getElementById('menubtn'),side=document.getElementById('side');
+if(mb&&side)mb.addEventListener('click',function(){side.classList.toggle('open')});
+// Confirmations in a page dialog instead of the browser's box. A form with data-confirm asks first;
+// scripts call rbAsk(message, onYes).
+var dlg=document.getElementById('rb-dlg'),scrim=document.getElementById('rb-scrim'),yes=document.getElementById('rb-yes'),
+    no=document.getElementById('rb-no'),onYes=null,back=null;
+function closeAsk(){dlg.hidden=true;scrim.hidden=true;onYes=null;if(back&&back.focus)back.focus();back=null}
+window.rbAsk=function(m,cb,opts){opts=opts||{};var s=String(m||''),i=s.search(/[?.!](\\s|$)/);
+  var head=i>-1&&i<110?s.slice(0,i+1):s,rest=i>-1&&i<110?s.slice(i+1).trim():'';
+  document.getElementById('rb-dlg-t').textContent=head;document.getElementById('rb-dlg-msg').textContent=rest;
+  var danger=opts.danger!=null?opts.danger:/\\b(delete|deleted|remove|disconnect|clear|undo)\\b/i.test(s);
+  yes.textContent=opts.yes||(danger?(s.match(/\\b(Delete|Remove|Disconnect|Clear|Undo)\\b/i)||['Confirm'])[0].replace(/^./,function(c){return c.toUpperCase()}):'Confirm');
+  yes.className='btn'+(danger?' danger':'');onYes=cb;back=document.activeElement;dlg.hidden=false;scrim.hidden=false;yes.focus()};
+window.rbResubmit=function(f,sb){f._rbok=true;if(f.requestSubmit){try{f.requestSubmit(sb||undefined);return}catch(err){}}
+  if(sb&&sb.name){var h=document.createElement('input');h.type='hidden';h.name=sb.name;h.value=sb.value;f.appendChild(h)}f.submit()};
+yes.addEventListener('click',function(){var cb=onYes;closeAsk();if(cb)cb()});
+no.addEventListener('click',closeAsk);scrim.addEventListener('click',closeAsk);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(!dlg.hidden)closeAsk();closeDD()}});
+document.addEventListener('submit',function(e){var f=e.target,q=f.getAttribute&&f.getAttribute('data-confirm');
+  if(!q)return;if(f._rbok){f._rbok=false;return}
+  e.preventDefault();e.stopImmediatePropagation();var sb=e.submitter;rbAsk(q,function(){rbResubmit(f,sb)})},true);
+// Side panels: a button with data-drawer="x" opens #dr-x; data-close, the shade or Escape closes it.
+var dscrim=document.createElement('div');dscrim.className='scrim';dscrim.hidden=true;document.body.appendChild(dscrim);
+function drawers(){return [].slice.call(document.querySelectorAll('.drawer'))}
+function closeDrawers(){drawers().forEach(function(d){d.hidden=true});dscrim.hidden=true}
+window.rbOpenDrawer=function(n){var d=document.getElementById('dr-'+n);if(!d)return;closeDrawers();d.hidden=false;dscrim.hidden=false;
+  var f=d.querySelector('input:not([type=hidden]),select,button');if(f&&f.focus)f.focus()};
+document.addEventListener('click',function(e){var o=e.target.closest&&e.target.closest('[data-drawer]');if(o){e.preventDefault();rbOpenDrawer(o.getAttribute('data-drawer'));return}
+  if(e.target.closest&&e.target.closest('[data-close]')){e.preventDefault();closeDrawers()}});
+dscrim.addEventListener('click',closeDrawers);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&dlg.hidden)closeDrawers()});
+drawers().forEach(function(d){if(!d.hidden)dscrim.hidden=false});
+// The result of the last action: a message in the corner that fades (problems stay until closed).
+var fl=document.getElementById('flash');
+if(fl){var bad=/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
+  var x=document.createElement('button');x.type='button';x.className='x';x.setAttribute('aria-label','Close');x.textContent='\\u00d7';
+  x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad)setTimeout(function(){fl.hidden=true},6000)}
+})();</script>
+"""
+
 
 # Reusable show/hide-password eye icon: EYE_ICON = "click to reveal" state, EYE_OFF_ICON = "click to hide" state.
 EYE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>'
@@ -1736,56 +2043,112 @@ PW_TOGGLE_JS = ("function togglePw(btn,id){var i=document.getElementById(id);if(
                  "btn.setAttribute('aria-label',showing?'Show password':'Hide password');"
                  "btn.innerHTML=showing?" + repr(EYE_ICON) + ":" + repr(EYE_OFF_ICON) + ";}")
 
-LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · Reconciliation Tool</title>
+LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign in · ReconBook</title>
+<link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link rel=stylesheet href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@600&display=swap">
 <style>
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;color:#16202e;
-  background:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px) 0 0/30px 30px,linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px) 0 0/30px 30px,radial-gradient(900px 480px at 72% 8%,rgba(16,185,129,.18),transparent 58%),linear-gradient(155deg,#16323a 0%,#111d29 52%,#0f3a36 100%)}
-.card{background:#fff;border-radius:18px;width:100%;max-width:372px;padding:38px 34px;position:relative;overflow:hidden;
-  box-shadow:0 24px 60px rgba(8,15,30,.40),0 2px 10px rgba(8,15,30,.22)}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,#0f766e,#10b981)}
-.emblem{width:46px;height:46px;border-radius:12px;background:#ecfdf5;color:#0f766e;display:flex;align-items:center;justify-content:center;margin-bottom:16px}.emblem svg{width:25px;height:25px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:680;font-size:19px;letter-spacing:-.01em}
-.brand .dot{width:11px;height:11px;border-radius:50%;background:#0f766e;box-shadow:0 0 0 4px #d6efea}
-.tag{color:#667085;font-size:14px;margin:10px 0 26px;line-height:1.5}
-label{display:block;font-size:12px;font-weight:600;color:#475467;margin-bottom:7px;text-transform:uppercase;letter-spacing:.05em}
-input{width:100%;padding:12px 13px;border:1px solid #d8dee6;border-radius:10px;font-size:15px;outline:none;transition:border-color .15s,box-shadow .15s}
-input:focus{border-color:#0f766e;box-shadow:0 0 0 3px #d6efea}
+html{color-scheme:light}
+body{font-family:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;color:#18202f;font-size:14px;
+  background:radial-gradient(700px 380px at 80% 10%,rgba(200,162,58,.16),transparent 70%),radial-gradient(600px 420px at 10% 100%,rgba(76,195,138,.07),transparent 70%),#13213b}
+.card{background:#fff;border-radius:12px;width:100%;max-width:380px;padding:30px 28px 24px;box-shadow:0 30px 70px rgba(0,0,0,.35)}
+.brand{display:flex;align-items:center;gap:10px}
+.brand svg{width:32px;height:32px;color:#c8a23a;flex:none}
+.brand b{font:600 23px/1 'IBM Plex Serif',Georgia,serif;color:#13213b}
+.co{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:#8a93a3;margin:6px 0 22px}
+label{display:block;font-size:12px;font-weight:600;color:#5d6779;margin:0 0 5px}
+input{width:100%;padding:9px 11px;border:1px solid #d9dde5;border-radius:7px;font-size:14px;outline:none;font-family:inherit}
+input:focus{border-color:#13213b;box-shadow:0 0 0 3px rgba(200,162,58,.25)}
+.f+.f{margin-top:14px}
 .pw-wrap{position:relative}
 .pw-wrap input{padding-right:42px}
-.pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:#98a2b3;display:flex}
-.pw-toggle:hover{color:#475467}
-.pw-toggle:focus-visible{outline:2px solid #0f766e;outline-offset:1px}
-button{width:100%;margin-top:18px;padding:12px;background:#16202e;color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:15px;font-weight:600;transition:opacity .15s}
-button:hover{opacity:.92}
-.err{color:#b42318;font-size:13px;margin-top:13px;background:#fbe2de;padding:9px 12px;border-radius:8px}
-.foot{text-align:center;color:#98a2b3;font-size:12px;margin-top:24px}
+.pw-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:#8a93a3;display:flex}
+.pw-toggle:hover{color:#18202f}
+.pw-toggle:focus-visible{outline:2px solid #c8a23a;outline-offset:1px}
+button.go{width:100%;margin-top:18px;padding:10px;background:#13213b;color:#fff;border:none;border-radius:7px;cursor:pointer;font-size:14px;font-weight:600;font-family:inherit}
+button.go:hover{background:#1c2e4f}
+.err{color:#b42318;font-size:13px;margin-top:12px;background:#fbe4e1;padding:8px 11px;border-radius:7px}
+details{margin-top:14px}summary{cursor:pointer;color:#5d6779;font-size:12.5px}
+details div{color:#8a93a3;font-size:12.5px;margin-top:6px;line-height:1.55}
+.foot{text-align:center;color:#8d99b1;font-size:12px;margin-top:18px}.foot a{color:#cfd7e6}
 </style></head><body>
 <div class=card>
-<div class=emblem><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></div>
-<div class=brand><span class=dot></span>Reconciliation Tool</div>
-<p class=tag>Match your books to your bank statements, with confidence.</p>
+<div class=brand>""" + SCALE_ICON + """<b>ReconBook</b></div>
+<div class=co>{{ company or 'Bank reconciliation for QuickBooks' }}</div>
 <form method=post>
-<label for=un>Username</label>
-<input id=un type=text name=username placeholder="Your username" autocapitalize=off autofocus>
-<label for=pw style="display:block;margin-top:16px">Password</label>
-<div class=pw-wrap>
-<input id=pw type=password name=password placeholder="Enter your password">
-<button type=button class=pw-toggle onclick="togglePw(this,'pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button>
-</div>
-<button type=submit>Sign in</button>
-{% if error %}<div class=err>{{ error }}</div>{% endif %}
+<div class=f><label for=un>Username</label><input id=un type=text name=username placeholder="Your username" autocapitalize=off autocomplete=username autofocus></div>
+<div class=f><label for=pw>Password</label><div class=pw-wrap><input id=pw type=password name=password placeholder="Your password" autocomplete=current-password>
+<button type=button class=pw-toggle onclick="togglePw(this,'pw')" aria-label="Show password" aria-pressed="false" title="Show or hide the password">""" + EYE_ICON + """</button></div></div>
+<button type=submit class=go>Sign in</button>
+{% if error %}<div class=err role=alert>{{ error }}</div>{% endif %}
 </form>
-<details style="margin-top:14px"><summary style="cursor:pointer;color:#667085;font-size:13px">Forgot password?</summary><div style="color:#98a2b3;font-size:12.5px;margin-top:8px;line-height:1.55">The password originally set up for this app still works as a recovery key. Sign in with that, then change your password from the menu.</div></details>
-<div class=foot>Private · access by password<br><a href="{{ url_for('terms') }}" style="color:#98a2b3">Terms</a> · <a href="{{ url_for('privacy') }}" style="color:#98a2b3">Privacy</a> · <a href="mailto:{{ contact_email }}" style="color:#98a2b3">Contact</a></div>
+<details><summary>Forgot password?</summary><div>Ask an admin to set a new one under Users &amp; permissions. The password originally set up for this app also works as a recovery key.</div></details>
 </div>
+<div class=foot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <script>""" + PW_TOGGLE_JS + """</script>
 </body></html>"""
 
 
+ADMIN_PERMS = ("users", "settings")
+
+
+def can(perm):
+    """Whether the signed-in user may do `perm`. Admins may do everything."""
+    if session.get("is_admin"):
+        return True
+    perm = {"settings": "users"}.get(perm, perm)
+    perms = session.get("perms")
+    if perms is None:            # users from before permissions: everything but the admin pages
+        return perm not in ADMIN_PERMS
+    return perm in perms
+
+
+CRUMBS = {"dashboard": "<b>Dashboard</b>", "users": "Manage / <b>Users &amp; permissions</b>",
+          "settings": "Manage / <b>Settings</b>", "manage_accounts": "Settings / <b>Bank accounts shown</b>",
+          "reports": "Manage / <b>Reports</b>", "search": "<b>Search</b>", "change_password": "<b>Change password</b>"}
+
+
+def shell_data():
+    """What the sidebar and top bar show: the company, each bank account with a status dot and the
+    number of its bank lines still unmatched, the QuickBooks connection, and where you are."""
+    ep = request.endpoint or ""
+    name = (request.view_args or {}).get("name")
+    who = (session.get("name") or session.get("username") or "?").strip()
+    d = {"page": ep, "acct": name, "company": "", "accounts": [], "qbo": False, "synced": None,
+         "initials": "".join(w[0] for w in who.split()[:2]).upper() or "?",
+         "role": "Admin" if session.get("is_admin") else (session.get("title") or "User")}
+    if ep in ("detail", "history"):
+        d["crumb"] = (f'Bank accounts / <b>{escape(name)}</b>' if ep == "detail" else
+                      f'Bank accounts / <a href="{url_for("detail", name=name)}">{escape(name)}</a> / <b>History</b>')
+    else:
+        d["crumb"] = CRUMBS.get(ep, "")
+    try:
+        d["company"] = get_config("company_name") or ""
+        d["qbo"] = qbo_is_connected()
+        age = _sync_age_secs(get_config("last_sync_at"))
+        if age != float("inf"):
+            d["synced"] = _ago(age) if age < 5400 else last_sync_label()
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""SELECT a.name, s.statement_id IS NOT NULL, s.signed_off_at IS NOT NULL,
+                              (SELECT count(*) FROM statement_line sl WHERE sl.statement_id = s.statement_id AND sl.amount <> 0
+                                 AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                                                 WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
+                       FROM account a
+                       LEFT JOIN LATERAL (SELECT statement_id, signed_off_at FROM statement WHERE account_id = a.account_id
+                                          ORDER BY created_at DESC LIMIT 1) s ON true
+                       WHERE coalesce(a.is_active, true) ORDER BY a.type, a.name;""")
+        for nm, has, signed, n in cur.fetchall():
+            d["accounts"].append({"name": nm, "n": n if has and not signed else 0,
+                                  "state": "none" if not has else "ok" if signed or not n else "attn"})
+        cur.close(); conn.close()
+    except Exception:
+        pass   # the frame must never break the page
+    return d
+
+
 @app.context_processor
 def _inject_contact():
-    return {"contact_email": CONTACT_EMAIL, "sync_banner": sync_banner}
+    return {"contact_email": CONTACT_EMAIL, "sync_banner": sync_banner, "shell_data": shell_data, "can": can}
 
 
 @app.template_filter("acct")
@@ -1814,7 +2177,7 @@ LEGAL_STYLE = """<style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2937;background:#f7f8fa;margin:0;line-height:1.65;font-size:16px}
 .legal-nav{background:#fff;border-bottom:1px solid #e5e7eb;padding:16px 24px;font-weight:650;display:flex;align-items:center;gap:9px}
-.legal-nav .dot{width:9px;height:9px;border-radius:50%;background:#0f766e;box-shadow:0 0 0 3px #d6efea}
+.legal-nav .dot{width:9px;height:9px;border-radius:50%;background:#c8a23a;box-shadow:0 0 0 3px #f6eed6}
 .legal-wrap{max-width:760px;margin:0 auto;padding:40px 24px 80px}
 .legal-wrap h1{font-size:30px;letter-spacing:-.02em;margin:0 0 6px}
 .legal-wrap .updated{color:#6b7280;font-size:14px;margin-bottom:32px}
@@ -1826,13 +2189,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .legal-foot{color:#9ca3af;font-size:13px;margin-top:40px;border-top:1px solid #e5e7eb;padding-top:20px}
 </style>"""
 
-PRIVACY_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Privacy Policy · Reconciliation Tool</title>""" + LEGAL_STYLE + """</head><body>
-<div class=legal-nav><span class=dot></span>Reconciliation Tool</div>
+PRIVACY_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Privacy Policy · ReconBook</title>""" + LEGAL_STYLE + """</head><body>
+<div class=legal-nav><span class=dot></span>ReconBook</div>
 <div class=legal-wrap>
 <h1>Privacy Policy</h1>
 <div class=updated>Last updated: 20 July 2026</div>
 
-<p>This Privacy Policy explains how the Reconciliation Tool (“the app”, “we”) collects, uses, stores, and protects information when you use it to reconcile bank statements against your QuickBooks Online accounting records.</p>
+<p>This Privacy Policy explains how ReconBook (“the app”, “we”) collects, uses, stores, and protects information when you use it to reconcile bank statements against your QuickBooks Online accounting records.</p>
 
 <h2>Information we access and collect</h2>
 <ul>
@@ -1867,16 +2230,16 @@ PRIVACY_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=view
 <h2>Contact</h2>
 <p>For any questions about this Privacy Policy or your data, contact: <a href="mailto:__EMAIL__">__EMAIL__</a></p>
 
-<div class=legal-foot>Reconciliation Tool — a tool for reconciling bank statements with QuickBooks Online.</div>
+<div class=legal-foot>ReconBook — a tool for reconciling bank statements with QuickBooks Online.</div>
 </div></body></html>"""
 
-TERMS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Terms of Service · Reconciliation Tool</title>""" + LEGAL_STYLE + """</head><body>
-<div class=legal-nav><span class=dot></span>Reconciliation Tool</div>
+TERMS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Terms of Service · ReconBook</title>""" + LEGAL_STYLE + """</head><body>
+<div class=legal-nav><span class=dot></span>ReconBook</div>
 <div class=legal-wrap>
 <h1>Terms of Service</h1>
 <div class=updated>Last updated: 20 July 2026</div>
 
-<p>These Terms of Service govern your use of the Reconciliation Tool (“the app”). By using the app, you agree to these terms.</p>
+<p>These Terms of Service govern your use of ReconBook (“the app”). By using the app, you agree to these terms.</p>
 
 <h2>The service</h2>
 <p>The app helps you reconcile bank statement transactions against your accounting records in QuickBooks Online. It identifies matches and discrepancies and, at your direction, can record transactions back to your QuickBooks Online company.</p>
@@ -1909,7 +2272,7 @@ TERMS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <h2>Contact</h2>
 <p>For questions about these terms, contact: <a href="mailto:__EMAIL__">__EMAIL__</a></p>
 
-<div class=legal-foot>Reconciliation Tool — a tool for reconciling bank statements with QuickBooks Online.</div>
+<div class=legal-foot>ReconBook — a tool for reconciling bank statements with QuickBooks Online.</div>
 </div></body></html>"""
 
 
@@ -1923,44 +2286,76 @@ def terms():
     return render_template_string(TERMS_PAGE.replace("__EMAIL__", CONTACT_EMAIL))
 
 
-USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Users · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<div class=wrap style="max-width:720px">
-<h1>Users</h1>
-<div class=sub>People who can sign in to this reconciliation tool.</div>
-{% if msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:10px 14px;border-radius:9px;font-size:14px;margin-bottom:16px">{{ msg }}</div>{% endif %}
-{% if error %}<div style="background:var(--bad-soft);color:var(--bad);padding:10px 14px;border-radius:9px;font-size:14px;margin-bottom:16px">{{ error }}</div>{% endif %}
-<table>
-<thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Added</th><th class=a></th></tr></thead>
-<tbody>
-{% for un, nm, adm, created in users %}<tr>
-<td><b>{{ un }}</b></td><td>{{ nm }}</td><td>{{ 'Admin' if adm else 'User' }}</td>
-<td>{{ created.strftime('%Y-%m-%d') if created else '' }}</td>
-<td class=a><a href="{{ url_for('users') }}?edit={{ un }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-right:6px">Edit</a><form method=post style="display:inline;margin:0" onsubmit="return confirm('Remove user {{ un }}?');"><input type=hidden name=action value=delete><input type=hidden name=username value="{{ un }}"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Remove</button></form></td>
-</tr>{% endfor %}
-{% if not users %}<tr><td colspan=5 class=muted>No named users yet. Add one below.</td></tr>{% endif %}
-</tbody></table>
-<h2>{% if edit_user %}Edit user{% else %}Add a user{% endif %}</h2>
-<form method=post style="max-width:420px">
-<input type=hidden name=action value=save>
-<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.04em">Username</label>
-<input name=username autocapitalize=off {% if edit_user %}value="{{ edit_user.username }}" readonly{% endif %} style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px{% if edit_user %};background:#f3f4f6;color:var(--muted){% endif %}">
-<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Display name</label>
-<input name=name value="{{ edit_user.name if edit_user else '' }}" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
-<label style="display:block;font-size:12px;font-weight:600;color:#475467;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em">Password</label>
-<input id=pwfield name=password type=password placeholder="{% if edit_user %}Leave blank to keep current{% else %}At least 6 characters{% endif %}" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:15px">
-<label style="display:flex;align-items:center;gap:6px;margin:8px 0 0;font-size:13px;color:var(--muted)"><input type=checkbox onclick="document.getElementById('pwfield').type=this.checked?'text':'password'"> Show password</label>
-<label style="display:flex;align-items:center;gap:8px;margin:16px 0;font-size:14px;color:var(--ink)"><input type=checkbox name=is_admin {% if edit_user and edit_user.is_admin %}checked{% endif %}> Administrator (can manage users)</label>
-<button type=submit class=btn>{% if edit_user %}Update user{% else %}Create user{% endif %}</button>
-{% if edit_user %}<a href="{{ url_for('users') }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-left:8px">Cancel</a>{% endif %}
-</form>
-<div class=sub style="margin-top:18px;font-size:13px;line-height:1.5">Sign-offs are recorded under each user's display name. The recovery password from your server settings always works as an admin — so you can't be locked out.</div>
-</div></body></html>"""
+USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Users · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<div class=ph><div><h1>Users &amp; permissions</h1><div class=meta>{{ users|length }} user{{ '' if users|length == 1 else 's' }} · tick what each person may do</div></div>
+<div class=acts><button type=button class=btn data-drawer=adduser>Add user</button></div></div>
+{% if msg %}<div id=flash role=status>{{ msg }}</div>{% elif error %}<div id=flash role=alert>{{ error }}</div>{% endif %}
+<div class=panel style="margin-bottom:14px"><div class=tw><table class=perm>
+<thead><tr><th>User</th><th class=p>View &amp; reports</th>{% for k, lab in perms %}<th class=p>{{ lab }}</th>{% endfor %}<th></th></tr></thead><tbody>
+{% for u in users %}<tr{% if not u.active %} class=off{% endif %}>
+<td><div class=who><span class="av{{ ' gold' if u.admin else '' }}">{{ u.initials }}</span><div><b>{{ u.name }}</b><span class=sub2>{{ u.username }}{% if u.title %} · {{ u.title }}{% endif %}{% if not u.active %} · <span class=bad>switched off</span>{% elif u.expires %} · access until {{ u.expires.strftime('%d %b %Y') }}{% endif %}{% if u.seen %} · seen {{ u.seen }}{% endif %}</span></div></div></td>
+<td class=p><span class="tick lock" title="Everyone can view and print reports">&#10003;</span></td>
+{% for k, lab in perms %}<td class=p>{% if u.admin %}<span class="tick lock gold" title="Admins may do everything">&#10003;</span>{% else %}<form method=post class=tf><input type=hidden name=action value=perm><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=perm value="{{ k }}"><input type=hidden name=on value="{{ '0' if k in u.perms else '1' }}"><button type=submit class="tick{{ ' on' if k in u.perms else '' }}" aria-label="{{ lab }} for {{ u.name }}" aria-pressed="{{ 'true' if k in u.perms else 'false' }}" data-busy="Saving...">{% if k in u.perms %}&#10003;{% endif %}</button></form>{% endif %}</td>{% endfor %}
+<td class=a>{% if u.admin %}<span class="pill gold">Admin</span> {% endif %}<span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ u.name }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+<a href="{{ url_for('users') }}?edit={{ u.username }}">Edit details or password</a>
+{% if u.username != session.username %}<form method=post><input type=hidden name=action value=admin><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=on value="{{ '0' if u.admin else '1' }}"><button type=submit>{{ 'Remove admin' if u.admin else 'Make admin' }}</button></form>
+<form method=post><input type=hidden name=action value=active><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=on value="{{ '0' if u.active else '1' }}"><button type=submit>{{ 'Switch off sign-in' if u.active else 'Switch sign-in back on' }}</button></form>
+<div class=sep></div><form method=post data-confirm="Remove user {{ u.username }}? Their past sign-offs keep their name."><input type=hidden name=action value=delete><input type=hidden name=username value="{{ u.username }}"><button type=submit class=danger>Remove user</button></form>{% endif %}
+</div></span></td></tr>
+{% else %}<tr><td colspan=9 class=muted>No named users yet. Add one with the button above.</td></tr>{% endfor %}
+</tbody></table></div>
+<div class=rule><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.5c0 4.3 2.9 7.7 7 9 4.1-1.3 7-4.7 7-9V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></svg>
+<div>{% if two_person %}<b>Sign-off needs a second person.</b> The person who prepared a reconciliation can't sign it off, unless they're an admin. {% endif %}Every sign-off records who prepared and who approved it, and both names print on the report. The recovery password from your server settings always works as an admin, so you can't be locked out.</div></div>
+</div>
+<div class=panel><div class=panel-h><h2>Recent activity</h2><span class="r faint">Last {{ activity|length }}</span></div>
+<table><tbody>{% for a in activity %}<tr><td class="faint num" style="width:120px">{{ a.at }}</td><td style="white-space:normal"><b>{{ a.name or a.username or 'Someone' }}</b> {{ a.action }}{% if a.account %} · <a href="{{ url_for('detail', name=a.account) }}">{{ a.account }}</a>{% endif %}</td></tr>
+{% else %}<tr><td class=muted>Nothing yet. Uploads, recordings, undos and sign-offs appear here.</td></tr>{% endfor %}</tbody></table></div>
+
+<aside class=drawer id=dr-adduser {% if not open_add %}hidden{% endif %} aria-label="Add a user"><form method=post style="display:contents">
+<div class=drawer-h><h2>Add a user</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b><input type=hidden name=action value=save><input type=hidden name=new value=1>
+<div class=two><div class=fld><label for=au-name>Full name</label><input id=au-name name=name placeholder="e.g. Grace Nabirye" required></div>
+<div class=fld><label for=au-un>Username</label><input id=au-un name=username autocapitalize=off placeholder="grace.nabirye" required></div></div>
+<div class=fld><label for=au-title>Job title</label><input id=au-title name=title placeholder="e.g. Accounts assistant"></div>
+<div class=fld><label for=au-pw>Password</label><div class=pw-wrap><input id=au-pw name=password type=password placeholder="At least 6 characters" style="width:100%"><button type=button class=pw-toggle onclick="togglePw(this,'au-pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div><small>Share it with them privately; they can change it after signing in.</small></div>
+<div class=fld><label for=au-preset>Start from</label><select id=au-preset name=preset>{% for k, p in presets %}<option value="{{ k }}">{{ p[0] }}{% if p[1] %} ({{ p[1]|join(', ') }}){% else %} (view and reports){% endif %}</option>{% endfor %}</select><small>A starting set of ticks; change any of them afterwards.</small></div>
+<div class=fld><label for=au-exp>Access until</label><input id=au-exp name=expires type=date><small>Leave empty for no end date. Useful for auditors.</small></div>
+</div>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Add user</button></div></form></aside>
+{% if edit_user %}<aside class=drawer id=dr-edituser aria-label="Edit user"><form method=post style="display:contents">
+<div class=drawer-h><h2>{{ edit_user.name }}</h2><a href="{{ url_for('users') }}" class=icon-btn style="margin-left:auto" aria-label="Close">&times;</a></div>
+<div class=drawer-b><input type=hidden name=action value=save><input type=hidden name=username value="{{ edit_user.username }}">
+<div class=fld><label>Username</label><input value="{{ edit_user.username }}" readonly style="background:var(--bg);color:var(--muted)"></div>
+<div class=fld><label for=eu-name>Full name</label><input id=eu-name name=name value="{{ edit_user.name }}"></div>
+<div class=fld><label for=eu-title>Job title</label><input id=eu-title name=title value="{{ edit_user.title or '' }}"></div>
+<div class=fld><label for=eu-pw>New password</label><div class=pw-wrap><input id=eu-pw name=password type=password placeholder="Leave empty to keep the current one" style="width:100%"><button type=button class=pw-toggle onclick="togglePw(this,'eu-pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div></div>
+<div class=fld><label for=eu-exp>Access until</label><input id=eu-exp name=expires type=date value="{{ edit_user.expires or '' }}"></div>
+</div>
+<div class=drawer-f><a href="{{ url_for('users') }}" class=btn-sm>Cancel</a><button type=submit class=btn>Save</button></div></form></aside>{% endif %}
+<style>
+.tw{overflow-x:auto}
+.perm th.p{text-align:center;white-space:normal;min-width:82px;line-height:1.25;vertical-align:bottom}
+.perm td.p{text-align:center}.perm tr.off td{opacity:.55}
+.tf{margin:0;display:inline}
+.tick{width:18px;height:18px;border-radius:4px;border:1.5px solid #c3c9d4;display:inline-grid;place-items:center;cursor:pointer;background:var(--panel);color:#fff;padding:0;font-size:11px;line-height:1;font-weight:700}
+.tick.on{background:var(--navy);border-color:var(--navy)}
+.tick.lock{background:var(--line-soft);border-color:var(--line);color:var(--muted);cursor:default}
+.tick.lock.gold{background:var(--gold);border-color:var(--gold);color:var(--navy)}
+.who{display:flex;gap:9px;align-items:center}
+.who .av{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:11px;background:var(--accent-soft);color:var(--accent);flex:none}
+.who .av.gold{background:var(--gold-soft);color:#7a5d0e}
+.sub2{display:block;color:var(--faint);font-size:11.5px;white-space:normal}
+.rule{display:flex;gap:10px;padding:10px 14px;border-top:1px solid var(--line-soft);color:var(--muted);font-size:12.5px;align-items:flex-start}
+.rule svg{flex:none;color:var(--gold);margin-top:1px}.rule b{color:var(--ink)}
+.drawer-f{margin-top:auto;padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+</style>
+<script>""" + PW_TOGGLE_JS + """</script>
+</div>""" + SHELL_END + """</body></html>"""
 
 
-ACCOUNTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Accounts · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<div class=wrap><h1>Accounts</h1>
+ACCOUNTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Accounts · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap><h1>Accounts</h1>
 <div class=sub>QuickBooks has {{ rows|length }} bank and credit-card accounts. Tick only the ones you actually reconcile — the rest stay synced but stop loading on the dashboard.</div>
 {% if msg %}<div style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ msg }}</div>{% endif %}
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 18px;line-height:1.5">Hiding an account never deletes anything. Its transactions and reconciliation history stay in the database — tick it again any time to bring it back.</div>
@@ -1978,7 +2373,198 @@ ACCOUNTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 </table>
 <div style="margin-top:18px"><button type=submit class=btn-go>Save</button>
 <a href="{{ url_for('dashboard') }}" class=btn-sm style="text-decoration:none;display:inline-block;margin-left:8px">Cancel</a></div>
-</form></div></body></html>"""
+</form></div>""" + SHELL_END + """</body></html>"""
+
+
+SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Settings · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<div class=ph><div><h1>Settings</h1><div class=meta>QuickBooks connection, matching rules, sign-off and backups</div></div></div>
+{% if msg %}<div id=flash role=status>{{ msg }}</div>{% endif %}
+{{ sync_banner() }}
+<div class=setgrid>
+<div class=panel>
+<div class=panel-h><h2>QuickBooks Online</h2><span class=r>{% if qbo_connected %}<span class="pill ok">Connected</span>{% else %}<span class="pill bad">Not connected</span>{% endif %}</span></div>
+<dl class=kv>
+<dt>Company</dt><dd>{{ company or '—' }}</dd>
+<dt>Home currency</dt><dd>{{ home or '—' }}</dd>
+<dt>Last sync</dt><dd>{{ last_sync or 'Not synced yet' }}</dd>
+<dt>Bank accounts shown</dt><dd>{{ n_active }} of {{ n_accts }} · <a href="{{ url_for('manage_accounts') }}" class=lnk>choose</a></dd>
+</dl>
+<div class=ptools>
+{% if qbo_connected %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=to value=settings><button type=submit class="btn-sm pri">Sync now</button></form>
+<form method=post action="{{ url_for('sync') }}" data-confirm="Full resync? It re-reads every transaction in the window, ignoring the last-sync marker. Slower, but use it if you think something was missed."><input type=hidden name=to value=settings><input type=hidden name=full value="1"><button type=submit class=btn-sm>Full resync</button></form>
+<form method=post action="{{ url_for('check_connection') }}"><input type=hidden name=to value=settings><button type=submit class=btn-sm>Check connection</button></form>
+<span style="flex:1"></span>
+<form method=post action="{{ url_for('disconnect') }}" data-confirm="Disconnect QuickBooks? Syncing and recording stop until someone connects again. Nothing in QuickBooks is changed."><input type=hidden name=to value=settings><button type=submit class="btn-sm danger">Disconnect</button></form>
+{% else %}<a href="{{ url_for('connect') }}" class=btn>Connect to QuickBooks</a>{% endif %}
+</div>
+<details class=adv><summary>Advanced: connect with a refresh token</summary>
+<form method=post action="{{ url_for('set_token') }}" class=advf><input type=hidden name=to value=settings>
+<div class=fld><label for=st-rt>Refresh token</label><input id=st-rt name=refresh_token></div>
+<div class=fld><label for=st-realm>Realm / Company ID</label><input id=st-realm name=realm_id></div>
+<button type=submit class=btn-sm>Save token</button></form>
+<div class=hint style="margin-top:6px">For support use: a refresh token from the Intuit OAuth Playground connects the app without the redirect URI.</div></details>
+</div>
+
+<form method=post class=panel action="{{ url_for('settings') }}"><input type=hidden name=action value=rules>
+<div class=panel-h><h2>Matching rules</h2><span class=r><button type=submit class="btn-sm pri">Save rules</button></span></div>
+<label class=opt><span><b>Bank charges match on the exact date</b><small>Excise duty, ledger fees, commissions</small></span><input type=checkbox name=charges_exact value=1 {% if rules.charges_exact %}checked{% endif %}></label>
+<label class=opt><span><b>Days a bank line and its entry may differ</b><small>Still counted as an exact match</small></span><input class=n name=date_days value="{{ rules.date_days }}" inputmode=numeric></label>
+<label class=opt><span><b>Days a payment may clear late</b><small>Cheques and transfers booked before they reach the bank</small></span><input class=n name=clear_days value="{{ rules.clear_days }}" inputmode=numeric></label>
+<label class=opt><span><b>Days apart for transfer suggestions</b><small>Same amount, opposite direction, another account</small></span><input class=n name=transfer_days value="{{ rules.transfer_days }}" inputmode=numeric></label>
+<div class=hint style="padding:8px 14px">Open reconciliations are re-matched with the new rules the next time they're opened or refreshed.</div>
+</form>
+
+<form method=post class=panel action="{{ url_for('settings') }}"><input type=hidden name=action value=signoff>
+<div class=panel-h><h2>Sign-off and month end</h2><span class=r><button type=submit class="btn-sm pri">Save</button></span></div>
+<label class=opt><span><b>Sign-off needs a second person</b><small>The person who prepared it can't sign it off, unless they're an admin</small></span><input type=checkbox name=two_person value=1 {% if rules.two_person %}checked{% endif %}></label>
+<label class=opt><span><b>Month-end close due on day</b><small>Of the following month, shown on the dashboard checklist</small></span><input class=n name=close_day value="{{ rules.close_day }}" inputmode=numeric></label>
+</form>
+
+<div class=panel>
+<div class=panel-h><h2>Backup</h2></div>
+<div style="padding:12px 14px" class=muted>A copy of every reconciliation, statement, match and user, as one file.</div>
+<div class=ptools><a href="{{ url_for('backup') }}" class=btn-sm>Download a backup now</a></div>
+</div>
+</div>
+<style>.setgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
+.kv{display:grid;grid-template-columns:150px minmax(0,1fr);gap:7px 14px;padding:12px 14px;margin:0}.kv dt{color:var(--muted)}.kv dd{margin:0;font-weight:500}
+.lnk{color:var(--accent);font-weight:600}
+.ptools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--line-soft)}.ptools form{margin:0}
+.opt{display:flex;gap:12px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line-soft);cursor:pointer}
+.opt span{flex:1;min-width:0}.opt small{display:block;color:var(--faint)}
+.opt input.n{width:60px;border:1px solid var(--line);border-radius:5px;padding:3px 6px;text-align:right;font-variant-numeric:tabular-nums}
+.opt input[type=checkbox]{width:16px;height:16px;accent-color:var(--navy)}
+details.adv{padding:8px 14px 12px;border-top:1px solid var(--line-soft)}details.adv summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+.advf{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:8px}.advf .fld{flex:1;min-width:160px}
+@media (max-width:1000px){.setgrid{grid-template-columns:minmax(0,1fr)}.kv{grid-template-columns:minmax(0,1fr)}}</style>
+</div>""" + SHELL_END + """</body></html>"""
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    if not can("settings"):
+        return "Admins only. <a href='/'>Back</a>", 403
+    msg = session.pop("sync_msg", None)
+    if request.method == "POST":
+        keys = {"rules": ("charges_exact", "date_days", "clear_days", "transfer_days"),
+                "signoff": ("two_person", "close_day")}.get(request.form.get("action"), ())
+        for k in keys:
+            default, lo, hi, _ = RULES[k]
+            if hi == 1 and lo == 0:      # a tick box
+                v = 1 if request.form.get(k) == "1" else 0
+            else:
+                try:
+                    v = min(hi, max(lo, int((request.form.get(k) or "").strip())))
+                except ValueError:
+                    v = rule(k)
+            set_config("rule_" + k, str(v))
+        if keys:
+            log_activity("changed the " + ("matching rules" if "date_days" in keys else "sign-off settings"))
+            session["sync_msg"] = "Settings saved."
+        return redirect(url_for("settings"))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT count(*), count(*) FILTER (WHERE coalesce(is_active,true)) FROM account;")
+    n_accts, n_active = cur.fetchone()
+    try:
+        home = qbo_home_currency(cur)
+    except Exception:
+        home = None
+    cur.close(); conn.close()
+    return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(),
+                                  company=get_config("company_name"), home=home, last_sync=last_sync_label(),
+                                  n_accts=n_accts, n_active=n_active, rules={k: rule(k) for k in RULES})
+
+
+REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reports · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<div class=ph><div><h1>Reports</h1><div class=meta>Every reconciliation, newest period first. Open one to print or save it as a PDF.</div></div>
+<div class=acts><form method=get class=btnrow><select name=status class=btn-sm onchange="this.form.submit()" aria-label="Show">
+<option value="">All reconciliations</option><option value=signed {% if status=='signed' %}selected{% endif %}>Signed off</option><option value=open {% if status=='open' %}selected{% endif %}>In progress</option></select></form></div></div>
+<div class=panel><table>
+<thead><tr><th>Period</th><th>Account</th><th>Currency</th><th>Status</th><th>Prepared by</th><th>Approved by</th><th></th></tr></thead><tbody>
+{% for r in rows %}<tr><td>{{ r.ps.strftime('%d %b') }} – {{ r.pe.strftime('%d %b %Y') }}</td><td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td><td>{{ r.ccy }}</td>
+<td>{% if r.signed %}<span class="pill ok">Signed off {{ r.signed.strftime('%d %b %Y') }}</span>{% else %}<span class="pill attn">In progress</span>{% endif %}</td>
+<td>{{ r.prep or '—' }}</td><td>{{ r.by or '—' }}</td>
+<td class=a><a class=btn-sm href="{{ url_for('report', name=r.name, s=r.id) }}" target=_blank rel=noopener>Open report</a> <a class=btn-sm href="{{ url_for('history', name=r.name) }}">History</a></td></tr>
+{% else %}<tr><td colspan=7 class=muted>No reconciliations yet. Upload a statement on a bank account to start.</td></tr>{% endfor %}
+</tbody></table></div>
+</div>""" + SHELL_END + """</body></html>"""
+
+
+@app.route("/reports")
+def reports():
+    status = request.args.get("status") or ""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT s.statement_id, a.name, a.currency, s.period_start, s.period_end, s.signed_off_at, s.signed_off_by,
+                          s.prepared_by
+                   FROM statement s JOIN account a ON a.account_id = s.account_id
+                   WHERE coalesce(a.is_active, true)
+                     AND (%s = '' OR (%s = 'signed') = (s.signed_off_at IS NOT NULL))
+                   ORDER BY s.period_end DESC, a.name LIMIT 500;""", (status, status))
+    rows = [{"id": str(i), "name": n, "ccy": (c or "").strip(), "ps": ps, "pe": pe, "signed": so, "by": by, "prep": pr}
+            for i, n, c, ps, pe, so, by, pr in cur.fetchall()]
+    cur.close(); conn.close()
+    return render_template_string(REPORTS_TEMPLATE, rows=rows, status=status)
+
+
+SEARCH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Search · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<div class=ph><div><h1>{% if q %}Results for “{{ q }}”{% else %}Search{% endif %}</h1><div class=meta>{% if amount is not none %}Amounts of {{ amount|money }} either way, and text containing “{{ q }}”{% elif q %}Bank lines and QuickBooks entries whose description or payee contains “{{ q }}”{% else %}Type an amount (e.g. 731,000), a payee or a reference in the box above.{% endif %}</div></div></div>
+<form method=get class=btnrow style="margin:0 0 14px"><input name=q value="{{ q }}" class=sbig placeholder="Amount, payee or reference" aria-label="Search" autofocus><button type=submit class=btn>Search</button></form>
+{% if q %}
+<div class=panel style="margin-bottom:14px"><div class=panel-h><h2>On bank statements</h2><span class=r class=faint>{{ lines|length }}{% if lines|length >= 100 %}+{% endif %}</span></div>
+<table><thead><tr><th>Date</th><th>Account</th><th>Bank description</th><th class=a>Amount</th><th>Status</th></tr></thead><tbody>
+{% for r in lines %}<tr><td>{{ r.d }}</td><td><a href="{{ url_for('detail', name=r.acct) }}"><b>{{ r.acct }}</b></a></td><td class=desc>{{ r.who }}</td><td class=a>{{ r.amt|money }}</td>
+<td>{% if r.matched %}<span class="pill ok">Matched</span>{% else %}<span class="pill attn">Not matched</span>{% endif %}</td></tr>
+{% else %}<tr><td colspan=5 class=muted>Nothing on any statement.</td></tr>{% endfor %}</tbody></table></div>
+<div class=panel><div class=panel-h><h2>In QuickBooks</h2><span class=r>{{ books|length }}{% if books|length >= 100 %}+{% endif %}</span></div>
+<table><thead><tr><th>Date</th><th>Account</th><th>Type</th><th>Description</th><th class=a>Amount</th><th>Status</th></tr></thead><tbody>
+{% for r in books %}<tr><td>{{ r.d }}</td><td><a href="{{ url_for('detail', name=r.acct) }}"><b>{{ r.acct }}</b></a></td><td>{{ r.typ }}{% if r.ref %} #{{ r.ref }}{% endif %}</td><td class=desc>{{ r.who }}</td><td class=a>{{ r.amt|money }}</td>
+<td>{% if r.matched %}<span class="pill ok">Matched</span>{% else %}<span class="pill none">Not on a statement</span>{% endif %}</td></tr>
+{% else %}<tr><td colspan=6 class=muted>Nothing in QuickBooks.</td></tr>{% endfor %}</tbody></table></div>
+{% endif %}
+<style>.sbig{width:min(420px,100%);padding:6px 10px;border:1px solid var(--line);border-radius:6px;font-size:13px}</style>
+</div>""" + SHELL_END + """</body></html>"""
+
+
+def _search_amount(q):
+    t = q.replace(",", "").replace(" ", "").lstrip("+-")
+    try:
+        return Decimal(t) if re.fullmatch(r"\d+(\.\d{1,2})?", t) else None
+    except Exception:
+        return None
+
+
+@app.route("/search")
+def search():
+    q = (request.args.get("q") or "").strip()[:80]
+    amount = _search_amount(q) if q else None
+    lines, books = [], []
+    if q:
+        like = "%" + q.replace("%", "").replace("_", "") + "%"
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""SELECT sl.posted_date, a.name, coalesce(sl.description, sl.counterparty, ''), sl.amount,
+                              EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                                      WHERE msl.line_id = sl.line_id AND m.status = 'confirmed')
+                       FROM statement_line sl JOIN statement s ON s.statement_id = sl.statement_id
+                       JOIN account a ON a.account_id = s.account_id
+                       WHERE (abs(sl.amount) = %s OR coalesce(sl.description,'') || ' ' || coalesce(sl.counterparty,'') ILIKE %s)
+                       ORDER BY sl.posted_date DESC LIMIT 100;""", (amount if amount is not None else -1, like))
+        lines = [{"d": d, "acct": n, "who": w, "amt": a, "matched": m} for d, n, w, a, m in cur.fetchall()]
+        cur.execute("""SELECT bt.posted_date, a.name, bt.source_txn_type, bt.reference,
+                              coalesce(bt.counterparty, bt.description, ''), bt.amount,
+                              EXISTS (SELECT 1 FROM match_book_txn mbt JOIN match m ON m.match_id = mbt.match_id
+                                      WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed')
+                       FROM book_txn bt JOIN account a ON a.account_id = bt.account_id
+                       WHERE NOT coalesce(bt.is_deleted, false) AND NOT coalesce(bt.is_void, false)
+                         AND (abs(bt.amount) = %s OR coalesce(bt.description,'') || ' ' || coalesce(bt.counterparty,'')
+                              || ' ' || coalesce(bt.reference,'') ILIKE %s)
+                       ORDER BY bt.posted_date DESC LIMIT 100;""", (amount if amount is not None else -1, like))
+        books = [{"d": d, "acct": n, "typ": t, "ref": r, "who": w, "amt": a, "matched": m}
+                 for d, n, t, r, w, a, m in cur.fetchall()]
+        cur.close(); conn.close()
+    return render_template_string(SEARCH_TEMPLATE, q=q, amount=amount, lines=lines, books=books)
 
 
 @app.route("/accounts", methods=["GET", "POST"])
@@ -2011,39 +2597,102 @@ def manage_accounts():
 
 @app.route("/users", methods=["GET", "POST"])
 def users():
-    if not session.get("is_admin"):
+    if not can("users"):
         return "Admins only. <a href='/'>Back</a>", 403
     error = msg = None
     edit_user = None
+    open_add = False
     if request.method == "POST":
         action = request.form.get("action")
+        un = (request.form.get("username") or "").strip().lower()
+        row = user_row(un) if un else None
+        conn = get_conn(); cur = conn.cursor(); _ensure_users(cur)
         if action == "save":
-            un = (request.form.get("username") or "").strip().lower()
             nm = (request.form.get("name") or "").strip()
             pw = request.form.get("password") or ""
-            adm = request.form.get("is_admin") == "on"
-            if not un:
-                error = "Username is required."
-            elif get_user(un):
-                update_user(un, nm, adm, pw or None)
-                msg = f"User '{un}' updated."
+            title = (request.form.get("title") or "").strip()[:60] or None
+            try:
+                exp = date.fromisoformat(request.form.get("expires")) if request.form.get("expires") else None
+            except ValueError:
+                exp = None
+            if not un or not re.fullmatch(r"[a-z0-9._@-]{2,60}", un):
+                error, open_add = "Choose a username of letters, numbers, dots or dashes.", True
+            elif request.form.get("new") and row:
+                error, open_add = f"There is already a user called {un}.", True
+            elif row:
+                update_user(un, nm or row[1], row[2], pw or None)
+                cur.execute("UPDATE app_users SET title=%s, expires=%s WHERE username=%s;", (title, exp, un))
+                msg = f"Saved {nm or un}."
+                log_activity(f"changed the details of {nm or un}")
             elif len(pw) < 6:
-                error = "New users need a password of at least 6 characters."
+                error, open_add = "New users need a password of at least 6 characters.", True
             else:
-                add_user(un, nm, pw, adm); msg = f"User '{un}' created."
+                preset = PERM_PRESETS.get(request.form.get("preset") or "", PERM_PRESETS["assistant"])
+                add_user(un, nm, pw, request.form.get("preset") == "admin")
+                cur.execute("UPDATE app_users SET perms=%s, title=%s, expires=%s, active=true WHERE username=%s;",
+                            (",".join(preset[1]), title or (preset[0] if request.form.get("preset") != "admin" else None), exp, un))
+                msg = f"Added {nm or un}. Share their username and password with them privately."
+                log_activity(f"added the user {nm or un} ({preset[0]})")
+        elif action == "perm" and row and not row[2]:
+            k = request.form.get("perm")
+            if k in dict(PERMS):
+                cur_p = set(p for p in row[3].split(",") if p) if row[3] is not None else {p for p, _ in PERMS if p != "users"}
+                (cur_p.add if request.form.get("on") == "1" else cur_p.discard)(k)
+                cur.execute("UPDATE app_users SET perms=%s WHERE username=%s;", (",".join(p for p, _ in PERMS if p in cur_p), un))
+                msg = f"Saved permissions for {row[1] or un}."
+                log_activity(f"{'allowed' if request.form.get('on') == '1' else 'removed'} ‘{dict(PERMS)[k].lower()}’ for {row[1] or un}")
+        elif action == "admin" and row and un != session.get("username"):
+            on = request.form.get("on") == "1"
+            cur.execute("UPDATE app_users SET is_admin=%s WHERE username=%s;", (on, un))
+            msg = f"{row[1] or un} is {'now' if on else 'no longer'} an admin."
+            log_activity(f"{'made' if on else 'removed'} {row[1] or un} {'an admin' if on else 'as admin'}")
+        elif action == "active" and row and un != session.get("username"):
+            on = request.form.get("on") == "1"
+            cur.execute("UPDATE app_users SET active=%s WHERE username=%s;", (on, un))
+            msg = f"{row[1] or un} can {'sign in again' if on else 'no longer sign in'}."
+            log_activity(f"switched {'on' if on else 'off'} the sign-in of {row[1] or un}")
         elif action == "delete":
-            un = (request.form.get("username") or "").strip().lower()
             if un == session.get("username"):
-                error = "You can't delete the account you're signed in with."
-            else:
-                delete_user(un); msg = f"User '{un}' removed."
+                error = "You can't remove the account you're signed in with."
+            elif row:
+                delete_user(un); msg = f"Removed {row[1] or un}."
+                log_activity(f"removed the user {row[1] or un}")
+        conn.commit(); cur.close(); conn.close()
+        if msg and not error:
+            session["sync_msg"] = msg
+            return redirect(url_for("users"))
     else:
+        msg = session.pop("sync_msg", None)
         eu = (request.args.get("edit") or "").strip().lower()
-        if eu:
-            row = get_user(eu)
-            if row:
-                edit_user = {"username": row[0], "name": row[1], "is_admin": row[3]}
-    return render_template_string(USERS_PAGE, users=list_users(), error=error, msg=msg, edit_user=edit_user)
+        row = user_row(eu) if eu else None
+        if row:
+            edit_user = {"username": row[0], "name": row[1] or row[0], "title": row[4], "expires": row[6]}
+    now = datetime.now(timezone.utc)
+    rows = []
+    for un, nm, adm, created, perms, title, active, expires, seen in list_users():
+        nm = nm or un
+        ago = None
+        if seen:
+            secs = (now - seen).total_seconds()
+            ago = "just now" if secs < 120 else f"{int(secs // 60)} min ago" if secs < 3600 else \
+                  f"{int(secs // 3600)} h ago" if secs < 86400 else seen.astimezone(EAT).strftime("%d %b")
+        rows.append({"username": un, "name": nm, "admin": bool(adm), "title": title, "active": active, "expires": expires,
+                     "seen": ago, "initials": "".join(w[0] for w in nm.split()[:2]).upper(),
+                     "perms": set(p for p in perms.split(",") if p) if perms is not None else {p for p, _ in PERMS if p != "users"}})
+    activity = []
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS activity_log (id serial PRIMARY KEY, at timestamptz NOT NULL DEFAULT now(),
+                       username text, name text, action text NOT NULL, account text);""")
+        cur.execute("SELECT at, username, name, action, account FROM activity_log ORDER BY at DESC LIMIT 40;")
+        activity = [{"at": a.astimezone(EAT).strftime("%d %b %H:%M"), "username": u, "name": n, "action": ac, "account": acc}
+                    for a, u, n, ac, acc in cur.fetchall()]
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+    return render_template_string(USERS_PAGE, users=rows, error=error, msg=msg, edit_user=edit_user, open_add=open_add,
+                                  perms=PERMS, presets=list(PERM_PRESETS.items()), activity=activity,
+                                  two_person=rule("two_person"))
 
 
 BACKUP_TABLES = ["account", "statement", "statement_line", "book_txn", "match",
@@ -2250,7 +2899,7 @@ def check_csrf():
     if good and hmac.compare_digest(sent, good):
         return
     if request.endpoint == "login":
-        return render_template_string(LOGIN_PAGE, error="That sign-in page had expired. Please try again."), 400
+        return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error="That sign-in page had expired. Please try again."), 400
     return (f"This form had expired or didn't come from this app, so nothing was changed. "
             f"<a href='{url_for('dashboard')}'>Reload the app</a> and try again."), 400
 
@@ -2261,10 +2910,51 @@ def require_login():
         return
     if not session.get("authed"):
         return redirect(url_for("login"))
+    un = session.get("username")
+    if un and un != "admin":
+        row = user_row(un)
+        if row is not None:
+            if not row[5] or (row[6] and row[6] < date.today()):
+                session.clear()
+                return redirect(url_for("login"))
+            _load_session_user(row)
+            if time.time() - session.get("seen_at", 0) > 60:
+                session["seen_at"] = time.time()
+                try:
+                    conn = get_conn(); cur = conn.cursor()
+                    cur.execute("UPDATE app_users SET last_seen=now() WHERE username=%s;", (un,))
+                    conn.commit(); cur.close(); conn.close()
+                except Exception:
+                    pass
+    need = PERM_BY_ENDPOINT.get(request.endpoint)
+    if need and not can(need):
+        what = dict(PERMS).get({"settings": "users"}.get(need, need), need).lower()
+        if request.method == "POST":
+            name = (request.view_args or {}).get("name")
+            session["detail_msg" if name else "sync_msg"] = f"Not done: your sign-in doesn't allow ‘{what}’. Ask an admin."
+            return redirect(url_for("detail", name=name) if name else url_for("dashboard"))
+        return render_template_string(DENIED_PAGE, what=what), 403
 
-CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('manage_accounts') }}">Accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<div class=wrap style="max-width:440px">
+
+# Which tick each action needs (anything not listed: any signed-in user).
+PERM_BY_ENDPOINT = {
+    "upload": "upload", "import_books": "upload", "balances": "upload",
+    "review_match": "review", "review_all": "review", "manual_match": "review", "unmatch": "review",
+    "transfer_dismiss": "review", "transfer_restore": "review",
+    "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
+    "transfer_change": "record", "record_reset": "record",
+    "transfer_undo": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
+    "signoff": "signoff", "reopen": "reopen",
+    "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
+    "set_token": "users", "disconnect": "users", "check_connection": "users", "connect": "users",
+    "schema_dump": "users", "qbo_info": "users"}
+
+DENIED_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Not allowed · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap><div class=ph><div><h1>Not allowed</h1><div class=meta>Your sign-in doesn't allow ‘{{ what }}’. An admin can change this under Users &amp; permissions.</div></div></div>
+<a class=btn href="{{ url_for('dashboard') }}">Back to the dashboard</a></div>""" + SHELL_END + """</body></html>"""
+
+CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Change password · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap style="max-width:440px">
 <h1>Change password</h1>
 <div class=sub>Set a new password for signing in.</div>
 <form method=post>
@@ -2282,7 +2972,7 @@ CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=vi
 </form>
 <div class=sub style="margin-top:22px;font-size:13px;line-height:1.55">Forgot your password? The password originally set up for this app always works as a recovery key — sign in with that, then change it here.</div>
 </div>
-<script>""" + PW_TOGGLE_JS + """</script>
+<script>""" + PW_TOGGLE_JS + """</script>""" + SHELL_END + """
 </body></html>"""
 
 
@@ -2321,17 +3011,23 @@ def login():
         password = request.form.get("password") or ""
         u = get_user(username) if username else None
         if u and u[2] and check_password_hash(u[2], password):
+            row = user_row(u[0])
+            if row and (not row[5] or (row[6] and row[6] < date.today())):
+                return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error="This sign-in has been switched off or has expired. Ask an admin.")
             session["csrf"] = secrets.token_urlsafe(32)
-            session["authed"] = True; session["username"] = u[0]
-            session["name"] = u[1] or u[0]; session["is_admin"] = bool(u[3])
+            session["authed"] = True
+            if row:
+                _load_session_user(row)
+            else:
+                session["username"] = u[0]; session["name"] = u[1] or u[0]; session["is_admin"] = bool(u[3])
             return redirect(url_for("dashboard"))
         if check_password(password):
             session["csrf"] = secrets.token_urlsafe(32)
             session["authed"] = True; session["username"] = "admin"
-            session["name"] = "Admin"; session["is_admin"] = True
+            session["name"] = "Admin"; session["is_admin"] = True; session["perms"] = None; session["title"] = ""
             return redirect(url_for("dashboard"))
-        return render_template_string(LOGIN_PAGE, error="Incorrect username or password")
-    return render_template_string(LOGIN_PAGE, error=None)
+        return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error="Incorrect username or password")
+    return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error=None)
 
 @app.route("/logout")
 def logout():
@@ -3013,9 +3709,10 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     cur.execute("DELETE FROM statement WHERE account_id=%s AND period_start=%s AND period_end=%s;",
                 (acct_uuid, p_start, p_end))
     cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end,
-                   opening_balance, closing_balance, opening_source, closing_source, currency, source_format)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
-                (ORG_ID, acct_uuid, p_start, p_end, opening or 0, closing or 0, o_src, c_src, currency, source_format))
+                   opening_balance, closing_balance, opening_source, closing_source, currency, source_format, prepared_by)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
+                (ORG_ID, acct_uuid, p_start, p_end, opening or 0, closing or 0, o_src, c_src, currency, source_format,
+                 session.get("name") if has_request_context() else None))
     sid = cur.fetchone()[0]
     seen = {}
     for r, key in zip(rows, _dedupe_keys(rows)):
@@ -3097,7 +3794,9 @@ def run_matcher(statement_id):
                           coalesce(description,'') || ' ' || coalesce(counterparty,'')
                    FROM statement_line WHERE statement_id=%s;""", (statement_id,))
     rows = cur.fetchall()
-    charges = {str(r[0]) for r in rows if is_bank_charge(r[4], r[2])}   # these pair on the exact date only
+    charges = ({str(r[0]) for r in rows if is_bank_charge(r[4], r[2])}   # these pair on the exact date only
+               if rule("charges_exact") else set())
+    date_days, clear_days = rule("date_days"), rule("clear_days")
     lines = [r[:4] for r in rows]
     txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
@@ -3119,7 +3818,7 @@ def run_matcher(statement_id):
     txns = [(str(a), b, c, d) for a, b, c, d in txns]
 
     def tol(l_id):
-        return 0 if l_id in charges else DATE_TOLERANCE_DAYS
+        return 0 if l_id in charges else date_days
 
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
@@ -3145,7 +3844,7 @@ def run_matcher(statement_id):
             if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
                 continue
             lag = (ld - td).days
-            if DATE_TOLERANCE_DAYS < lag <= CLEARING_WINDOW_DAYS and (best is None or lag < best[0]):
+            if date_days < lag <= clear_days and (best is None or lag < best[0]):
                 best = (lag, t_id)
         if best:
             add([l_id], [best[1]], "exact", 0.9, 0); used.add(best[1]); matched_lines.add(l_id)
@@ -3269,10 +3968,18 @@ def run_matcher(statement_id):
     return None
 
 
-def account_summary(cur, acct_uuid, name, atype, currency=None):
-    s = _latest_statement(cur, acct_uuid)
+def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
+    s = _latest_statement(cur, acct_uuid) if stmt is False else stmt
     if not s: return {"name": name, "type": atype, "status": "none", "currency": currency}
     sid, ps, pe, signed = s[:4]
+    cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
+                          count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
+                              SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                              WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
+                   FROM statement_line sl WHERE sl.statement_id = %s;""", (sid,))
+    n_lines, n_matched = cur.fetchone()
+    cur.execute("SELECT prepared_by, signed_off_by FROM statement WHERE statement_id=%s;", (sid,))
+    prep, by = cur.fetchone() or (None, None)
     cur.execute("SELECT match_type, count(*) FROM match WHERE statement_id=%s AND status='confirmed' GROUP BY match_type;", (sid,))
     mc = dict(cur.fetchall())
     rec = reconcile(cur, acct_uuid, s)
@@ -3280,119 +3987,70 @@ def account_summary(cur, acct_uuid, name, atype, currency=None):
     return {"name": name, "type": atype, "currency": currency, "status": "signed" if signed else "open",
             "p_start": ps, "p_end": pe, "exact": mc.get("exact", 0), "fuzzy": mc.get("fuzzy", 0),
             "m2o": mc.get("many_to_one", 0), "exc": exc, "rec_status": rec["status"],
-            "rec_diff": rec["rec_diff"], "missing": rec["missing"]}
+            "rec_diff": rec["rec_diff"], "missing": rec["missing"], "n_lines": n_lines, "n_matched": n_matched,
+            "n_unmatched": n_lines - n_matched, "n_pending": rec["n_pending"], "prep": prep, "by": by,
+            "signed_at": signed, "pct": int(n_matched * 100 / n_lines) if n_lines else 100}
 
 
-DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}{% if session.is_admin %}<a href="{{ url_for('manage_accounts') }}">Accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<div class=wrap>
-<h1>All accounts</h1>
-<div class=sub>Updated {{ now }} EAT{% if n_hidden %} · {{ n_hidden }} account{{ '' if n_hidden==1 else 's' }} hidden{% if session.is_admin %} · <a href="{{ url_for('manage_accounts') }}" style="color:var(--accent);font-weight:600">manage</a>{% endif %}{% endif %}</div>
-<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-{% if qbo_connected %}<span style="color:var(--ok);font-size:13px;font-weight:600">● Connected to QuickBooks</span>
-<form method=post action="{{ url_for('check_connection') }}" style="margin:0"><button type=submit class=btn-sm>Check connection</button></form>
-<form method=post action="{{ url_for('disconnect') }}" style="margin:0" onsubmit="return confirm('Disconnect from QuickBooks? You will need to reconnect before syncing again.');"><button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Disconnect</button></form>
-{% else %}<a href="{{ url_for('connect') }}" class=btn style="text-decoration:none;display:inline-block">Connect to QuickBooks</a>
-<span style="color:var(--muted);font-size:13px">Not connected</span>{% endif %}
-</div>
-<details style="margin-bottom:20px">
-<summary style="cursor:pointer;color:var(--muted);font-size:13px">Advanced: connect with a refresh token</summary>
-<form method=post action="{{ url_for('set_token') }}" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-<div><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Refresh token</label><input name=refresh_token style="width:340px;max-width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px"></div>
-<div><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Realm / Company ID</label><input name=realm_id style="width:190px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px"></div>
-<button type=submit class=btn-sm>Save token</button>
-</form>
-<div style="color:var(--muted);font-size:12px;margin-top:8px;line-height:1.5">Paste a refresh token from the Intuit OAuth Playground. This connects the app without needing the redirect URI registered.</div>
-</details>
-<form method=post action="{{ url_for('sync') }}" style="margin-bottom:24px" onsubmit="var b=this.querySelector('button');b.textContent='Syncing\u2026';b.disabled=true;">
-<button type=submit class=btn-sm>Sync from QuickBooks</button></form>
-<form method=post action="{{ url_for('sync') }}" style="display:inline" onsubmit="return confirm('Full resync re-downloads every transaction in the window, ignoring the last-sync marker. Slower, but use it if you think something was missed.');"><input type=hidden name=full value="1"><button type=submit class=btn-sm>Full resync</button></form>
-{% if sync_msg %}<div class=sub style="color:var(--ok);margin-top:-16px">{{ sync_msg }}</div>{% endif %}
+DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<div class=ph><div><h1>{{ month_label }} close</h1><div class=meta>{{ rows|length }} bank account{{ '' if rows|length == 1 else 's' }} · {{ n_signed }} signed off{% if n_hidden %} · {{ n_hidden }} hidden{% if can('settings') %} (<a href="{{ url_for('manage_accounts') }}" class=lnk>choose</a>){% endif %}{% endif %} · updated {{ now }}</div></div>
+{% if months|length > 1 %}<div class=acts><form method=get><select name=m class=btn-sm onchange="this.form.submit()" aria-label="Month">{% for v, lab in months %}<option value="{{ v }}" {% if v == month %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></form></div>{% endif %}</div>
+{% if sync_msg %}<div id=flash role=status>{{ sync_msg }}</div>{% endif %}
 {{ sync_banner() }}
-<div class=tiles>
-<button class="tile active" data-filter="all"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span><span class=t-label>Accounts</span></div><div class=t-val>{{ rows|length }}</div></button>
-<button class="tile" data-filter="reconciled"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.4 12 2.4 2.4L16 9"/></svg></span><span class=t-label>Reconciled</span></div><div class=t-val>{{ n_recon }}</div></button>
-<button class="tile" data-filter="signed"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5.5c0 4 3 6.5 7 7.5 4-1 7-3.5 7-7.5V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></svg></span><span class=t-label>Signed off</span></div><div class=t-val>{{ n_signed }}</div></button>
-<button class="tile" data-filter="exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Open exceptions</span></div><div class="t-val {{ 'warn' if tot_exc else '' }}">{{ tot_exc }}</div></button>
+{% if not qbo_connected %}<div class=recnote style="background:var(--accent-soft);color:#24406b;margin:0 0 14px">QuickBooks isn't connected, so books can't refresh.{% if can('settings') %} <a href="{{ url_for('settings') }}" class=lnk>Connect it in Settings</a>.{% endif %}</div>{% endif %}
+{% if totals %}<div class=ccys>{% for t in totals %}<div class="panel ccy"><div class=code>{{ t.ccy }}</div>
+<span class=k>Unreconciled</span><span class=k>Open items</span><span class=k>Not matched</span>
+<span class="v {{ 'bad' if t.diff else '' }}">{{ t.diff|money }}</span><span class=v>{{ t.exc }}</span><span class=v>{{ t.unmatched }}</span></div>{% endfor %}</div>{% endif %}
+<div class=dash2>
+<div class=panel><div class=panel-h><h2>Needs your attention</h2>{% if attention %}<span class="pill attn">{{ attention|length }}</span>{% endif %}</div>
+<ul class=attn>{% for a in attention %}<li><span class="sev {{ a.sev }}"></span><div><b>{{ a.name }}</b> {{ a.what }}{% if a.sub %}<span class=sub2>{{ a.sub }}</span>{% endif %}</div>
+<a class=btn-sm href="{{ url_for('detail', name=a.name) }}{{ a.hash }}" data-busy="Loading {{ a.name }}...">{{ a.btn }}</a></li>
+{% else %}<li class=calm><span class="sev ok"></span><div><b>All clear.</b> Every account for {{ month_label }} is reconciled and signed off.</div></li>{% endfor %}</ul></div>
+<div class=panel><div class=panel-h><h2>Month-end checklist</h2><span class="r faint">{{ n_signed }} of {{ rows|length }} done</span></div>
+<ul class=check>{% for r in rows %}<li><span class="bx {{ 'done' if r.status=='signed' else 'half' if r.status!='none' else '' }}">{% if r.status=='signed' %}&#10003;{% endif %}</span><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}...">{{ r.name }}</a>
+<span class=who>{% if r.status=='signed' %}Signed off{% if r.by %} by {{ r.by }}{% endif %}<br>{{ r.signed_at.astimezone(eat).strftime('%d %b') }}{% elif r.status=='none' %}Not started{% else %}Prepared {{ r.pct }}%{% if r.prep %}<br>by {{ r.prep }}{% endif %}{% endif %}</span></li>{% endfor %}</ul>
+<div class="due{{ ' late' if overdue else '' }}">{{ 'Overdue: was due' if overdue else 'Due' }} {{ due.strftime('%d %b %Y') }}<div class="bar{{ '' if n_signed == rows|length else ' attn' }}"><i style="width:{{ (n_signed * 100 / rows|length)|int if rows else 0 }}%"></i></div>{{ (n_signed * 100 / rows|length)|int if rows else 0 }}%</div></div>
 </div>
-<div class=fbar id=fbar></div>
-<table>
-<thead><tr><th>Account</th><th>Type</th><th>Currency</th><th>Status</th><th>Period</th><th>Matches</th><th>Exceptions</th><th class=a>Unreconciled</th></tr></thead>
-<tbody>
-{% for r in rows %}<tr data-status="{{ r.status }}" data-exc="{{ r.get('exc',0) }}">
+<div class=panel><div class=panel-h><h2>Bank accounts</h2>{% if can('settings') %}<span class=r><a class=btn-sm href="{{ url_for('manage_accounts') }}">Choose accounts</a></span>{% endif %}</div>
+<div class=tw><table>
+<thead><tr><th>Account</th><th>Currency</th><th>Statement period</th><th style="min-width:170px">Progress</th><th>Status</th><th class=a>Difference</th><th>Prepared / approved</th><th></th></tr></thead>
+<tbody>{% for r in rows %}<tr data-status="{{ r.status }}">
 <td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a></td>
-<td>{{ 'bank' if r.type=='bank' else 'credit card' }}</td>
 <td>{{ r.currency or '—' }}</td>
-<td>{% if r.status=='none' %}<span class="pill none">Not reconciled</span>{% elif r.status=='signed' %}<span class="pill signed">Signed off</span>{% elif r.rec_status=='balanced' %}<span class="pill open">Balanced</span>{% else %}<span class="pill open">In progress</span>{% endif %}</td>
-{% if r.status=='none' %}<td class=muted>—</td><td class=muted>—</td><td class=muted>—</td><td class="a muted">—</td>
-{% else %}<td>{{ r.p_start }} → {{ r.p_end }}</td>
-<td>{{ r.exact }} exact{% if r.fuzzy %}, {{ r.fuzzy }} fuzzy{% endif %}{% if r.m2o %}, {{ r.m2o }} batched{% endif %}</td>
-<td>{{ r.exc }}</td>
-<td class=a>{% if r.rec_status=='balanced' %}<span class=ok>0.00 · balanced</span>{% elif r.rec_status=='out' %}<span class=bad>{{ r.rec_diff|money }} · out</span>{% else %}<span class=muted>needs {{ r.missing }}</span>{% endif %}</td>
-{% endif %}</tr>{% endfor %}
-</tbody></table>
-<script>
-function flt(f){
-  document.querySelectorAll('.tile').forEach(function(t){t.classList.toggle('active', t.getAttribute('data-filter')===f)});
-  var total=document.querySelectorAll('tbody tr').length, shown=0;
-  document.querySelectorAll('tbody tr').forEach(function(tr){
-    var st=tr.getAttribute('data-status'), exc=parseInt(tr.getAttribute('data-exc')||'0',10), show=true;
-    if(f==='reconciled') show = st!=='none';
-    else if(f==='signed') show = st==='signed';
-    else if(f==='exceptions') show = exc>0;
-    tr.style.display = show ? '' : 'none'; if(show) shown++;
-  });
-  var bar=document.getElementById('fbar');
-  var labels={reconciled:'reconciled', signed:'signed off', exceptions:'with open exceptions'};
-  if(f==='all'){ bar.style.display='none'; }
-  else{
-    bar.style.display='block';
-    bar.textContent='Showing '+shown+' of '+total+' accounts '+labels[f]+'.\u00a0';
-    var a=document.createElement('a'); a.textContent='Show all'; a.onclick=function(){flt('all')};
-    bar.appendChild(a);
-  }
-}
-document.querySelectorAll('.tile').forEach(function(t){t.addEventListener('click',function(){flt(t.getAttribute('data-filter'))})});
-</script>
-</div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
-<div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
-<script>(function(){
-var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
-function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(ov)ov.classList.remove('on');},40000);}
-function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
-// "Confirm" -> "Confirming...", "Save balances" -> "Saving balances...": say what's being done.
-var VERB={Confirm:'Confirming',Reject:'Rejecting',Undo:'Undoing',Edit:'Opening',Record:'Recording',Save:'Saving',Get:'Getting',
-  Sign:'Signing',Match:'Matching',Import:'Importing',Clear:'Clearing',Delete:'Deleting',Set:'Setting',Update:'Updating',
-  Create:'Creating',Remove:'Removing',Check:'Checking',Disconnect:'Disconnecting',Refresh:'Refreshing',Discard:'Discarding'};
-function busy(label){var w=label.split(' '),v=VERB[w[0]];if(!v)return '';var rest=label.slice(w[0].length).trim();
-  return v+(rest?' '+rest.charAt(0).toLowerCase()+rest.slice(1):'')+'...';}
-document.addEventListener('click',function(e){
-var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
-var href=a.getAttribute('href')||'';if(!href)return;
-if(a.target==='_blank'||a.hasAttribute('download'))return;
-if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
-if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
-if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
-schedule(a.getAttribute('data-busy')||'Loading...');});
-document.addEventListener('submit',function(e){
-if(e.defaultPrevented)return;
-var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Please wait...';
-var sb=e.submitter,bt=sb&&(sb.getAttribute('data-busy')||busy((sb.textContent||sb.value||'').trim()));
-if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
-else if(act.indexOf('/match')>-1||act.indexOf('/unmatch')>-1)t='Matching...';
-if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
-else if(act.indexOf('/import_books')>-1)t='Importing your books...';
-else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
-else if(act.indexOf('/clear')>-1)t='Clearing account data...';
-else if(act.indexOf('/signoff')>-1)t='Signing off...';
-else if(act.indexOf('/reopen')>-1)t='Reopening...';
-else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
-else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
-if(bt&&act.indexOf('/upload')<0&&act.indexOf('/import_books')<0&&act.indexOf('/sync')<0)t=bt;
-schedule(t);});
-window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
-})();</script>
-</body></html>"""
+{% if r.status=='none' %}<td class=faint>{{ 'No ' ~ month_label ~ ' statement' }}</td><td></td><td><span class="pill none">Not started</span></td><td class="a faint">—</td><td class=faint>—</td>
+<td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}?upload=1" data-busy="Loading {{ r.name }}...">Upload</a></td>
+{% else %}<td>{{ r.p_start.strftime('%d %b') }} – {{ r.p_end.strftime('%d %b %Y') }}</td>
+<td><div class=prog><div class="bar{{ '' if r.pct == 100 else ' attn' }}"><i style="width:{{ r.pct }}%"></i></div><span class="faint num">{{ r.n_matched }}/{{ r.n_lines }}</span></div></td>
+<td>{% if r.status=='signed' %}<span class="pill ok">Signed off</span>{% elif r.rec_status=='balanced' %}<span class="pill info">Balanced</span>{% elif r.rec_status=='out' %}<span class="pill bad">Out of balance</span>{% else %}<span class="pill attn">In progress</span>{% endif %}</td>
+<td class=a>{% if r.rec_status=='balanced' %}0.00{% elif r.rec_status=='out' %}<span class=bad>{{ r.rec_diff|money }}</span>{% else %}<span class=faint>needs {{ r.missing }}</span>{% endif %}</td>
+<td class=muted>{{ r.prep or '—' }}{% if r.by %} / {{ r.by }}{% endif %}</td>
+<td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}...">{{ 'Open' if r.status=='signed' else 'Continue' }}</a></td>{% endif %}</tr>
+{% else %}<tr><td colspan=8 class=muted>No bank accounts yet.{% if can('settings') %} Connect QuickBooks in <a href="{{ url_for('settings') }}" class=lnk>Settings</a>; its bank and card accounts appear here.{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>
+<style>.lnk{color:var(--accent);font-weight:600}
+.ccys{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:0 0 12px}
+.ccy{padding:11px 14px;display:grid;grid-template-columns:auto repeat(3,minmax(0,1fr));gap:3px 18px;align-items:center}
+.ccy .code{font:600 21px/1 var(--f-num);color:var(--navy);grid-row:span 2;padding-right:12px;border-right:1px solid var(--line-soft)}
+.ccy .k{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.ccy .v{font:500 16px/1.2 var(--f-num);font-variant-numeric:tabular-nums}.ccy .v.bad{color:var(--bad)}
+.dash2{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:12px;align-items:start;margin:0 0 12px}
+ul.attn{list-style:none;margin:0;padding:0}
+ul.attn li{display:grid;grid-template-columns:4px minmax(0,1fr) auto;gap:12px;align-items:center;padding:8px 14px 8px 0;border-bottom:1px solid var(--line-soft)}
+ul.attn li:last-child{border-bottom:0}
+.sev{align-self:stretch;border-radius:0 3px 3px 0;min-height:30px}.sev.bad{background:var(--bad)}.sev.attn{background:#e08a3e}.sev.info{background:#7d9bc9}.sev.gold{background:var(--gold)}.sev.ok{background:#4cb07e}
+.sub2{display:block;color:var(--faint);font-size:11.5px}
+ul.check{list-style:none;margin:0;padding:6px 0}
+ul.check li{display:flex;gap:10px;align-items:center;padding:5px 14px}
+.bx{width:16px;height:16px;border-radius:4px;border:1.5px solid #c3c9d4;display:grid;place-items:center;flex:none;font-size:10px;color:#fff;font-weight:700}
+.bx.done{background:var(--ok);border-color:var(--ok)}.bx.half{border-color:#e08a3e;background:var(--warn-soft)}
+.check .who{margin-left:auto;font-size:11.5px;color:var(--faint);text-align:right;line-height:1.3}
+.due{display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid var(--line-soft);font-size:12px;color:var(--muted)}.due .bar{flex:1}
+.due.late{color:var(--bad);font-weight:600}
+.prog{display:flex;gap:8px;align-items:center}.prog .bar{flex:1}
+.tw{overflow-x:auto}
+@media (max-width:1000px){.dash2{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:600px){.ccy{grid-template-columns:repeat(3,minmax(0,1fr))}.ccy .code{grid-row:auto;grid-column:1/-1;border:0}}</style>
+</div>""" + SHELL_END + """</body></html>"""
 
 
 @app.route("/")
@@ -3400,22 +4058,74 @@ def dashboard():
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, name, type, currency FROM account WHERE coalesce(is_active,true) ORDER BY type, name;")
     accts = cur.fetchall()
-    rows = [account_summary(cur, a, n, t, ccy) for a, n, t, ccy in accts]
+    # The month being closed: the one asked for, else the latest statement period end.
+    cur.execute("""SELECT DISTINCT date_trunc('month', s.period_end)::date FROM statement s JOIN account a USING (account_id)
+                   WHERE coalesce(a.is_active,true) ORDER BY 1 DESC LIMIT 18;""")
+    months = [r[0] for r in cur.fetchall()]
+    try:
+        month = date.fromisoformat((request.args.get("m") or "") + "-01") if request.args.get("m") else None
+    except ValueError:
+        month = None
+    if month not in months:
+        month = months[0] if months else date.today().replace(day=1)
+    rows = []
+    for a, n, t, ccy in accts:
+        cur.execute(f"""SELECT {STMT_COLS} FROM statement WHERE account_id=%s AND date_trunc('month', period_end)::date=%s
+                        ORDER BY created_at DESC LIMIT 1;""", (a, month))
+        rows.append(account_summary(cur, a, n, t, (ccy or "").strip() or None, cur.fetchone()))
     cur.execute("SELECT count(*) FROM account WHERE NOT coalesce(is_active,true);")
     n_hidden = cur.fetchone()[0]
     cur.close(); conn.close()
-    n_recon = sum(1 for r in rows if r["status"] != "none")
+    label = month.strftime("%B %Y")
+    attention = []
+    for r in rows:
+        if r["status"] == "none":
+            attention.append({"sev": "info", "name": r["name"], "what": f"has no {label} statement yet", "hash": "?upload=1",
+                              "btn": "Upload", "rank": 4})
+            continue
+        if r["status"] == "signed":
+            continue
+        if r["rec_status"] == "out":
+            attention.append({"sev": "bad", "name": r["name"], "what": f"is out of balance by {r['currency'] or ''} {_money(r['rec_diff'])}",
+                              "sub": "Recording the lines not in QuickBooks usually closes the gap", "hash": "#sec-balance",
+                              "btn": "Continue", "rank": 0})
+        if r["n_pending"]:
+            attention.append({"sev": "attn", "name": r["name"], "what": f"has {r['n_pending']} suggested match"
+                              f"{'' if r['n_pending'] == 1 else 'es'} to review", "sub": "Sign-off waits for these",
+                              "hash": "#sec-review", "btn": "Review", "rank": 1})
+        if r["n_unmatched"]:
+            attention.append({"sev": "attn", "name": r["name"], "what": f"has {r['n_unmatched']} bank line"
+                              f"{'' if r['n_unmatched'] == 1 else 's'} not matched", "hash": "#sec-record",
+                              "btn": "Record", "rank": 2})
+        if r["rec_status"] == "incomplete":
+            attention.append({"sev": "attn", "name": r["name"], "what": f"needs its {r['missing']}", "hash": "#sec-balance",
+                              "btn": "Enter", "rank": 3})
+        if r["rec_status"] == "balanced" and not r["n_pending"]:
+            attention.append({"sev": "gold", "name": r["name"], "what": "is balanced and ready to sign off", "hash": "",
+                              "btn": "Sign off", "rank": 1})
+    attention.sort(key=lambda x: x["rank"])
+    totals = {}
+    for r in rows:
+        if r["status"] == "none" or r["status"] == "signed":
+            continue
+        t = totals.setdefault(r["currency"] or "—", {"ccy": r["currency"] or "—", "diff": Decimal(0), "exc": 0, "unmatched": 0})
+        if r["rec_status"] == "out" and r["rec_diff"]:
+            t["diff"] += abs(r["rec_diff"])
+        t["exc"] += r.get("exc", 0); t["unmatched"] += r.get("n_unmatched", 0)
+    nxt = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    due = nxt.replace(day=min(rule("close_day"), 28))
     n_signed = sum(1 for r in rows if r["status"] == "signed")
-    tot_exc = sum(r.get("exc", 0) for r in rows)
     sync_msg = session.pop("sync_msg", None)
-    qbo_connected = qbo_is_connected()
-    return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_connected, rows=rows, n_recon=n_recon, n_signed=n_signed, n_hidden=n_hidden,
-                                  tot_exc=tot_exc, sync_msg=sync_msg, now=datetime.now(EAT).strftime("%Y-%m-%d %H:%M"))
+    return render_template_string(DASH_TEMPLATE, qbo_connected=qbo_is_connected(), rows=rows, n_signed=n_signed,
+                                  n_hidden=n_hidden, attention=attention, totals=sorted(totals.values(), key=lambda t: t["ccy"]),
+                                  month=month.strftime("%Y-%m"), month_label=label, due=due, eat=EAT,
+                                  overdue=date.today() > due and n_signed < len(rows),
+                                  months=[(m.strftime("%Y-%m"), m.strftime("%B %Y")) for m in months],
+                                  sync_msg=sync_msg, now=datetime.now(EAT).strftime("%d %b, %H:%M"))
 
 
-DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('dashboard') }}">← All accounts</a>{% if session.is_admin %}<a href="{{ url_for('manage_accounts') }}">Accounts</a><a href="{{ url_for('users') }}">Users</a><a href="{{ url_for('backup') }}">Backup</a>{% endif %}<a href="{{ url_for('change_password') }}">Change password</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<style>
+DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<style>
 .secnav{position:sticky;top:var(--navh,53px);z-index:4;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:8px max(24px,calc(50% - 476px));background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
 .secnav[hidden]{display:none}
 .secnav::-webkit-scrollbar{display:none}
@@ -3425,84 +4135,88 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 .secnav a.on{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:600}
 .secnav a.attn::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--warn);margin:0 6px 1px 0;vertical-align:middle}
 @media (max-width:760px){.secnav{padding:7px 15px}}
-@media (min-width:1260px){
-  /* The menu has its own column beside the content: it scrolls with the page sideways and can't sit over it. */
-  .pagecols{display:grid;grid-template-columns:132px minmax(0,1000px);column-gap:16px;justify-content:center;align-items:start}
-  .pagecols>.wrap{margin:0;max-width:none;min-width:0}
-  .secnav{position:sticky;top:calc(var(--navh,53px) + 30px);margin-top:34px;align-self:start;width:auto;max-height:calc(100vh - var(--navh,53px) - 60px);overflow:auto;flex-direction:column;gap:2px;padding:0 0 0 10px;background:none;backdrop-filter:none;-webkit-backdrop-filter:none;border:0;border-left:1px solid var(--line)}
+@media (min-width:99999px){
+  .secnav{flex-direction:column}
   .secnav a{border:0;background:none;border-radius:calc(var(--radius) - 6px);padding:5px 9px;white-space:normal;line-height:1.35}
   .secnav a.on{background:var(--accent-soft)}
 }
 @media print{.secnav{display:none}}
 </style>
 <div class=pagecols><nav id=secnav class=secnav aria-label="Page sections" hidden></nav>
-<div class=wrap><form class=acctswitch method=get action="{{ url_for('switch_account') }}"><label for=acctswitch>Account</label>
-<select id=acctswitch name=name>
-{% for label, accts in switch if accts %}<optgroup label="{{ label }}">{% for a in accts %}<option value="{{ a.name }}" data-href="{{ url_for('detail', name=a.name) }}"{% if a.name==name %} selected{% endif %}>{{ a.name }}{% if a.ccy %} · {{ a.ccy }}{% endif %}{% if a.p_end %} · to {{ a.p_end }}{% endif %}</option>{% endfor %}</optgroup>{% endfor %}
-</select><button type=submit class="btn-sm acctgo" data-busy="Loading {{ name }}...">Reconcile</button></form>
-<script>(function(){var s=document.getElementById('acctswitch'),b=s&&s.form.querySelector('.acctgo');if(!b)return;
-// Choose an account, then Reconcile: it says which account is loading while the page is fetched.
-function upd(){var other=s.value!==s.getAttribute('data-cur');b.disabled=!other;b.classList.toggle('go',other);
-  b.setAttribute('data-busy','Loading '+s.value+': its statement, matches and lines to record...')}
-s.setAttribute('data-cur',s.value);s.addEventListener('change',upd);upd()})();</script>
-<style>.acctswitch{display:flex;align-items:center;gap:8px;margin:0 0 6px}.acctswitch label{font-size:13px;color:var(--muted)}
-.acctswitch select{max-width:100%;min-width:0;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:var(--panel);color:var(--ink)}
-.acctswitch .acctgo.go{background:var(--accent);color:#fff;border-color:var(--accent)}
-.acctswitch .acctgo:disabled{opacity:.5;cursor:default}
-@media print{.acctswitch{display:none}}</style>
-<h1>{{ name }}</h1>
-{% if has_results %}<div class=sub>Statement period {{ p_start }} to {{ p_end }}{% if ccy %} · {{ ccy }}{% endif %}</div>{% else %}<div class=sub>No statement yet — upload one to reconcile.</div>{% endif %}
-<form method=post action="{{ url_for('set_currency', name=name) }}" style="margin:0 0 20px;display:flex;align-items:center;gap:8px"><label style="font-size:13px;color:var(--muted)">Currency</label><input name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX" style="width:80px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-transform:uppercase"><button type=submit class=btn-sm>Set</button></form>
-<a href="{{ url_for('history', name=name) }}" class=btn-sm style="text-decoration:none;display:inline-block;margin:0 0 20px">View reconciliation history</a>
-{% if atype=='credit_card' %}<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 20px;line-height:1.5">Credit-card account: enter <b>charges as positive</b> and <b>payments/refunds as negative</b>, so signs match your QuickBooks credit-card register.</div>{% endif %}
+<div class=wrap>
+<div class=ph><div><h1>{{ name }}</h1>
+<div class=meta>{% if not has_results %}<span class="pill none">No statement yet</span>{% elif signed_off %}<span class="pill ok">Signed off</span>{% elif rec.status=='balanced' %}<span class="pill info">Balanced</span>{% elif rec.status=='out' %}<span class="pill bad">Out of balance</span>{% else %}<span class="pill attn">In progress</span>{% endif %}
+{% if ccy %}<span>{{ ccy }}</span>{% endif %}{% if atype=='credit_card' %}<span class=faint>·</span><span>Credit card</span>{% endif %}
+{% if has_results %}<span class=faint>·</span><span>Statement {{ p_start }} to {{ p_end }}</span>{% endif %}
+{% if prep %}<span class=faint>·</span><span>Prepared by {{ prep }}</span>{% endif %}{% if signed_by %}<span class=faint>·</span><span>Approved by {{ signed_by }}{% if signed_off %} on {{ signed_off }}{% endif %}</span>{% endif %}</div></div>
+<div class=acts>
+{% if can('upload') %}<button type=button class=btn-sm data-drawer=upload><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 16v4h16v-4"/></svg>Upload statement</button>{% endif %}
+<a href="{{ url_for('history', name=name) }}" class=btn-sm>History</a>
+{% if has_results %}<a href="{{ url_for('report', name=name) }}" class=btn-sm target=_blank rel=noopener title="Print reconciliation report">Report</a>{% endif %}
+<span class=kebab><button type=button class=icon-btn data-dd aria-label="More for this account" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+{% if has_results %}<a href="{{ url_for('exceptions_csv', name=name) }}">Download exceptions (CSV)</a><a href="{{ url_for('qbo_import_csv', name=name) }}">Download for QuickBooks (CSV)</a><div class=sep></div>{% endif %}
+{% if qbo_connected and qbo_linked %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=back value="{{ name }}"><button type=submit>Refresh books from QuickBooks</button></form>{% endif %}
+{% if can('upload') %}<button type=button data-drawer=books>Import books from a CSV</button>{% endif %}
+{% if can('settings') %}<div class=sep></div><div class=dh>Admin</div>
+<form method=post action="{{ url_for('set_currency', name=name) }}" class=ccyf><label for=ccy-in>Currency</label><input id=ccy-in name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX"><button type=submit class=btn-sm>Set</button></form>
+<form method=post action="{{ url_for('clear_account', name=name) }}" data-confirm="Clear this account's data? All statements and book transactions for it are removed here, to start fresh. QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Clear this account's data</button></form>
+<form method=post action="{{ url_for('delete_account', name=name) }}" data-confirm="Delete this account entirely? It and all its statements and transactions are removed here (for old sandbox accounts). QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Delete account</button></form>{% endif %}
+</div></span>
+</div></div>
+{% if atype=='credit_card' %}<div class=help>Credit card: charges are positive and payments or refunds negative, as in your QuickBooks card register.</div>{% endif %}
 {{ sync_banner() }}
-{% if detail_msg %}<div id=flash style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin-bottom:18px;font-weight:550">{{ detail_msg }}</div>
-<script>// After an action the page opens at its section (#sec-record...): show the result there, not off-screen at the top.
-document.addEventListener('DOMContentLoaded',function(){var f=document.getElementById('flash'),id=location.hash.slice(1),
-h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px';h.parentNode.insertBefore(f,h.nextSibling);}});</script>{% endif %}
-<div class=upload>
-<form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="margin-bottom:14px">
-<div class=u-label>Bank statement (PDF, CSV or OFX) · <a href="{{ url_for('template', kind='bank') }}" style="color:var(--accent);font-weight:600">download template</a></div>
-<input type=file name=statement accept=.pdf,.csv,.ofx required> <button type=submit class=btn>Upload &amp; reconcile</button>
-<div class=balform style="margin-top:10px">
-<div><label>Opening balance <span class=muted>(optional)</span></label><input name=opening_balance inputmode=decimal placeholder="from the statement"></div>
-<div><label>Closing balance</label><input name=closing_balance inputmode=decimal placeholder="from the statement"></div>
-<div><label>Period start</label><input type=date name=period_start></div>
-<div><label>Period end (statement date)</label><input type=date name=period_end></div>
-<div><label>PDF password <span class=muted>(if it has one)</span></label><input type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--accent)"{% endif %}></div>
+{% if detail_msg %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}
+{% if not has_results %}<div class="panel empty"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M12 11v6"/><path d="m9.5 13.5 2.5-2.5 2.5 2.5"/></svg>
+<div><b>No statement yet.</b> Upload this account's bank statement (PDF, CSV or OFX) to start the reconciliation.</div>
+{% if can('upload') %}<button type=button class=btn data-drawer=upload>Upload statement</button>{% endif %}</div>{% endif %}
+
+<aside class=drawer id=dr-upload {% if not open_upload %}hidden{% endif %} aria-label="Upload a statement"><form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
+<div class=drawer-h><h2>Upload a statement</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b>
+<label class=drop for=up-file><b>Choose the bank statement</b><span>PDF from online banking, CSV or OFX · <a href="{{ url_for('template', kind='bank') }}">CSV template</a></span><input id=up-file type=file name=statement accept=.pdf,.csv,.ofx required></label>
+<div class=two>
+<div class=fld><label for=up-ps>Period start</label><input id=up-ps type=date name=period_start></div>
+<div class=fld><label for=up-pe>Statement date (period end)</label><input id=up-pe type=date name=period_end></div>
+<div class=fld><label for=up-ob>Opening balance</label><input id=up-ob name=opening_balance inputmode=decimal placeholder="read from the statement"><small>Empty: the last signed-off closing</small></div>
+<div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
-<div class=muted style="font-size:12px">Leave blank if the file has a running-balance column (PDF, CSV) or a ledger balance (OFX) — they're read automatically. A PDF must be the one downloaded from online banking, not a scan; its password is used once to open it and never stored. Opening defaults to last signed-off closing. Set the period end to the statement date: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></form>
-<div class=u-label>Books</div>
-{% if qbo_connected and qbo_linked %}
-<form method=post action="{{ url_for('sync') }}" class=booksrc><input type=hidden name=back value="{{ name }}">
-<span>&#10003; Read straight from QuickBooks{% if last_sync %} · last synced {{ last_sync }}{% endif %}</span>
-<button type=submit class=btn-sm>Refresh from QuickBooks</button></form>
-<div class=hint style="margin-top:4px">Uploading a statement refreshes the books automatically — no export needed.</div>
-<details style="margin-top:10px"><summary class=muted style="cursor:pointer;font-size:12.5px">Offline? Import a QuickBooks CSV export instead</summary>
-{% else %}
-<div class=hint style="margin-bottom:8px">{% if not qbo_connected %}<a href="{{ url_for('connect') }}" style="color:var(--accent);font-weight:600">Connect QuickBooks</a> to read books directly, or import a CSV export:{% else %}This account isn't linked to a QuickBooks account — import a CSV export:{% endif %}</div>
-{% endif %}
-<form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="margin-top:8px">
-<div class=u-label>QuickBooks CSV export · <a href="{{ url_for('template', kind='books') }}" style="color:var(--accent);font-weight:600">download template</a></div>
-<input type=file name=books accept=.csv required> <button type=submit class=btn-sm>Import books</button></form>
-{% if qbo_connected and qbo_linked %}</details>{% endif %}
-{% if session.is_admin %}
-<div style="margin-top:15px;border-top:1px solid var(--line-soft);padding-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-<form method=post action="{{ url_for('clear_account', name=name) }}" onsubmit="return confirm('Clear ALL statements and book transactions for this account? This removes old synced or imported data so you can start fresh offline. This cannot be undone.');" style="display:inline">
-<button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Clear this account&#39;s data</button></form>
-<form method=post action="{{ url_for('delete_account', name=name) }}" onsubmit="return confirm('Delete this account entirely, including all its statements and transactions? Use this to remove old sandbox accounts. This cannot be undone.');" style="display:inline;margin-left:8px">
-<button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Delete account</button></form>
-<span style="color:var(--muted);font-size:12px">Removes old synced/imported data for a clean offline slate</span>
+<div class=fld><label for=up-pw>PDF password</label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}><small>Used once to open the file; never stored.</small></div>
+<details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></details>
+<div class=help style="margin:0">{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}</div>
 </div>
-{% endif %}
-</div>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Upload &amp; reconcile</button></div></form></aside>
+<aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
+<div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b><div class=help style="margin:0">For working offline: a QuickBooks register exported as CSV. When QuickBooks is connected the books are read directly, with no export needed.</div>
+<label class=drop for=bk-file><b>Choose the QuickBooks CSV export</b><span><a href="{{ url_for('template', kind='books') }}">CSV template</a></span><input id=bk-file type=file name=books accept=.csv required></label></div>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Import books</button></div></form></aside>
+<style>
+.sumstrip{display:grid;grid-template-columns:minmax(0,1.4fr) repeat(4,minmax(0,.6fr)) minmax(0,1.1fr);background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:0 0 6px}
+.sumstrip .tile{border-right:1px solid var(--line-soft);display:flex;flex-direction:column;gap:3px;justify-content:center;padding:10px 14px;border-radius:0}
+.sumstrip .tile:first-child{border-radius:var(--radius) 0 0 var(--radius)}
+.sumstrip .t-val small{font:400 12px var(--f-ui);color:var(--faint)}
+.sumstrip .t-val.bad{color:var(--bad)}
+.sumstrip .prog .bar{height:7px;display:block;margin-top:3px}
+.sumstrip .so{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:4px;padding:10px 14px}
+.sumstrip .so form{margin:0}.sumstrip .so small{color:var(--faint);font-size:11.5px;line-height:1.3}
+.panel.empty{display:flex;gap:14px;align-items:center;padding:18px;margin:0 0 14px;flex-wrap:wrap}.panel.empty svg{color:var(--faint);flex:none}.panel.empty div{flex:1;min-width:200px}
+.drop{display:flex;flex-direction:column;gap:4px;border:1.5px dashed #c3c9d4;border-radius:8px;padding:16px;text-align:center;color:var(--muted);background:#fbfbfc;cursor:pointer;align-items:center}
+.drop b{color:var(--ink)}.drop a{color:var(--accent)}.drop input{font-size:12.5px;margin-top:6px;max-width:100%}
+.ccyf{display:flex;gap:6px;align-items:center;padding:4px 10px}.ccyf label{font-size:12px;color:var(--muted)}.ccyf input{width:64px;padding:3px 6px;border:1px solid var(--line);border-radius:5px;text-transform:uppercase;font-size:12.5px}
+.ccyf .btn-sm{width:auto;display:inline-flex;padding:3px 9px}
+@media (max-width:1100px){.sumstrip{grid-template-columns:repeat(3,minmax(0,1fr))}.sumstrip .tile,.sumstrip .so{border-bottom:1px solid var(--line-soft)}}
+@media (max-width:600px){.sumstrip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
 {% if has_results %}
-<div class=tiles id=dtiles>
-<button class="tile" data-target="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7"/></svg></span><span class=t-label>Exact</span></div><div class=t-val>{{ n_exact }}</div></button>
-<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5h14"/><path d="M5 14.5h14"/><path d="M16 4 8 20"/></svg></span><span class=t-label>To review</span></div><div class="t-val {{ 'warn' if n_pending else '' }}">{{ n_pending }}</div></button>
-<button class="tile" data-target="sec-review" data-fallback="sec-matched"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="8" height="8" rx="1.5"/><rect x="13" y="12.5" width="8" height="8" rx="1.5"/><path d="M13 7.5h3a2 2 0 0 1 2 2v3"/></svg></span><span class=t-label>Batched</span></div><div class=t-val>{{ n_m2o }}</div></button>
-<button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
-<button class="tile" data-target="sec-balance"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Unreconciled</span></div><div class=t-val style="color:{{ '#047857' if rec.status=='balanced' else ('#b42318' if rec.status=='out' else '#667085') }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</div></button>
+<div class=sumstrip id=dtiles>
+<button type=button class="tile prog" data-target="sec-matched"><span class=t-label>Matched</span><span class=t-val>{{ n_matched_lines }} <small>of {{ n_lines }} lines</small></span><span class="bar{{ '' if n_matched_lines == n_lines else ' attn' }}"><i style="width:{{ (n_matched_lines * 100 / n_lines)|int if n_lines else 100 }}%"></i></span></button>
+<button type=button class=tile data-target="sec-review" data-fallback="sec-matched"><span class=t-label>To review</span><span class="t-val {{ 'warn' if n_pending else '' }}">{{ n_pending }}</span></button>
+<button type=button class=tile data-target="sec-record" data-fallback="sec-exceptions"><span class=t-label>To record</span><span class="t-val {{ 'warn' if n_to_record else '' }}">{{ n_to_record }}</span></button>
+<button type=button class=tile data-target="sec-transfers" data-fallback="sec-record"><span class=t-label>Transfers</span><span class="t-val {{ 'warn' if n_xfer else '' }}">{{ n_xfer }}</span></button>
+<button type=button class=tile data-target="sec-balance"><span class=t-label>Difference</span><span class="t-val {{ 'bad' if rec.status=='out' else '' }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</span></button>
+<div class=so>{% if signed_off %}<span class="pill ok">Signed off {{ signed_off }}</span>{% if can('reopen') %}<form method=post action="{{ url_for('reopen', name=name) }}" data-confirm="Reopen this reconciliation? You can sign it off again afterwards."><button type=submit class=btn-sm>Undo sign-off</button></form>{% endif %}
+{% elif rec.status=='balanced' and not n_pending and can('signoff') and not self_prepared %}<form method=post action="{{ url_for('signoff', name=name) }}" data-confirm="Sign off this reconciliation? It is locked as reconciled for {{ p_start }} to {{ p_end }}."><button type=submit class=btn-go>Sign off</button></form><small>Balanced and reviewed</small>
+{% else %}<button type=button class=btn-go disabled title="{{ signoff_why }}">Sign off</button><small>{{ signoff_why }}</small>{% endif %}</div>
 </div>
 <h2 id=sec-balance style="font-size:15px" data-sec data-state="{{ 'done' if signed_off else ('ready' if rec.status=='balanced' else 'attn') }}" data-note="{{ ('Signed off ' ~ signed_off) if signed_off else ('Balanced' if rec.status=='balanced' else ('Out of balance' if rec.status=='out' else 'Balances needed')) }}">Balance reconciliation</h2>
 {% set cc = atype=='credit_card' %}
@@ -3545,14 +4259,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 {% if qbo_linked %}<form method=post action="{{ url_for('balances', name=name) }}" style="margin:8px 0 0"><input type=hidden name=action value=fetch_book><button type=submit class=btn-sm>Get book balance from QuickBooks</button> <span class=muted style="font-size:12px">Syncs first, then reads the account balance as at {{ p_end }}.</span></form>{% endif %}
 <div class=muted style="font-size:12px;margin-top:8px;line-height:1.5">Book balance is the account's register (or Balance Sheet) balance in QuickBooks as at the statement end date{{ ' — enter what you owe as a positive number' if cc else '' }}. Blank opening falls back to the last signed-off closing balance.</div>
 </details>
-<div style="margin-bottom:24px">
-{% if signed_off %}<span class="pill signed">Signed off {{ signed_off }}</span>
-<form method=post action="{{ url_for('reopen', name=name) }}" style="display:inline;margin-left:8px" onsubmit="return confirm('Reopen this reconciliation? You can sign it off again afterward.');"><button type=submit class=btn-sm>Undo sign-off</button></form>
-{% elif rec.status=='balanced' and not n_pending %}<form method=post action="{{ url_for('signoff', name=name) }}" style="display:inline"><button type=submit class=btn-go>Sign off this reconciliation</button></form>
-{% else %}<button type=button class=btn-go disabled style="opacity:.45;cursor:not-allowed" title="{{ 'Review the suggested matches first' if n_pending else 'Balance the reconciliation first' }}">Sign off this reconciliation</button>{% if n_pending %} <a href="#sec-review" class=hint style="color:var(--warn);font-weight:600">{{ n_pending }} suggested match{{ '' if n_pending==1 else 'es' }} to review first</a>{% endif %}{% endif %}
-<a href="{{ url_for('exceptions_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download exceptions (CSV)</a>
-<a href="{{ url_for('qbo_import_csv', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px">Download for QuickBooks (CSV)</a>
-<a href="{{ url_for('report', name=name) }}" class=btn-sm style="display:inline-block;text-decoration:none;margin-left:8px" target=_blank rel=noopener>Print reconciliation report</a>
+<div style="margin-bottom:8px">
 {% if session.is_admin and not signed_off and (rec.status!='balanced' or n_pending) %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
 <form method=post action="{{ url_for('signoff', name=name) }}" class=balform><input type=hidden name=override value=1>
 <div><label>Reason (recorded with the sign-off)</label><input name=note required style="width:340px;max-width:100%"></div>
@@ -3560,8 +4267,8 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 </div>
 {% if reviewable %}
 <h2 id=sec-review style="font-size:15px" data-sec data-state="{{ 'attn' if n_pending else 'done' }}" data-note="{{ (n_pending ~ ' to review') if n_pending else 'All reviewed' }}">Suggested matches{% if n_pending %} — {{ n_pending }} to review{% endif %}</h2>
-<div class=sub style="margin:-4px 0 12px">These aren't counted until you confirm them.{% if n_signflip %} {{ n_signflip }} {{ 'is an' if n_signflip==1 else 'are' }} opposite-sign pairing{{ '' if n_signflip==1 else 's' }} (same amount, flipped sign) — usually a transfer entered the wrong way round.{% endif %}</div>
-{% if n_pending > 1 %}<form method=post action="{{ url_for('review_all', name=name) }}" style="margin:0 0 4px" onsubmit="return confirm('Confirm all {{ n_pending }} suggested matches?');"><button type=submit class=btn-sm>Confirm all {{ n_pending }}</button></form>{% endif %}
+<div class=help>Close but not exact pairs. They only count once you confirm them. <details class=how><summary>How this works</summary><div>Suggested when the payee matches but the amount differs slightly, a bank line cleared later than it was booked, or several bank lines add up to one QuickBooks entry (batched).{% if n_signflip %} {{ n_signflip }} {{ 'is an' if n_signflip==1 else 'are' }} opposite-sign pairing{{ '' if n_signflip==1 else 's' }} (same amount, flipped sign): usually a transfer entered the wrong way round.{% endif %} Confirm the right ones and reject the rest; Edit pairing changes which items are paired.</div></details></div>
+{% if n_pending > 1 %}<form method=post action="{{ url_for('review_all', name=name) }}" style="margin:0 0 4px" data-confirm="Confirm all {{ n_pending }} suggested matches? They count as matched; you can undo each one afterwards."><button type=submit class=btn-sm>Confirm all {{ n_pending }}</button></form>{% endif %}
 <table><tr><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched total')) }}</span></td>
@@ -3569,10 +4276,13 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
 <td><form method=post action="{{ url_for('review_match', name=name, match_id=r.id) }}" class=btnrow>
-{% if r.status=='proposed' %}<button type=submit name=status value=confirmed class=btn-sm>Confirm</button><button type=submit name=status value=rejected class=btn-sm>Reject</button>
+{% if r.status=='proposed' %}<button type=submit name=status value=confirmed class="btn-sm pri">Confirm</button>
 {% else %}<button type=submit name=status value=proposed class=btn-sm>Undo</button>{% endif %}
-{% if r.status=='confirmed' %}<button type=submit name=status value=edit class=btn-sm title="Change which items this match pairs">Edit</button>
-{% else %}<button type=button class="btn-sm mm-edit" data-lines="{{ r.lids|join(',') }}" data-txns="{{ r.tids|join(',') }}" title="Change which items this match pairs">Edit</button>{% endif %}
+<span class=kebab><button type=button class=icon-btn data-dd aria-label="More" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+{% if r.status=='proposed' %}<button type=submit name=status value=rejected>Reject</button>{% endif %}
+{% if r.status=='confirmed' %}<button type=submit name=status value=edit title="Change which items this match pairs">Edit pairing</button>
+{% else %}<button type=button class=mm-edit data-lines="{{ r.lids|join(',') }}" data-txns="{{ r.tids|join(',') }}" title="Change which items this match pairs">Edit pairing</button>{% endif %}
+</div></span>
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
@@ -3583,7 +4293,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
 <h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else 'Recorded \u2014 matches on the next refresh' }}">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
-<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer (same currency only); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div>
+<div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer (same currency only); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
 {% if rec_job %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">Recording in QuickBooks: <b class=rj-n>{{ rec_job.n }}</b> of {{ rec_job.total }} lines done ({{ rec_job.done }} recorded so far). The list updates when it finishes.</div>
 <script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
 function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
@@ -3879,13 +4589,14 @@ f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='only'
 f.addEventListener('submit',function(e){var b=e.submitter;if(!b||b.name!=='bulk')return;
   var n=0,t=0;document.querySelectorAll('.rsel:checked').forEach(function(c){n++;t+=Math.abs(parseFloat(c.getAttribute('data-amt'))||0)});
   if(!n){e.preventDefault();return}
-  if(!confirm('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString(undefined,{minimumFractionDigits:2})+' in QuickBooks?'))e.preventDefault();});}
+  if(f._rbok){f._rbok=false;return}
+  e.preventDefault();rbAsk('Record '+n+' transaction'+(n==1?'':'s')+' totalling '+t.toLocaleString(undefined,{minimumFractionDigits:2})+' in QuickBooks? Each is posted dated as on the statement.',function(){rbResubmit(f,b)},{yes:'Record'});});}
 count();
 })();</script>
 {% endif %}
 {% if all_unmatched or in_books or user_matches %}
 <h2 id=sec-manual style="font-size:15px" data-sec data-state="{{ 'attn' if all_unmatched and in_books else 'done' }}" data-note="{{ (all_unmatched|length ~ ' bank line' ~ ('' if all_unmatched|length == 1 else 's') ~ ' unmatched') if all_unmatched and in_books else 'Nothing to pair' }}">Match manually</h2>
-<div class=sub style="margin:-4px 0 12px">Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</div>
+<div class=help>Pair bank lines with QuickBooks entries the matcher missed, one to one or several together. <details class=how><summary>How this works</summary><div>Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</div></details></div>
 {% if user_matches %}
 <table><tr><th>Matched by you</th><th>Statement side</th><th>Books side</th><th class=a>Difference</th><th></th></tr>
 {% for u in user_matches %}<tr>
@@ -3959,13 +4670,14 @@ document.querySelectorAll('.mm-edit').forEach(function(b){b.addEventListener('cl
 var E={{ mm_edit|tojson }};
 if(E){window.__mmOpen=1;}
 if(E)pick(E.l,E.t,E.l.join(',')+'|'+E.t.join(','));
-f.addEventListener('submit',function(e){if(diff!==0&&!confirm('The two sides differ by '+fmt(diff)+'. Match anyway? The difference will show under amount differences.'))e.preventDefault()});
+f.addEventListener('submit',function(e){if(f._rbok){f._rbok=false;return}if(diff===0)return;var sb=e.submitter;e.preventDefault();
+  rbAsk('The two sides differ by '+fmt(diff)+'. Match anyway? The difference will show under amount differences.',function(){rbResubmit(f,sb)},{yes:'Match anyway'})});
 update(false);
 })();</script>
 {% endif %}
 {% endif %}
 {% if n_xfer or xfer_recorded or xfer_dismissed %}<h2 id=sec-transfers style="font-size:15px" data-sec data-state="{{ 'attn' if n_xfer else 'done' }}" data-note="{{ (n_xfer ~ ' to check') if n_xfer else 'None to check' }}">Possible transfers between your own accounts ({{ n_xfer }})</h2>
-<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it. <em>Edit</em> picks a different counterpart (or just the other account, when its statement isn't uploaded); <em>Not a transfer</em> hides a wrong suggestion.</div>
+<div class=help>Suggestions only. A real transfer is recorded once, as one QuickBooks Transfer. <details class=how><summary>How this works</summary><div>Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it. <em>Edit</em> picks a different counterpart (or just the other account, when its statement isn't uploaded); <em>Not a transfer</em> hides a wrong suggestion.</div></details></div>
 {% if n_xfer %}<form method=post action="{{ url_for('transfer_dismiss', name=name) }}" id=xferbulk class=xferbar>
 <span class=xb-n>Tick the suggestions that aren't transfers</span><button type=submit class=btn-sm data-busy="Hiding the suggestions..." disabled>Not a transfer (selected)</button></form>
 <table class=xfertbl><tr><th><input type=checkbox class=xb-all title="Select all" aria-label="Select all suggestions"></th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
@@ -3973,9 +4685,11 @@ update(false);
 <tr><td><input type=checkbox name=pick value="{{ lid }}|{{ c.key }}" form=xferbulk class=xb-pick aria-label="Not a transfer"></td><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
 <td class=desc><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
 <td style="font-size:12px;color:var(--muted);white-space:normal;min-width:220px">{{ c.note }}<div class=btnrow style="margin-top:6px;flex-wrap:wrap">
-{% if c.rule == 'unrecorded' %}{% if not acct_linked or not c.other_linked %}<span>Both accounts must be linked to QuickBooks to record it here.</span>{% elif signed_off or c.other_signed %}<span>A statement is signed off \u2014 reopen it to record this.</span>{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}
-{% if loop.first and not signed_off and acct_linked %}<button type=button class="btn-sm xfer-edit" data-line="{{ lid }}" aria-expanded=false>Edit</button>{% endif %}
-<form method=post action="{{ url_for('transfer_dismiss', name=name) }}"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.key }}"><button type=submit class=btn-sm data-busy="Hiding this suggestion...">Not a transfer</button></form>
+{% if c.rule == 'unrecorded' %}{% if not acct_linked or not c.other_linked %}<span>Both accounts must be linked to QuickBooks to record it here.</span>{% elif signed_off or c.other_signed %}<span>A statement is signed off \u2014 reopen it to record this.</span>{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" data-confirm="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class="btn-sm pri">Record as one transfer</button></form>{% endif %}{% endif %}
+<span class=kebab><button type=button class=icon-btn data-dd aria-label="More" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+{% if loop.first and not signed_off and acct_linked %}<button type=button class=xfer-edit data-line="{{ lid }}" aria-expanded=false>Edit counterpart</button>{% endif %}
+<form method=post action="{{ url_for('transfer_dismiss', name=name) }}"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.key }}"><button type=submit data-busy="Hiding this suggestion...">Not a transfer</button></form>
+</div></span>
 </div></td></tr>
 {% if loop.last and not signed_off and acct_linked %}<tr class=xferedit id="xe-{{ lid }}" hidden><td></td><td colspan=5 style="white-space:normal;background:#f8faff">
 <form method=post action="{{ url_for('record_transfer', name=name) }}" class=xe-form data-amt="{{ a|abs|money }}"><input type=hidden name=line value="{{ lid }}">
@@ -3990,7 +4704,7 @@ update(false);
 {% if xfer_recorded %}<details class=xferrec id=xferrec style="margin:4px 0 14px"{% if not n_xfer %} open{% endif %}><summary style="cursor:pointer;font-size:13.5px;font-weight:600">Transfers recorded from this statement ({{ xfer_recorded|length }}) <span class=hint style="font-weight:400">— Edit changes the other side; Undo deletes it in QuickBooks</span></summary>
 <table class=xferdone><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Other account</th><th></th></tr>
 {% for t in xfer_recorded %}<tr><td>{{ t.date }}</td><td class=desc>{{ t.who }}</td><td class=a>{{ t.amount|money }}</td><td class=desc>{{ t.other or '' }}<br><span class=hint>QuickBooks #{{ t.qbo_id }}{% if t.by %} \u00b7 {{ t.by }}{% endif %}</span></td>
-<td>{% if not signed_off %}<div class=btnrow><button type=button class="btn-sm xfer-edit" data-line="r{{ t.qbo_id }}" aria-expanded=false>Edit</button><form method=post action="{{ url_for('transfer_undo', name=name) }}" onsubmit="return confirm(this.dataset.q)" data-q="Undo this transfer? It is DELETED in QuickBooks (#{{ t.qbo_id }}), and its bank lines go back to the list to record again."><input type=hidden name=qbo_id value="{{ t.qbo_id }}"><button type=submit class=btn-sm data-busy="Undoing the transfer (deleting it in QuickBooks)...">Undo</button></form></div>{% else %}<span class=hint>signed off</span>{% endif %}</td></tr>
+<td>{% if not signed_off %}<div class=btnrow><button type=button class="btn-sm xfer-edit" data-line="r{{ t.qbo_id }}" aria-expanded=false>Edit</button><span class=kebab><button type=button class=icon-btn data-dd aria-label="More" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden><form method=post action="{{ url_for('transfer_undo', name=name) }}" data-confirm="Undo transfer #{{ t.qbo_id }}? It is deleted in QuickBooks, and its bank lines go back to the list to record again."><input type=hidden name=qbo_id value="{{ t.qbo_id }}"><button type=submit class=danger data-busy="Undoing the transfer (deleting it in QuickBooks)...">Undo (delete in QuickBooks)</button></form></div></span></div>{% else %}<span class=hint>signed off</span>{% endif %}</td></tr>
 {% if not signed_off %}<tr class=xferedit id="xe-r{{ t.qbo_id }}" hidden><td></td><td colspan=4 style="white-space:normal;background:#f8faff">
 <form method=post action="{{ url_for('transfer_change', name=name) }}" class=xe-form data-amt="{{ t.amount|abs|money }}" data-verb="Change transfer #{{ t.qbo_id }} of"><input type=hidden name=qbo_id value="{{ t.qbo_id }}">
 <div class=splithead>Change the other side of transfer #{{ t.qbo_id }} (now {{ t.other or 'unknown' }}). It's updated in QuickBooks, keeping its number; the old counterpart line goes back to its list.</div>
@@ -4021,8 +4735,9 @@ function upd(){var n=picks.filter(function(p){return p.checked}).length;btn.disa
   if(all){all.checked=n&&n===picks.length;all.indeterminate=n>0&&n<picks.length}}
 picks.forEach(function(p){p.addEventListener('change',upd)});
 if(all)all.addEventListener('change',function(){picks.forEach(function(p){p.checked=all.checked});upd()});
-bf.addEventListener('submit',function(e){var n=picks.filter(function(p){return p.checked}).length;
-  if(!n||!confirm('Mark '+n+' suggestion'+(n==1?'':'s')+' as not a transfer? They can be restored from the hidden list.'))e.preventDefault()});
+bf.addEventListener('submit',function(e){if(bf._rbok){bf._rbok=false;return}var n=picks.filter(function(p){return p.checked}).length;
+  e.preventDefault();if(!n)return;var sb=e.submitter;
+  rbAsk('Mark '+n+' suggestion'+(n==1?'':'s')+' as not a transfer? They can be restored from the hidden list.',function(){rbResubmit(bf,sb)},{yes:'Not a transfer'})});
 upd();
 })();</script>
 <script>(function(){
@@ -4032,12 +4747,13 @@ document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.get
   row.querySelector('.xe-cancel').addEventListener('click',function(){row.hidden=true;b.setAttribute('aria-expanded','false')});
   var sel=row.querySelector('.xe-acct'),r=row.querySelector('.xe-acct-r'),f=row.querySelector('.xe-form');
   if(sel&&r)sel.addEventListener('change',function(){if(sel.value)r.checked=true});
-  f.addEventListener('submit',function(e){var pick=f.querySelector('input[name=other]:checked');
+  f.addEventListener('submit',function(e){if(f._rbok)return;var pick=f.querySelector('input[name=other]:checked');
     var acct=pick&&pick.classList.contains('xe-acct-r')?sel.options[sel.selectedIndex]:null;
     if(!pick||(acct&&!sel.value)){e.preventDefault();var h=f.querySelector('.xe-err');if(!h){h=document.createElement('div');h.className='hint bad xe-err';f.appendChild(h)}
       h.textContent=!pick?'Pick the matching line or an account first.':'Choose the account.';return}
     var verb=f.getAttribute('data-verb')||'Record a transfer of';
-    if(!confirm(verb+' '+f.getAttribute('data-amt')+(acct?' with '+acct.textContent:' between these two lines')+' in QuickBooks?'))e.preventDefault()});
+    if(f._rbok){f._rbok=false;return}var sb=e.submitter;e.preventDefault();
+    rbAsk(verb+' '+f.getAttribute('data-amt')+(acct?' with '+acct.textContent:' between these two lines')+' in QuickBooks?',function(){rbResubmit(f,sb)},{yes:'Save'})});
 });})();</script>
 {% endif %}
 <h2 id=sec-exceptions style="font-size:15px" data-sec data-state="{{ 'attn' if on_stmt else 'done' }}" data-note="{{ (on_stmt|length ~ ' to clear') if on_stmt else 'None' }}">On statement, not in books ({{ on_stmt|length }})</h2>
@@ -4100,15 +4816,18 @@ document.querySelectorAll('.wrap table').forEach(function(tbl,ti){
   if(sc&&sc.modes[+saved[1]])apply(sc,+saved[1],false);
 });
 })();</script>
-<style>.dsecbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0 4px;font-size:13px;color:var(--muted)}
+<style>.dsecbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 2px 8px;font-size:12px;color:var(--muted)}
 .dsecbar b{color:var(--ink)}.dsecbar button{background:none;border:0;padding:0;color:var(--accent);font:inherit;font-weight:600;cursor:pointer}
-.dsec>h2.dsec-h{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;margin:12px 0 10px;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:10px}
-.dsec>h2.dsec-h:hover{border-color:var(--accent)}
-.dsec.attn>h2.dsec-h{border-left-color:var(--warn)}.dsec.ready>h2.dsec-h{border-left-color:var(--accent)}.dsec.done>h2.dsec-h{border-left-color:var(--ok);color:#475467;font-weight:600}
-.dsec-chev{display:inline-block;width:12px;font-size:10px;color:var(--muted);transition:transform .15s}.dsec.closed .dsec-chev{transform:rotate(-90deg)}
-.dsec-badge{margin-left:auto;font-size:11.5px;font-weight:600;padding:2px 10px;border-radius:999px;white-space:nowrap}
-.dsec.attn .dsec-badge{background:var(--warn-soft);color:var(--warn)}.dsec.ready .dsec-badge{background:var(--accent-soft);color:var(--accent)}.dsec.done .dsec-badge{background:var(--ok-soft);color:var(--ok)}
-.dsec-body{padding:0 2px 6px}</style>
+.dsec{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:0 0 10px}
+.dsec>h2.dsec-h{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;margin:0;padding:9px 14px;font-size:13.5px;border-left:3px solid transparent;border-radius:var(--radius)}
+.dsec>h2.dsec-h:hover{background:var(--row)}
+.dsec.attn>h2.dsec-h{border-left-color:#e08a3e}.dsec.ready>h2.dsec-h{border-left-color:var(--gold)}.dsec.done>h2.dsec-h{border-left-color:#4cb07e;color:#3d4757;font-weight:600}
+.dsec:not(.closed)>h2.dsec-h{border-radius:var(--radius) var(--radius) 0 0}
+.dsec-chev{display:inline-block;width:12px;font-size:9px;color:var(--faint);transition:transform .15s}.dsec.closed .dsec-chev{transform:rotate(-90deg)}
+.dsec-badge{margin-left:auto;font-size:11.5px;font-weight:600;padding:1px 9px;border-radius:999px;white-space:nowrap}
+.dsec.attn .dsec-badge{background:var(--warn-soft);color:var(--warn)}.dsec.ready .dsec-badge{background:var(--gold-soft);color:#7a5d0e}.dsec.done .dsec-badge{background:var(--ok-soft);color:var(--ok)}
+.dsec-body{border-top:1px solid var(--line-soft);padding:10px 14px 4px}
+.dsec-body>table:first-child,.dsec-body>.help:first-child{margin-top:0}</style>
 <script>(function(){
 // Each section heading folds its section. Sections that need work come first and start open; finished
 // ones go to the bottom, folded. A section you open or fold stays that way (this tab) until its state changes.
@@ -4156,47 +4875,9 @@ if(location.hash){fromHash();var el=document.getElementById(decodeURIComponent(l
 if(window.__mmOpen){reveal("sec-manual");var mm=document.getElementById("sec-manual");if(mm&&mm.scrollIntoView)mm.scrollIntoView()}
 })();</script>
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
-</div></div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
-<div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
-<script>(function(){
-var ov=document.getElementById('loadingov'),msg=document.getElementById('loadingmsg'),timer,hideTimer;
-function show(t){if(msg&&t)msg.textContent=t;if(ov)ov.classList.add('on');clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(ov)ov.classList.remove('on');},40000);}
-function schedule(t){clearTimeout(timer);timer=setTimeout(function(){show(t);},180);}
-// "Confirm" -> "Confirming...", "Save balances" -> "Saving balances...": say what's being done.
-var VERB={Confirm:'Confirming',Reject:'Rejecting',Undo:'Undoing',Edit:'Opening',Record:'Recording',Save:'Saving',Get:'Getting',
-  Sign:'Signing',Match:'Matching',Import:'Importing',Clear:'Clearing',Delete:'Deleting',Set:'Setting',Update:'Updating',
-  Create:'Creating',Remove:'Removing',Check:'Checking',Disconnect:'Disconnecting',Refresh:'Refreshing',Discard:'Discarding'};
-function busy(label){var w=label.split(' '),v=VERB[w[0]];if(!v)return '';var rest=label.slice(w[0].length).trim();
-  return v+(rest?' '+rest.charAt(0).toLowerCase()+rest.slice(1):'')+'...';}
-document.addEventListener('click',function(e){
-var a=e.target.closest?e.target.closest('a'):null;if(!a)return;
-var href=a.getAttribute('href')||'';if(!href)return;
-if(a.target==='_blank'||a.hasAttribute('download'))return;
-if(href[0]==='#'||href.indexOf('javascript:')===0||href.indexOf('mailto:')===0)return;
-if(href.indexOf('.csv')>-1||href.indexOf('/template/')>-1||href.indexOf('/backup')>-1)return;
-if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
-schedule(a.getAttribute('data-busy')||'Loading...');});
-document.addEventListener('submit',function(e){
-if(e.defaultPrevented)return;
-var act=(e.target.getAttribute&&e.target.getAttribute('action'))||'';var t='Please wait...';
-var sb=e.submitter,bt=sb&&(sb.getAttribute('data-busy')||busy((sb.textContent||sb.value||'').trim()));
-if(act.indexOf('/record')>-1)t='Recording in QuickBooks...';
-else if(act.indexOf('/match')>-1||act.indexOf('/unmatch')>-1)t='Matching...';
-if(act.indexOf('/upload')>-1)t='Reconciling your statement...';
-else if(act.indexOf('/import_books')>-1)t='Importing your books...';
-else if(act.indexOf('/sync')>-1)t='Syncing from QuickBooks...';
-else if(act.indexOf('/clear')>-1)t='Clearing account data...';
-else if(act.indexOf('/signoff')>-1)t='Signing off...';
-else if(act.indexOf('/reopen')>-1)t='Reopening...';
-else if(act.indexOf('/disconnect')>-1)t='Disconnecting...';
-else if(act.indexOf('/check-connection')>-1)t='Checking connection...';
-if(bt&&act.indexOf('/upload')<0&&act.indexOf('/import_books')<0&&act.indexOf('/sync')<0)t=bt;
-schedule(t);});
-window.addEventListener('pageshow',function(){clearTimeout(timer);clearTimeout(hideTimer);if(ov)ov.classList.remove('on');});
-})();</script>
-<script>// Section menu: built from the page's own h2[id^=sec-] headings, so conditional sections take care of themselves.
+</div></div>""" + SHELL_END + """<script>// Section menu: built from the page's own h2[id^=sec-] headings, so conditional sections take care of themselves.
 (function(){
-var menu=document.getElementById('secnav'),topnav=document.querySelector('.nav');
+var menu=document.getElementById('secnav'),topnav=document.querySelector('.topbar');
 if(!menu||menu.getAttribute('data-built'))return;
 var heads=[].slice.call(document.querySelectorAll('h2[id^="sec-"]'));
 if(heads.length<2)return;
@@ -4211,7 +4892,7 @@ function label(h){
   return {name:name,n:n};
 }
 var cur=null,offset=70;
-function wide(){return window.matchMedia?window.matchMedia('(min-width:1260px)').matches:window.innerWidth>=1260;}
+function wide(){return false;}
 function setOn(a){
   if(a===cur)return;if(cur)cur.classList.remove('on');cur=a;if(!a)return;a.classList.add('on');
   if(!wide()&&menu.scrollWidth>menu.clientWidth){var l=a.offsetLeft-menu.offsetLeft;menu.scrollLeft=Math.max(0,l-(menu.clientWidth-a.offsetWidth)/2);}
@@ -4263,7 +4944,7 @@ TRANSFER_WINDOW_DAYS = 4      # how far apart the two sides of a transfer may si
 TRANSFER_EXACT_ONLY = True    # fees charged as separate debits, so amounts should tie exactly
 
 
-def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_DAYS):
+def transfer_candidates(cur, acct_uuid, unmatched_lines, window=None):
     """Find likely own-transfer counterparts on OTHER accounts.
 
     Two fingerprints, deliberately kept apart because they mean different things:
@@ -4280,6 +4961,8 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
     same number are a coincidence, not a transfer (each bank's charges stay on that bank).
     Suggestions only. Nothing here auto-matches or writes anything back.
     """
+    if window is None:
+        window = rule("transfer_days")
     if not unmatched_lines:
         return {}
     ids = [str(l[0]) for l in unmatched_lines]
@@ -4886,7 +5569,30 @@ def detail(name):
         session["detail_msg"] = " ".join(x for x in (extra, session.get("detail_msg")) if x)
         session["rec_seen:" + name] = rec_job.get("started")
     d["rec_job"] = rec_job if rec_job and rec_job.get("state") == "running" else None
+    conn = get_conn(); cur = conn.cursor()
+    st = _latest_statement(cur, acct_uuid)
+    prep = signed_by = None
+    n_lines = n_matched_lines = 0
+    if st:
+        cur.execute("SELECT prepared_by, signed_off_by FROM statement WHERE statement_id=%s;", (st[0],))
+        prep, signed_by = cur.fetchone() or (None, None)
+        cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
+                              count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
+                                  SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
+                                  WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
+                       FROM statement_line sl WHERE sl.statement_id = %s;""", (st[0],))
+        n_lines, n_matched_lines = cur.fetchone()
+    cur.close(); conn.close()
+    self_prepared = bool(rule("two_person") and prep and prep == session.get("name") and not session.get("is_admin"))
+    rec = d.get("rec") or {}
+    signoff_why = ("Your sign-in can't sign off" if not can("signoff") else
+                   f"Review the {d.get('n_pending')} suggested match{'' if d.get('n_pending') == 1 else 'es'} first" if d.get("n_pending") else
+                   "Balance the reconciliation first" if rec.get("status") != "balanced" else
+                   "You prepared it: a second person (or an admin) signs off" if self_prepared else "")
+    open_upload = bool(request.args.get("upload") or request.args.get("pdfpw")) and can("upload")
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
+                                  prep=prep, signed_by=signed_by, n_lines=n_lines, n_matched_lines=n_matched_lines,
+                                  self_prepared=self_prepared, signoff_why=signoff_why, open_upload=open_upload,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=session.pop("detail_msg", None),
                                   mm_edit=session.pop("mm_edit", None), switch=switch, **d)
@@ -4961,6 +5667,7 @@ def upload(name):
                          " A QuickBooks sync is running; this statement is re-matched automatically when it finishes.")
         except Exception as e:
             refreshed = f" (Couldn't start a QuickBooks refresh: {e}. Matched against the last sync.)"
+    log_activity(f"uploaded a statement ({n} lines)", name)
     session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
                              + (f" {note}" if note else "") + refreshed)
     return redirect(url_for("detail", name=name))
@@ -5182,6 +5889,7 @@ def record(name):
     so a long batch isn't cut off by the server's time limit (the page shows its progress)."""
     form = request.form.to_dict(flat=True)
     ids = [form["only"]] if form.get("only") else list(dict.fromkeys(request.form.getlist("sel")))
+    ids = [i for i in ids if _is_uuid(i)]       # only real bank lines (a tampered id is simply ignored)
     user = session.get("name")
     back = redirect(url_for("detail", name=name) + "#sec-record")
     job = record_job(name)
@@ -5194,6 +5902,14 @@ def record(name):
         return back
     session["detail_msg"] = _record_run(name, form, ids, user)
     return back
+
+
+def _is_uuid(v):
+    try:
+        uuid.UUID(str(v))
+        return True
+    except ValueError:
+        return False
 
 
 @app.route("/account/<name>/record_status")
@@ -6093,6 +6809,13 @@ def signoff(name):
             rec = d["rec"]
             note = (request.form.get("note") or "").strip()
             override = session.get("is_admin") and request.form.get("override") == "1" and note
+            cur.execute("SELECT prepared_by FROM statement WHERE statement_id=%s;", (sid,))
+            prep = (cur.fetchone() or [None])[0]
+            if rule("two_person") and prep and prep == session.get("name") and not session.get("is_admin"):
+                session["detail_msg"] = ("Not signed off: you prepared this reconciliation, so a second person "
+                                         "(or an admin) must sign it off.")
+                cur.close(); conn.close()
+                return redirect(url_for("detail", name=name))
             if rec["n_pending"] and not override:
                 session["detail_msg"] = (f"Not signed off: {rec['n_pending']} suggested match"
                                          f"{'' if rec['n_pending'] == 1 else 'es'} still need a confirm or reject.")
@@ -6115,6 +6838,7 @@ def signoff(name):
             cur.execute("UPDATE statement SET signed_off_at=now(), signed_off_by=%s, signoff_note=%s WHERE statement_id=%s;",
                         (session.get("name") or "you", note if (rec["status"] != "balanced" or rec["n_pending"]) else None, sid))
             conn.commit()
+            log_activity("signed off the reconciliation" + (" (unbalanced: " + note + ")" if override else ""), name)
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
 
@@ -6206,9 +6930,8 @@ def exceptions_csv(name):
                     headers={"Content-Disposition": f"attachment; filename={name}_exceptions.csv"})
 
 
-HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} history · Reconciliation Tool</title>""" + CSS + """</head><body>
-<div class=nav><span class=brand><span class=dot></span>Reconciliation Tool</span><span class=links>{% if session.name %}<span style="color:var(--muted);font-size:13px;margin-right:6px">{{ session.name }}</span>{% endif %}<a href="{{ url_for('detail', name=name) }}">← Back to {{ name }}</a><a href="{{ url_for('dashboard') }}">All accounts</a><a href="{{ url_for('logout') }}">Sign out</a></span></div>
-<div class=wrap>
+HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} history · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
 <h1>{{ name }} — reconciliation history</h1>
 <div class=sub>Past reconciliations for this account{% if ccy %} · {{ ccy }}{% endif %}</div>
 {% if stmts %}
@@ -6229,7 +6952,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 {% else %}
 <div class=sub>No reconciliations yet for this account.</div>
 {% endif %}
-</div></body></html>"""
+</div>""" + SHELL_END + """</body></html>"""
 
 
 @app.route("/account/<name>/history")
@@ -6441,7 +7164,7 @@ def set_token():
         session["sync_msg"] = "Refresh token saved. Use 'Check connection' to verify it works."
     else:
         session["sync_msg"] = "No refresh token was provided."
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("settings") if request.form.get("to") == "settings" else url_for("dashboard"))
 
 
 @app.route("/disconnect", methods=["POST"])
@@ -6462,7 +7185,7 @@ def disconnect():
     try: set_config("qbo_conn", "disconnected")
     except Exception: pass
     session["sync_msg"] = "Disconnected from QuickBooks."
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("settings") if request.form.get("to") == "settings" else url_for("dashboard"))
 
 
 @app.route("/check-connection", methods=["POST"])
@@ -6478,7 +7201,7 @@ def check_connection():
         try: set_config("qbo_conn", "disconnected")
         except Exception: pass
         session["sync_msg"] = "QuickBooks connection isn't active — please reconnect."
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("settings") if request.form.get("to") == "settings" else url_for("dashboard"))
 
 
 @app.route("/sync", methods=["POST"])
@@ -6494,7 +7217,7 @@ def sync():
         if msg: session["detail_msg"] = msg
         return redirect(url_for("detail", name=back))
     if msg: session["sync_msg"] = msg
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("settings") if request.form.get("to") == "settings" else url_for("dashboard"))
 
 
 @app.route("/sync/status")

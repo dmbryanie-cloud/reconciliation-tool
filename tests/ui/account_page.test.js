@@ -11,6 +11,7 @@ const dom = new JSDOM(html, { runScripts: "dangerously", virtualConsole: vc, pre
 const { window } = dom; const d = window.document;
 window.HTMLElement.prototype.scrollIntoView = function () {};
 let confirmMsg = null; window.confirm = m => { confirmMsg = m; return false; };
+window.rbAsk = m => { confirmMsg = m; };   // the page asks in its own dialog; this answers "Cancel"
 
 let fails = 0;
 const check = (label, cond) => { console.log((cond ? "PASS " : "FAIL ") + label); if (!cond) fails++; };
@@ -76,7 +77,7 @@ const bulk = rf.querySelector("button[name=bulk]");
 const e2 = new window.SubmitEvent("submit", { cancelable: true, bubbles: true, submitter: bulk });
 rf.dispatchEvent(e2);
 console.log("   bulk confirm:", confirmMsg);
-check("bulk record confirms count and total (flagged lines excluded)", /^Record 2 transactions totalling 510,000\.00 in QuickBooks\?$/.test(confirmMsg || ""));
+check("bulk record confirms count and total (flagged lines excluded)", /^Record 2 transactions totalling 510,000\.00 in QuickBooks\?/.test(confirmMsg || ""));
 
 // The account box: type to search, closest first, clear to leave the line unrecorded.
 const tr = [...d.querySelectorAll(".rectbl tr")].find(r => r.textContent.includes("NEW EXPENSE"));
