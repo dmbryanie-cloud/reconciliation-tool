@@ -117,6 +117,13 @@ st = admin.get("/settings").data.decode()
 check("settings page: QuickBooks card, rules, sign-off, backup", "QuickBooks Online" in st and 'name=date_days value="5"' in st
       and "Sign-off and month end" in st and "Download a backup now" in st)
 admin.post("/settings", data={"action": "rules", "date_days": "3", "clear_days": "31", "transfer_days": "4", "charges_exact": "1"})
+check("settings lists the bank accounts with Show ticks", "<h2>Bank accounts</h2>" in st and st.count("class=acc name=active") == 2)
+r = admin.post("/accounts", data={"to": "settings", "active": [STB]})
+check("hiding one from Settings returns there and hides it", r.headers["Location"].endswith("/settings#banks")
+      and q("SELECT is_active FROM account WHERE account_id=%s", (DF,)) == [(False,)]
+      and ">DFCU UGX<" not in admin.get("/").data.decode().split("</aside>")[0])
+admin.post("/accounts", data={"to": "settings", "active": [STB, DF]})
+check("…and ticking it again brings it back", ">DFCU UGX<" in admin.get("/").data.decode().split("</aside>")[0])
 
 # ---- reports, search, sign-in ---------------------------------------------------------------------------------------
 rp = admin.get("/reports").data.decode()
@@ -127,6 +134,34 @@ check("search by text", "MYSTERY" in admin.get("/search?q=myst").data.decode())
 li = A.app.test_client().get("/login").data.decode()
 check("sign-in page: ReconBook, the company, a show-password eye", "<b>ReconBook</b>" in li and "THE NORTH GREEN SCHOOL" in li
       and "class=pw-toggle" in li and 'aria-label="Show password"' in li)
+
+# ---- one reconciliation per account per period; Reports actions ------------------------------------------------------
+n0 = q("SELECT count(*) FROM statement WHERE account_id=%s", (STB,))[0][0]
+r = upload(admin, "Stanbic UGX", [("2026-09-10", "SUPPLIER X", -80000), ("2026-09-12", "MYSTERY", -1000)])
+m = msg(admin.get("/account/Stanbic UGX").data.decode())
+check("re-uploading overlapping dates replaces the open reconciliation (one per period)",
+      q("SELECT count(*) FROM statement WHERE account_id=%s", (STB,))[0][0] == n0 and "replaces the earlier reconciliation" in m)
+sid = q("SELECT statement_id::text FROM statement WHERE account_id=%s", (STB,))[0][0]
+q("UPDATE statement SET signed_off_at=now(), signed_off_by='Jane' WHERE statement_id=%s RETURNING 1", (sid,))
+upload(admin, "Stanbic UGX", [("2026-09-20", "LATE", -5)])
+check("…but never over a signed-off one", "already has a signed-off reconciliation" in msg(admin.get("/account/Stanbic UGX").data.decode())
+      and q("SELECT statement_id::text FROM statement WHERE account_id=%s", (STB,)) == [(sid,)])
+rp = admin.get("/reports").data.decode()
+check("reports: each row has Open report and a menu", rp.count("Open report</a>") >= 2 and "History of this account" in rp)
+check("…a signed-off one offers Undo sign-off, not Delete", "Undo sign-off</button>" in rp and "undo the sign-off to delete it" in rp)
+admin.post("/reports/delete", data={"s": sid})
+check("…deleting a signed-off one is refused", q("SELECT count(*) FROM statement WHERE statement_id=%s", (sid,))[0][0] == 1)
+r = admin.post(f"/account/Stanbic UGX/reopen", headers={"Referer": "http://localhost/reports"})
+check("undo sign-off from Reports returns to Reports", r.headers["Location"].endswith("/reports")
+      and q("SELECT signed_off_at FROM statement WHERE statement_id=%s", (sid,)) == [(None,)])
+# an old duplicate (from before the rule) is flagged so it can be deleted
+dup = q("""INSERT INTO statement (org_id, account_id, period_start, period_end, opening_balance, closing_balance, currency, created_at)
+           VALUES (%s,%s,'2026-09-05','2026-09-25',0,0,'UGX', now() - interval '1 day') RETURNING statement_id::text""", (A.ORG_ID, STB))[0][0]
+rp = admin.get("/reports").data.decode()
+check("overlapping reconciliations are flagged on Reports", "Overlaps another" in rp and "overlap another for the same account" in rp.replace("overlaps another", "overlap another"))
+admin.post("/reports/delete", data={"s": dup})
+check("delete one: gone from the app, the other kept", q("SELECT count(*) FROM statement WHERE statement_id=%s", (dup,))[0][0] == 0
+      and q("SELECT count(*) FROM statement WHERE statement_id=%s", (sid,))[0][0] == 1 and "Overlaps another" not in admin.get("/reports").data.decode())
 
 # ---- the page's dialog, menus and panels in a browser ---------------------------------------------------------------
 node = shutil.which("node")

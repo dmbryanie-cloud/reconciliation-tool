@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from psycopg2.extras import execute_values
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta, date
-from flask import Flask, has_request_context, render_template_string, request, redirect, session, url_for, Response
+from flask import Flask, g, has_request_context, render_template_string, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
@@ -2392,7 +2392,7 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <dt>Company</dt><dd>{{ company or '—' }}</dd>
 <dt>Home currency</dt><dd>{{ home or '—' }}</dd>
 <dt>Last sync</dt><dd>{{ last_sync or 'Not synced yet' }}</dd>
-<dt>Bank accounts shown</dt><dd>{{ n_active }} of {{ n_accts }} · <a href="{{ url_for('manage_accounts') }}" class=lnk>choose</a></dd>
+<dt>Bank accounts shown</dt><dd>{{ n_active }} of {{ n_accts }} · <a href="#banks" class=lnk>choose below</a></dd>
 </dl>
 <div class=ptools>
 {% if qbo_connected %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=to value=settings><button type=submit class="btn-sm pri">Sync now</button></form>
@@ -2409,6 +2409,18 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <button type=submit class=btn-sm>Save token</button></form>
 <div class=hint style="margin-top:6px">For support use: a refresh token from the Intuit OAuth Playground connects the app without the redirect URI.</div></details>
 </div>
+
+<form method=post class="panel wide" id=banks action="{{ url_for('manage_accounts') }}"><input type=hidden name=to value=settings>
+<div class=panel-h><h2>Bank accounts</h2><span class=faint>{{ n_active }} of {{ n_accts }} shown</span><span class=r>
+<button type=button class=btn-sm onclick="this.form.querySelectorAll('.acc').forEach(function(c){c.checked=true})">Select all</button>
+<button type=button class=btn-sm onclick="this.form.querySelectorAll('.acc').forEach(function(c){c.checked=c.dataset.hastxn=='1'})">Only ones with data</button>
+<button type=submit class="btn-sm pri">Save</button></span></div>
+<div class=help style="padding:8px 14px 0">Tick the accounts you reconcile. Hiding one never deletes anything: it keeps syncing and keeps its history, and you can tick it again any time.</div>
+<table><thead><tr><th style="width:60px">Show</th><th>Account</th><th>Type</th><th>Currency</th><th class=a>Transactions</th></tr></thead><tbody>
+{% for r in accts %}<tr><td><input type=checkbox class=acc name=active value="{{ r.id }}" data-hastxn="{{ '1' if r.n else '0' }}" {% if r.active %}checked{% endif %} aria-label="Show {{ r.name }}"></td>
+<td><b>{{ r.name }}</b></td><td>{{ 'Credit card' if r.type=='credit_card' else 'Bank' }}</td><td>{{ r.currency or '' }}</td><td class=a>{{ r.n }}</td></tr>
+{% else %}<tr><td colspan=5 class=muted>No bank accounts yet. Connect QuickBooks and sync; its bank and card accounts appear here.</td></tr>{% endfor %}
+</tbody></table></form>
 
 <form method=post class=panel action="{{ url_for('settings') }}"><input type=hidden name=action value=rules>
 <div class=panel-h><h2>Matching rules</h2><span class=r><button type=submit class="btn-sm pri">Save rules</button></span></div>
@@ -2434,6 +2446,7 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <style>.setgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
 .kv{display:grid;grid-template-columns:150px minmax(0,1fr);gap:7px 14px;padding:12px 14px;margin:0}.kv dt{color:var(--muted)}.kv dd{margin:0;font-weight:500}
 .lnk{color:var(--accent);font-weight:600}
+.setgrid>.wide{grid-column:1/-1}.acc{width:16px;height:16px;accent-color:var(--navy)}
 .ptools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--line-soft)}.ptools form{margin:0}
 .opt{display:flex;gap:12px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line-soft);cursor:pointer}
 .opt span{flex:1;min-width:0}.opt small{display:block;color:var(--faint)}
@@ -2470,6 +2483,11 @@ def settings():
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT count(*), count(*) FILTER (WHERE coalesce(is_active,true)) FROM account;")
     n_accts, n_active = cur.fetchone()
+    cur.execute("SELECT account_id, count(*) FROM book_txn GROUP BY account_id;")
+    counts = {str(a): n for a, n in cur.fetchall()}
+    cur.execute("SELECT account_id, name, type, currency, coalesce(is_active,true) FROM account ORDER BY type, name;")
+    accts = [{"id": str(a), "name": n, "type": t, "currency": (c or "").strip(), "active": act, "n": counts.get(str(a), 0)}
+             for a, n, t, c, act in cur.fetchall()]
     try:
         home = qbo_home_currency(cur)
     except Exception:
@@ -2477,7 +2495,7 @@ def settings():
     cur.close(); conn.close()
     return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(),
                                   company=get_config("company_name"), home=home, last_sync=last_sync_label(),
-                                  n_accts=n_accts, n_active=n_active, rules={k: rule(k) for k in RULES})
+                                  n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES})
 
 
 REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reports · ReconBook</title>""" + CSS + """</head><body>
@@ -2485,12 +2503,22 @@ REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <div class=ph><div><h1>Reports</h1><div class=meta>Every reconciliation, newest period first. Open one to print or save it as a PDF.</div></div>
 <div class=acts><form method=get class=btnrow><select name=status class=btn-sm onchange="this.form.submit()" aria-label="Show">
 <option value="">All reconciliations</option><option value=signed {% if status=='signed' %}selected{% endif %}>Signed off</option><option value=open {% if status=='open' %}selected{% endif %}>In progress</option></select></form></div></div>
+{% if msg %}<div id=flash role=status>{{ msg }}</div>{% endif %}
+{% if n_overlap %}<div class="recnote bad">{{ n_overlap }} reconciliation{{ '' if n_overlap == 1 else 's' }} overlap{{ 's' if n_overlap == 1 else '' }} another for the same account. Each account should have one per period: delete the one you don't need (⋯ menu).</div>{% endif %}
 <div class=panel><table>
 <thead><tr><th>Period</th><th>Account</th><th>Currency</th><th>Status</th><th>Prepared by</th><th>Approved by</th><th></th></tr></thead><tbody>
-{% for r in rows %}<tr><td>{{ r.ps.strftime('%d %b') }} – {{ r.pe.strftime('%d %b %Y') }}</td><td><a href="{{ url_for('detail', name=r.name) }}"><b>{{ r.name }}</b></a></td><td>{{ r.ccy }}</td>
+{% for r in rows %}<tr><td>{{ r.ps.strftime('%d %b') }} – {{ r.pe.strftime('%d %b %Y') }}{% if r.overlap %}<br><span class="pill bad" title="Overlaps {{ r.overlap }}">Overlaps another</span>{% endif %}</td>
+<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}..."><b>{{ r.name }}</b></a>{% if r.latest %} <span class=faint style="font-size:11.5px">· current</span>{% endif %}</td><td>{{ r.ccy }}</td>
 <td>{% if r.signed %}<span class="pill ok">Signed off {{ r.signed.strftime('%d %b %Y') }}</span>{% else %}<span class="pill attn">In progress</span>{% endif %}</td>
 <td>{{ r.prep or '—' }}</td><td>{{ r.by or '—' }}</td>
-<td class=a><a class=btn-sm href="{{ url_for('report', name=r.name, s=r.id) }}" target=_blank rel=noopener>Open report</a> <a class=btn-sm href="{{ url_for('history', name=r.name) }}">History</a></td></tr>
+<td class=a><div class=btnrow style="justify-content:flex-end"><a class=btn-sm href="{{ url_for('report', name=r.name, s=r.id) }}" target=_blank rel=noopener title="Open the printable report">Open report</a>
+<span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ r.name }} {{ r.pe.strftime('%b %Y') }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+<a href="{{ url_for('detail', name=r.name) }}">Open the account</a>
+<a href="{{ url_for('history', name=r.name) }}">History of this account</a>
+{% if r.signed and r.latest and can('reopen') %}<form method=post action="{{ url_for('reopen', name=r.name) }}" data-confirm="Undo the sign-off of {{ r.name }} for {{ r.ps }} to {{ r.pe }}? It goes back to in progress; sign it off again afterwards."><button type=submit>Undo sign-off</button></form>{% endif %}
+{% if can('users') %}<div class=sep></div>{% if r.signed %}<span class=dh style="text-transform:none;letter-spacing:0">Signed off: undo the sign-off to delete it</span>
+{% else %}<form method=post action="{{ url_for('delete_reconciliation') }}" data-confirm="Delete the reconciliation of {{ r.name }} for {{ r.ps }} to {{ r.pe }}? Its statement lines, matches and review work are removed from the app. QuickBooks is not changed: anything already recorded there stays."><input type=hidden name=s value="{{ r.id }}"><button type=submit class=danger>Delete this reconciliation</button></form>{% endif %}{% endif %}
+</div></span></div></td></tr>
 {% else %}<tr><td colspan=7 class=muted>No reconciliations yet. Upload a statement on a bank account to start.</td></tr>{% endfor %}
 </tbody></table></div>
 </div>""" + SHELL_END + """</body></html>"""
@@ -2501,15 +2529,45 @@ def reports():
     status = request.args.get("status") or ""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""SELECT s.statement_id, a.name, a.currency, s.period_start, s.period_end, s.signed_off_at, s.signed_off_by,
-                          s.prepared_by
+                          s.prepared_by,
+                          s.statement_id = (SELECT statement_id FROM statement WHERE account_id = s.account_id
+                                            ORDER BY created_at DESC LIMIT 1),
+                          (SELECT string_agg(o.period_start || ' to ' || o.period_end, ', ') FROM statement o
+                           WHERE o.account_id = s.account_id AND o.statement_id <> s.statement_id
+                             AND o.period_start <= s.period_end AND o.period_end >= s.period_start)
                    FROM statement s JOIN account a ON a.account_id = s.account_id
                    WHERE coalesce(a.is_active, true)
                      AND (%s = '' OR (%s = 'signed') = (s.signed_off_at IS NOT NULL))
                    ORDER BY s.period_end DESC, a.name LIMIT 500;""", (status, status))
-    rows = [{"id": str(i), "name": n, "ccy": (c or "").strip(), "ps": ps, "pe": pe, "signed": so, "by": by, "prep": pr}
-            for i, n, c, ps, pe, so, by, pr in cur.fetchall()]
+    rows = [{"id": str(i), "name": n, "ccy": (c or "").strip(), "ps": ps, "pe": pe, "signed": so, "by": by, "prep": pr,
+             "latest": latest, "overlap": ov}
+            for i, n, c, ps, pe, so, by, pr, latest, ov in cur.fetchall()]
     cur.close(); conn.close()
-    return render_template_string(REPORTS_TEMPLATE, rows=rows, status=status)
+    return render_template_string(REPORTS_TEMPLATE, rows=rows, status=status, msg=session.pop("sync_msg", None),
+                                  n_overlap=sum(1 for r in rows if r["overlap"]))
+
+
+@app.route("/reports/delete", methods=["POST"])
+def delete_reconciliation():
+    """Delete one reconciliation (not signed off) from the app. QuickBooks is not changed."""
+    sid = request.form.get("s") or ""
+    conn = get_conn(); cur = conn.cursor()
+    row = None
+    if _is_uuid(sid):
+        cur.execute("""SELECT a.name, s.period_start, s.period_end, s.signed_off_at FROM statement s
+                       JOIN account a ON a.account_id = s.account_id WHERE s.statement_id = %s;""", (sid,))
+        row = cur.fetchone()
+    if not row:
+        session["sync_msg"] = "Nothing deleted: that reconciliation wasn't found."
+    elif row[3]:
+        session["sync_msg"] = "Not deleted: it's signed off. Undo the sign-off first."
+    else:
+        delete_statements(cur, [sid])
+        conn.commit()
+        session["sync_msg"] = f"Deleted the reconciliation of {row[0]} for {row[1]} to {row[2]}. QuickBooks was not changed."
+        log_activity(f"deleted the reconciliation for {row[1]} to {row[2]}", row[0])
+    cur.close(); conn.close()
+    return redirect(url_for("reports"))
 
 
 SEARCH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Search · ReconBook</title>""" + CSS + """</head><body>
@@ -2589,6 +2647,11 @@ def manage_accounts():
             cur.execute("UPDATE account SET is_active=false WHERE account_id::text = ANY(%s);", (off,))
         conn.commit()
         msg = f"Saved — {len(on)} account{'' if len(on)==1 else 's'} showing, {len(off)} hidden."
+        log_activity(f"changed which bank accounts are shown ({len(on)} shown, {len(off)} hidden)")
+        if request.form.get("to") == "settings":
+            cur.close(); conn.close()
+            session["sync_msg"] = msg
+            return redirect(url_for("settings") + "#banks")
     # one grouped query for counts, rather than one per account
     cur.execute("SELECT account_id, count(*) FROM book_txn GROUP BY account_id;")
     counts = {str(a): n for a, n in cur.fetchall()}
@@ -2948,7 +3011,7 @@ PERM_BY_ENDPOINT = {
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
     "transfer_change": "record", "record_reset": "record",
     "transfer_undo": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
-    "signoff": "signoff", "reopen": "reopen",
+    "signoff": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
     "set_token": "users", "disconnect": "users", "check_connection": "users", "connect": "users",
     "schema_dump": "users", "qbo_info": "users"}
@@ -3693,6 +3756,21 @@ def _resolve_period(cur, acct_uuid, rows, p_start=None, p_end=None):
     return p_start, p_end
 
 
+def delete_statements(cur, ids):
+    """Remove reconciliations (statements) from the app: their bank lines, matches and work in progress.
+    QuickBooks is never touched; entries already recorded there stay and match again on a new upload."""
+    ids = [str(i) for i in ids]
+    if not ids:
+        return
+    cur.execute("SELECT line_id FROM statement_line WHERE statement_id = ANY(%s::uuid[]);", (ids,))
+    lines = [str(r[0]) for r in cur.fetchall()]
+    if lines:
+        for t in ("record_draft", "transfer_dismissal"):
+            cur.execute(f"DELETE FROM {t} WHERE line_id = ANY(%s::uuid[]);", (lines,))
+    cur.execute("DELETE FROM match WHERE statement_id = ANY(%s::uuid[]);", (ids,))
+    cur.execute("DELETE FROM statement WHERE statement_id = ANY(%s::uuid[]);", (ids,))   # lines go with it
+
+
 def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None):
     if not rows: raise ValueError("No transactions found in the file.")
     conn = get_conn(); cur = conn.cursor()
@@ -3710,8 +3788,22 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     if closing is None and getattr(rows, "closing", None) is not None:
         closing, c_src = rows.closing, "file"
     opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src)
-    cur.execute("DELETE FROM statement WHERE account_id=%s AND period_start=%s AND period_end=%s;",
-                (acct_uuid, p_start, p_end))
+    # One reconciliation per account per period: a statement whose dates overlap this one is replaced,
+    # unless it's signed off (then the upload is refused until it's reopened or deleted).
+    cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at FROM statement
+                   WHERE account_id=%s AND period_start <= %s AND period_end >= %s ORDER BY period_start;""",
+                (acct_uuid, p_end, p_start))
+    overlap = cur.fetchall()
+    signed = [o for o in overlap if o[3]]
+    if signed:
+        cur.close(); conn.close()
+        raise ValueError(f"Not uploaded: this account already has a signed-off reconciliation for {signed[0][1]} to "
+                         f"{signed[0][2]}, which these dates ({p_start} to {p_end}) overlap. Undo its sign-off, or "
+                         f"delete it under Reports, then upload again.")
+    if overlap:
+        delete_statements(cur, [o[0] for o in overlap])
+        if has_request_context():
+            g.replaced = "; ".join(f"{o[1]} to {o[2]}" for o in overlap)
     cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end,
                    opening_balance, closing_balance, opening_source, closing_source, currency, source_format, prepared_by)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
@@ -3998,7 +4090,7 @@ def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
 
 DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Dashboard · ReconBook</title>""" + CSS + """</head><body>
 """ + SHELL_TOP + """<div class=wrap>
-<div class=ph><div><h1>{{ month_label }} close</h1><div class=meta>{{ rows|length }} bank account{{ '' if rows|length == 1 else 's' }} · {{ n_signed }} signed off{% if n_hidden %} · {{ n_hidden }} hidden{% if can('settings') %} (<a href="{{ url_for('manage_accounts') }}" class=lnk>choose</a>){% endif %}{% endif %} · updated {{ now }}</div></div>
+<div class=ph><div><h1>{{ month_label }} close</h1><div class=meta>{{ rows|length }} bank account{{ '' if rows|length == 1 else 's' }} · {{ n_signed }} signed off{% if n_hidden %} · {{ n_hidden }} hidden{% if can('settings') %} (<a href="{{ url_for('settings') }}#banks" class=lnk>choose</a>){% endif %}{% endif %} · updated {{ now }}</div></div>
 {% if months|length > 1 %}<div class=acts><form method=get><select name=m class=btn-sm onchange="this.form.submit()" aria-label="Month">{% for v, lab in months %}<option value="{{ v }}" {% if v == month %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></form></div>{% endif %}</div>
 {% if sync_msg %}<div id=flash role=status>{{ sync_msg }}</div>{% endif %}
 {{ sync_banner() }}
@@ -4016,7 +4108,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <span class=who>{% if r.status=='signed' %}Signed off{% if r.by %} by {{ r.by }}{% endif %}<br>{{ r.signed_at.astimezone(eat).strftime('%d %b') }}{% elif r.status=='none' %}Not started{% else %}Prepared {{ r.pct }}%{% if r.prep %}<br>by {{ r.prep }}{% endif %}{% endif %}</span></li>{% endfor %}</ul>
 <div class="due{{ ' late' if overdue else '' }}">{{ 'Overdue: was due' if overdue else 'Due' }} {{ due.strftime('%d %b %Y') }}<div class="bar{{ '' if n_signed == rows|length else ' attn' }}"><i style="width:{{ (n_signed * 100 / rows|length)|int if rows else 0 }}%"></i></div>{{ (n_signed * 100 / rows|length)|int if rows else 0 }}%</div></div>
 </div>
-<div class=panel><div class=panel-h><h2>Bank accounts</h2>{% if can('settings') %}<span class=r><a class=btn-sm href="{{ url_for('manage_accounts') }}">Choose accounts</a></span>{% endif %}</div>
+<div class=panel><div class=panel-h><h2>Bank accounts</h2>{% if can('settings') %}<span class=r><a class=btn-sm href="{{ url_for('settings') }}#banks">Choose accounts</a></span>{% endif %}</div>
 <div class=tw><table>
 <thead><tr><th>Account</th><th>Currency</th><th>Statement period</th><th style="min-width:170px">Progress</th><th>Status</th><th class=a>Difference</th><th>Prepared / approved</th><th></th></tr></thead>
 <tbody>{% for r in rows %}<tr data-status="{{ r.status }}">
@@ -5661,6 +5753,9 @@ def upload(name):
             sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), f.filename, name, opening, closing,
                                           _form_date("period_start"), _form_date("period_end"))
         note = run_matcher(sid)
+    except ValueError as e:
+        session["detail_msg"] = str(e)
+        return redirect(url_for("detail", name=name))
     except Exception as e:
         return f"Could not process file: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     # Fresh books come from a background sync, never inside this request: even a quick one
@@ -5674,7 +5769,10 @@ def upload(name):
                          " A QuickBooks sync is running; this statement is re-matched automatically when it finishes.")
         except Exception as e:
             refreshed = f" (Couldn't start a QuickBooks refresh: {e}. Matched against the last sync.)"
-    log_activity(f"uploaded a statement ({n} lines)", name)
+    replaced = getattr(g, "replaced", None)
+    log_activity(f"uploaded a statement ({n} lines)" + (f", replacing the one for {replaced}" if replaced else ""), name)
+    if replaced:
+        checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
     session["detail_msg"] = (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
                              + (f" {note}" if note else "") + refreshed)
     return redirect(url_for("detail", name=name))
@@ -6861,7 +6959,11 @@ def reopen(name):
         if srow:
             cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
             conn.commit()
+            log_activity("undid the sign-off", name)
     cur.close(); conn.close()
+    if "/reports" in (request.referrer or ""):
+        session["sync_msg"] = f"Sign-off undone for {name}: it's back in progress."
+        return redirect(url_for("reports"))
     return redirect(url_for("detail", name=name))
 
 

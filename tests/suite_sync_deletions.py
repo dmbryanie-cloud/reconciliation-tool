@@ -195,6 +195,11 @@ def watching_query(entity, token, since=None, changed_since=None, each=None):
     return fake_query(entity, token, since, changed_since, each)
 A.qbo_query = watching_query
 r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+            "period_start": "2026-09-01", "period_end": "2026-09-15"}, content_type="multipart/form-data", follow_redirects=True)
+check("one reconciliation per period: an upload overlapping a signed-off one is refused",
+      "already has a signed-off reconciliation" in r.get_data(as_text=True) and "seen" and not seen)
+cur.execute("UPDATE statement SET signed_off_at=NULL"); c.commit()   # reopened
+r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data", follow_redirects=True)
 page = r.get_data(as_text=True)
 A.qbo_query = fake_query
