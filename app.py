@@ -1724,7 +1724,16 @@ tr:hover>td{background:var(--row)}
 .tag.bf{background:var(--none-soft);color:var(--none)}
 .tag.pending{background:var(--warn-soft);color:var(--warn)}
 .hint{color:var(--faint);font-size:11.5px;line-height:1.4;white-space:normal}
-.rectbl td{vertical-align:top}
+.rectbl td,.rectbl th{vertical-align:top;padding:5px 6px}.rectbl td:first-child,.rectbl th:first-child{padding-left:10px;width:24px}.rectbl td.desc{max-width:230px;min-width:120px}
+.rectbl .dupwarn{font-size:11.5px;padding:5px 8px}
+/* Type, account and Split on one line; the reason for the guess on one short line under them. */
+.acell{display:flex;flex-wrap:wrap;gap:3px 6px;align-items:center;width:375px;max-width:100%}
+.acell>.ttype{margin:0;width:148px;order:0}
+.acell>.acctbox{width:165px;order:1}.acell.xo>.acctbox{width:300px}
+.acell>.rowtools{margin:0;order:2;flex-wrap:nowrap}
+.acell>.xrate{order:3}
+.acell>.ttype-why,.acell>.hint{order:9;flex:0 0 100%;min-width:0;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;line-height:1.3}
+.rectbl td.desc .hint{font-size:11px;line-height:1.3}
 /* Bank wording with no spaces (FXPLOU~1110179~FWD~BUY~USD/UGX~3,840.0000) wraps inside its cell instead of
    running into the amount beside it; dates and amounts stay on one line. */
 td.desc{white-space:normal;overflow-wrap:anywhere;word-break:break-word;min-width:140px;max-width:300px}
@@ -1745,7 +1754,7 @@ td.a{white-space:nowrap}
 .acct-list .ag{padding:7px 10px 3px;font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
 .acct-list .none{padding:9px 10px;font-size:12px;color:var(--muted);white-space:normal}
 .acctbox.off{opacity:.45}
-.custbox{position:relative;width:160px;max-width:100%}
+.custbox{position:relative;width:135px;max-width:100%}
 .custbox .acct-q{width:100%;box-sizing:border-box;padding:3px 24px 3px 7px}
 .custbox .acct-q.bad{border-color:#d97706;background:#fffbeb}
 .custbox .acct-x{position:absolute;right:2px;top:1px;border:0;background:none;color:var(--faint);font-size:16px;line-height:1;cursor:pointer;padding:2px 5px}
@@ -1828,7 +1837,7 @@ td.a{white-space:nowrap}
 .me{display:flex;align-items:center;gap:9px;padding:4px 2px;cursor:pointer;border-radius:6px;width:100%;background:none;border:0;text-align:left;color:inherit;font:inherit}
 .me .av{width:28px;height:28px;border-radius:50%;background:var(--gold);color:var(--navy);display:grid;place-items:center;font-weight:700;font-size:12px;flex:none}
 .me b{color:#fff;font-weight:600;display:block;font-size:12.5px}.me small{font-size:11px;color:#8d99b1}
-.main{min-width:0;display:flex;flex-direction:column;min-height:100vh}
+.app>.main{min-width:0;display:flex;flex-direction:column;min-height:100vh}
 .topbar{display:flex;align-items:center;gap:12px;padding:9px 24px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;min-height:46px}
 .crumb{color:var(--muted);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.crumb b{color:var(--ink);font-weight:600}
 .crumb a:hover{color:var(--ink)}
@@ -4415,13 +4424,13 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
-<td>{% if not w.xfer_only %}<select class=ttype aria-label="Transaction type" data-guess="{{ w.ttype or '' }}" title="{{ w.ttype_why or 'Narrow the accounts to one kind of transaction' }}"></select>{% if w.ttype_why %}<div class="hint ttype-why">{{ w.ttype_why }}</div>{% endif %}{% endif %}<div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
+<td><div class="acell{{ ' xo' if w.xfer_only else '' }}">{% if not w.xfer_only %}<select class=ttype aria-label="Transaction type" data-guess="{{ w.ttype or '' }}" title="{{ w.ttype_why or 'Narrow the accounts to one kind of transaction' }}"></select>{% if w.ttype_why %}<div class="hint ttype-why" title="{{ w.ttype_why }}">{{ w.ttype_why }}</div>{% endif %}{% endif %}<div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
 {% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
 <input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
 <input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
 {% if x_ccy and not w.out %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class="rate xrate" inputmode=decimal hidden placeholder="{{ acct_ccy }} per {{ x_ccy }}" aria-label="{{ x_ccy }} rate" title="The rate the {{ acct_ccy }} received converts to the student's {{ x_ccy }} account at ({{ acct_ccy }} per {{ x_ccy }}). Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}
 {% if w.hedge %}<input type=hidden name="hedge_{{ w.line_id }}" class=hedge-on value="{{ '1' if w.hedge_on else '' }}">{% endif %}
-{% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id and not w.saved %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug and not w.saved %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</td>
+{% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id and not w.saved %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug and not w.saved %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</div></td>
 <td><div class=custbox data-sel="{{ w.vend }}"><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class="payee acct-q" autocomplete=off aria-label="Payee"><button type=button class=acct-x title="Clear the customer" aria-label="Clear customer">&times;</button><input type=hidden name="cust_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1 {% if w.dupok %}checked{% endif %}> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
 <td><button type=submit name=only value="{{ w.line_id }}" class=btn-sm data-busy="Recording this line in QuickBooks...">Record</button></td>
 {% endif %}
@@ -4925,7 +4934,7 @@ document.querySelectorAll('.wrap table').forEach(function(tbl,ti){
 .dsec-chev{display:inline-block;width:12px;font-size:9px;color:var(--faint);transition:transform .15s}.dsec.closed .dsec-chev{transform:rotate(-90deg)}
 .dsec-badge{margin-left:auto;font-size:11.5px;font-weight:600;padding:1px 9px;border-radius:999px;white-space:nowrap}
 .dsec.attn .dsec-badge{background:var(--warn-soft);color:var(--warn)}.dsec.ready .dsec-badge{background:var(--gold-soft);color:#7a5d0e}.dsec.done .dsec-badge{background:var(--ok-soft);color:var(--ok)}
-.dsec-body{border-top:1px solid var(--line-soft);padding:10px 14px 4px}
+.dsec-body{border-top:1px solid var(--line-soft);padding:10px 10px 4px}
 .dsec-body>table:first-child,.dsec-body>.help:first-child{margin-top:0}</style>
 <script>(function(){
 // Each section heading folds its section. Sections that need work come first and start open; finished
