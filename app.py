@@ -1792,7 +1792,8 @@ td.a{white-space:nowrap}
 #loadingov .spin{width:38px;height:38px;border:3px solid var(--line);border-top-color:var(--navy);border-radius:50%;animation:spin .8s linear infinite}
 #loadingov .msg{color:var(--muted);font-size:13px;font-weight:600}
 @keyframes spin{to{transform:rotate(360deg)}}
-.appfoot{padding:18px 24px 30px;color:var(--faint);font-size:12px}.appfoot a{color:var(--muted)}.appfoot a:hover{color:var(--ink)}
+/* The footer sits at the bottom of the window (or below the content when it's longer), centred. */
+.appfoot{margin-top:auto;padding:14px 24px 18px;border-top:1px solid var(--line);background:var(--panel);color:var(--faint);font-size:12px;text-align:center}.appfoot a{color:var(--muted)}.appfoot a:hover{color:var(--ink)}
 .pw-wrap{position:relative}
 .pw-wrap input{padding-right:42px !important}
 .pw-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:auto;height:auto;margin:0;padding:6px;background:none;border:none;border-radius:6px;cursor:pointer;color:var(--faint);display:flex}
@@ -1827,7 +1828,7 @@ td.a{white-space:nowrap}
 .me{display:flex;align-items:center;gap:9px;padding:4px 2px;cursor:pointer;border-radius:6px;width:100%;background:none;border:0;text-align:left;color:inherit;font:inherit}
 .me .av{width:28px;height:28px;border-radius:50%;background:var(--gold);color:var(--navy);display:grid;place-items:center;font-weight:700;font-size:12px;flex:none}
 .me b{color:#fff;font-weight:600;display:block;font-size:12.5px}.me small{font-size:11px;color:#8d99b1}
-.main{min-width:0;display:flex;flex-direction:column}
+.main{min-width:0;display:flex;flex-direction:column;min-height:100vh}
 .topbar{display:flex;align-items:center;gap:12px;padding:9px 24px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;min-height:46px}
 .crumb{color:var(--muted);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.crumb b{color:var(--ink);font-weight:600}
 .crumb a:hover{color:var(--ink)}
