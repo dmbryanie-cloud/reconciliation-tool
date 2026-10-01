@@ -22,6 +22,8 @@ const sum = () => d.getElementById("mmsum").textContent;
 const go = () => d.getElementById("mmgo");
 
 check("no script errors on load", errors.length === 0);
+// "Any type": the full list (each line's Type starts on a guess, which narrows it)
+d.querySelectorAll(".ttype").forEach(t => { t.value = ""; });
 const boxes0 = [...d.querySelectorAll(".acctbox")];
 const fire = (el, type, init = {}) => el.dispatchEvent(new window[type === "keydown" ? "KeyboardEvent" : "Event"](type, { bubbles: true, cancelable: true, ...init }));
 const opts = b => [...b.querySelectorAll(".acct-list .ao")].map(o => o.firstChild.textContent);

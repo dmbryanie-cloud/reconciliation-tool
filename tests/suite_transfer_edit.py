@@ -79,6 +79,19 @@ check("…only this account's lines can be hidden from here", q("SELECT count(*)
 cl.post("/account/Stanbic UGX/transfer_restore", data={"line": S1, "other": f"line:{D1}"})
 check("Restore brings it back", f'name=other value="{D1}"' in section(page()) and "Not a transfer’" not in section(page()))
 
+# ---- bulk: tick several and mark them all 'Not a transfer' ---------------------------------------------------------
+sec = section(page())
+check("each suggestion has a tick box for the bulk 'Not a transfer'", f'name=pick value="{S1}|line:{D1}" form=xferbulk' in sec
+      and "id=xferbulk" in sec and "xb-all" in sec)
+cl.post("/account/Stanbic UGX/transfer_dismiss", data={"pick": [f"{S1}|line:{D1}", f"{D1}|line:x", "junk"]})
+bm = msg()
+check("bulk hides the ticked ones (only this account's lines)", q("SELECT line_id::text, other FROM transfer_dismissal") == [(S1, f"line:{D1}")]
+      and "Hidden" in bm)
+cl.post("/account/Stanbic UGX/transfer_dismiss", data={})
+check("…nothing ticked: nothing hidden, and it says so", "Nothing hidden" in msg())
+cl.post("/account/Stanbic UGX/transfer_restore", data={"line": S1, "other": f"line:{D1}"})
+check("…and they restore one by one", q("SELECT count(*) FROM transfer_dismissal")[0][0] == 0)
+
 # ---- Edit: a different counterpart ---------------------------------------------------------------------------------
 n = len(POSTS)
 cl.post("/account/Stanbic UGX/transfer", data={"line": S1, "other": D2})
@@ -157,6 +170,12 @@ out.acctRadio = row.querySelector(".xe-acct-r").checked;
 const s2 = new w.SubmitEvent("submit", { cancelable: true, bubbles: true }); f.dispatchEvent(s2);
 out.asked = asked;
 row.querySelector(".xe-cancel").click(); out.closedAgain = row.hidden;
+const picks = [...d.querySelectorAll(".xb-pick")], all = d.querySelector(".xb-all"), bf = d.getElementById("xferbulk"), bb = bf.querySelector("button");
+out.bulkOff = bb.disabled; all.click(); out.allTicked = picks.length > 0 && picks.every(p => p.checked); out.bulkLabel = bb.textContent;
+out.n = picks.length; out.inForm = [...new w.FormData(bf).getAll("pick")].length; asked = null;
+const s3 = new w.SubmitEvent("submit", { cancelable: true, bubbles: true }); bf.dispatchEvent(s3);
+out.bulkAsked = asked; out.bulkStopped = s3.defaultPrevented;
+picks[0].click(); out.offAgain = bb.disabled && !all.checked;
 out.errors = errors; console.log(JSON.stringify(out));
 """
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
@@ -173,5 +192,11 @@ out.errors = errors; console.log(JSON.stringify(out));
     check("browser: recording from it needs a line or an account picked", o.get("noPickStopped") and "Pick the matching line" in (o.get("hint") or ""))
     check("browser: choosing an account picks 'Only the account', and it asks before recording",
           o.get("acctRadio") and "Centenary UGX" in (o.get("asked") or "") and "700,000.00" in (o.get("asked") or ""))
+    n = o.get("n")
+    check("browser: bulk button is off until something is ticked; the header box ticks all",
+          o.get("bulkOff") is True and o.get("allTicked") and f"({n})" in (o.get("bulkLabel") or ""))
+    check("browser: the ticked boxes are sent with the bulk form", n and o.get("inForm") == n)
+    check("browser: bulk asks first, with the count", f"Mark {n} suggestion" in (o.get("bulkAsked") or "") and o.get("bulkStopped") is True)
+    check("browser: unticking turns the bulk button off again", o.get("offAgain") is True)
     check("browser: no script errors", o.get("errors") == [])
 sys.exit(T.summary())

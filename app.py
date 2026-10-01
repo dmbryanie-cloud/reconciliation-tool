@@ -1407,6 +1407,36 @@ CHARGE_RE = re.compile(r"\b(charges?|chgs?|fees?|excise|duty|commission|levy)\b"
 NOT_CHARGE_RE = re.compile(r"^\s*chq|\beft:", re.I)   # a cheque or payment to someone, not the bank's charge
 
 
+TYPE_XFER_RE = re.compile(r"\b(transfer|trf|tfr|xfer|sweep|own\s*a/?c|inter[- ]?account|funds?\s*trans)", re.I)
+TYPE_CUST_RE = re.compile(r"\b(fees?|tuition|pupil|student|admission|term\s*[1-3i]+|school\s*pay|schoolpay)\b", re.I)
+TYPE_AP_RE = re.compile(r"\b(rent|landlord)\b", re.I)
+
+
+def guess_type(who, out, amount, sug_kind=None, conf=None, pair=None):
+    """The likely kind of a bank line for the record list's Type box: 'xfer', 'cust' (a student or
+    customer payment), 'ap' (a supplier paid against a payable) or 'gl' (an expense or deposit),
+    with why, so the user can judge how far to trust it. (kind, why) or ('', '')."""
+    if pair:
+        days = abs((pair["date"] - pair["d"]).days) if pair.get("d") else None
+        when = "" if days is None else " the same day" if days == 0 else f", {days} day{'' if days == 1 else 's'} apart"
+        return "xfer", f"Transfer: the same amount moves the other way on {pair['account']}'s statement{when}"
+    pct = f"{conf * 100:.0f}% match" if conf is not None else ""
+    if sug_kind and conf is not None and conf >= 0.6:
+        return sug_kind, f"From how similar lines were posted before ({pct})"
+    if is_bank_charge(who, amount):
+        return "gl", "Bank charges, from the description"
+    text = who or ""
+    if TYPE_XFER_RE.search(text):
+        return "xfer", "The description mentions a transfer"
+    if not out and TYPE_CUST_RE.search(text):
+        return "cust", "The description mentions fees or a student"
+    if out and TYPE_AP_RE.search(text):
+        return "ap", "The description mentions rent"
+    if sug_kind:
+        return sug_kind, f"From similar lines posted before ({pct}, a weak match)"
+    return ("gl", "Most money out is an expense") if out else ("cust", "Most money in is a student or customer payment")
+
+
 def is_bank_charge(text, amount):
     """A bank charge (fee, commission, excise duty...). The bank takes the same small amounts again and
     again, so a charge only ever pairs with a QuickBooks entry on exactly the same date."""
@@ -1622,6 +1652,8 @@ td.a{white-space:nowrap}
 .rectbl select,.rectbl input.payee{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:230px;background:#fff}
 .rectbl select{width:230px}.rectbl input.payee{width:150px}
 .acctbox{position:relative;width:230px;max-width:100%}
+.ttype-why{margin:-2px 0 5px;max-width:230px;white-space:normal}
+.ttype{display:block;width:230px;max-width:100%;margin:0 0 5px;padding:4px 6px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;color:var(--ink);background:var(--panel)}
 .acctbox .acct-q{width:100%;box-sizing:border-box;padding:6px 26px 6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:#fff}
 .acctbox .acct-q.bad{border-color:#d97706;background:#fffbeb}
 .acctbox .acct-x{position:absolute;right:3px;top:4px;border:0;background:none;color:var(--muted);font-size:17px;line-height:1;cursor:pointer;padding:2px 5px}
@@ -3391,6 +3423,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 .secnav a:hover{color:var(--ink)}
 .secnav a .n{opacity:.75;font-variant-numeric:tabular-nums}
 .secnav a.on{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:600}
+.secnav a.attn::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--warn);margin:0 6px 1px 0;vertical-align:middle}
 @media (max-width:760px){.secnav{padding:7px 15px}}
 @media (min-width:1260px){
   /* The menu has its own column beside the content: it scrolls with the page sideways and can't sit over it. */
@@ -3471,7 +3504,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <button class="tile" data-target="sec-exceptions"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><path d="M12 17.6h.01"/></svg></span><span class=t-label>Exceptions</span></div><div class=t-val>{{ writebacks|length + deposits|length + on_stmt|length + in_books|length }}</div></button>
 <button class="tile" data-target="sec-balance"><div class=t-top><span class=t-ic><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v17"/><path d="M7 6.5h10"/><path d="M7 6.5 4 12.8a3 3 0 0 0 6 0L7 6.5Z"/><path d="M17 6.5l-3 6.3a3 3 0 0 0 6 0L17 6.5Z"/><path d="M8.5 20.5h7"/></svg></span><span class=t-label>Unreconciled</span></div><div class=t-val style="color:{{ '#047857' if rec.status=='balanced' else ('#b42318' if rec.status=='out' else '#667085') }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</div></button>
 </div>
-<h2 id=sec-balance style="font-size:15px">Balance reconciliation</h2>
+<h2 id=sec-balance style="font-size:15px" data-sec data-state="{{ 'done' if signed_off else ('ready' if rec.status=='balanced' else 'attn') }}" data-note="{{ ('Signed off ' ~ signed_off) if signed_off else ('Balanced' if rec.status=='balanced' else ('Out of balance' if rec.status=='out' else 'Balances needed')) }}">Balance reconciliation</h2>
 {% set cc = atype=='credit_card' %}
 <div class=recgrid>
 <table class=rec>
@@ -3526,7 +3559,7 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Sign off unbalanced</button></form></details>{% endif %}
 </div>
 {% if reviewable %}
-<h2 id=sec-review style="font-size:15px">Suggested matches{% if n_pending %} — {{ n_pending }} to review{% endif %}</h2>
+<h2 id=sec-review style="font-size:15px" data-sec data-state="{{ 'attn' if n_pending else 'done' }}" data-note="{{ (n_pending ~ ' to review') if n_pending else 'All reviewed' }}">Suggested matches{% if n_pending %} — {{ n_pending }} to review{% endif %}</h2>
 <div class=sub style="margin:-4px 0 12px">These aren't counted until you confirm them.{% if n_signflip %} {{ n_signflip }} {{ 'is an' if n_signflip==1 else 'are' }} opposite-sign pairing{{ '' if n_signflip==1 else 's' }} (same amount, flipped sign) — usually a transfer entered the wrong way round.{% endif %}</div>
 {% if n_pending > 1 %}<form method=post action="{{ url_for('review_all', name=name) }}" style="margin:0 0 4px" onsubmit="return confirm('Confirm all {{ n_pending }} suggested matches?');"><button type=submit class=btn-sm>Confirm all {{ n_pending }}</button></form>{% endif %}
 <table><tr><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
@@ -3543,14 +3576,14 @@ h=id&&document.getElementById(id);if(f&&h&&h.parentNode){f.style.marginTop='8px'
 </form></td>
 </tr>{% endfor %}</table>
 {% endif %}
-<h2 id=sec-matched style="font-size:15px">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
+<h2 id=sec-matched style="font-size:15px" data-sec data-state=done data-note="Matched">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 <table><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
-<h2 id=sec-record style="font-size:15px">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
-<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. Money moved between your own accounts: pick the other account under <em>Transfer</em> and it's recorded as one transfer (same currency only). Money received from a customer: pick <em>Accounts Receivable</em> and the customer, and it's recorded as a payment against their name. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div>
+<h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else 'Recorded \u2014 matches on the next refresh' }}">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
+<div class=sub style="margin:-4px 0 12px">The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer (same currency only); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div>
 {% if rec_job %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">Recording in QuickBooks: <b class=rj-n>{{ rec_job.n }}</b> of {{ rec_job.total }} lines done ({{ rec_job.done }} recorded so far). The list updates when it finishes.</div>
 <script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
 function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
@@ -3559,8 +3592,8 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
 setTimeout(tick,3000)})();</script>{% endif %}
 <form method=post action="{{ url_for('record', name=name) }}" id=recform data-ccy="{{ acct_ccy or '' }}">
 {% if draft_meta %}<div class=savedsel>Showing the selection saved by {{ draft_meta.by or 'a user' }} on {{ draft_meta.at.strftime('%Y-%m-%d %H:%M') }}. <button type=submit formaction="{{ url_for('record_discard', name=name) }}" class=btn-sm data-busy="Discarding the saved selection...">Discard it</button></div>{% endif %}
-<table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Post to account</th><th>Payee</th><th></th></tr>
-{% for w in writebacks + deposits %}<tr data-amt="{{ w.amount }}">
+<table class=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Type and account</th><th>Payee</th><th></th></tr>
+{% for w in record_rows %}<tr data-amt="{{ w.amount }}">
 <td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.sel %}checked{% endif %}><input type=hidden name=rowid value="{{ w.line_id }}">{% endif %}</td>
 <td>{{ w.date }}</td>
 <td class=desc>{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
@@ -3573,7 +3606,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
-<td><div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
+<td>{% if not w.xfer_only %}<select class=ttype aria-label="Transaction type" data-guess="{{ w.ttype or '' }}" title="{{ w.ttype_why or 'Narrow the accounts to one kind of transaction' }}"></select>{% if w.ttype_why %}<div class="hint ttype-why">{{ w.ttype_why }}</div>{% endif %}{% endif %}<div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
 {% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
 <input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
 <input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
@@ -3610,7 +3643,7 @@ function typeLabel(a,dir){return a.x===1?xferLabel[dir]:a.x===2?'Bank and card a
 // Students and families: a receipt is paid to one of them (their UGX or USD account), not to
 // Accounts Receivable in general. The bank's currency first; the other needs a rate.
 var studentList=custs.map(function(c,i){var other=CCY&&c.c&&c.c!==CCY;
-  return {id:'cust:'+c.id,cid:c.id,c:c.c,other:!!other,cust:true,n:c.n,p:c.p||'',rank:-100000+i,low:c.n.toLowerCase(),
+  return {id:'cust:'+c.id,cid:c.id,c:c.c,other:!!other,cust:true,k:'cust',n:c.n,p:c.p||'',rank:-100000+i,low:c.n.toLowerCase(),
           t:'Students and families'+(other?' ('+c.c+', at a rate)':c.c?' ('+c.c+')':'')}});
 // Each picker's accounts: students first for money in, then the usual types for its direction, then
 // the rest, then your own accounts (transfers). A split line can use any bank in the home currency
@@ -3620,7 +3653,7 @@ function accountsFor(dir,split){
   if(dir!=='xfer')coa.forEach(function(a){if(!a.x&&a.t!==AR&&(a.t!==AP||(dir==='out'&&!split)))out.push(a)});
   out.sort(function(a,b){var x=pref.indexOf(a.t),y=pref.indexOf(b.t);x=x<0?99:x;y=y<0?99:y;return x-y||a.t.localeCompare(b.t)||a.n.localeCompare(b.n)});
   coa.forEach(function(a){if(split?a.x===2:a.x===1)out.push(a)});
-  var list=out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ap:a.t===AP,rank:i,low:a.n.toLowerCase()}});
+  var list=out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ap:a.t===AP,k:a.x===1?'xfer':a.x===2?'bank':a.t===AP?'ap':'gl',rank:i,low:a.n.toLowerCase()}});
   return dir==='in'&&!split?studentList.concat(list):list;
 }
 var custList=studentList,vendList=vends.map(function(v,i){return {id:v.id,n:v.n,t:'Supplier',rank:i,low:v.n.toLowerCase()}});
@@ -3708,7 +3741,7 @@ function initBox(box,list,onPick,active){
   var LL=typeof list==='function'?list():list,start=LL.filter(function(a){return a.id===box.getAttribute('data-sel')})[0];
   if(!start&&q.value.trim())start=LL.filter(function(a){return a.low===q.value.trim().toLowerCase()})[0];
   if(start)set(start,false);else vis();
-  return {get:function(){return chosen},refresh:function(){vis();if(!on()){v.value='';q.classList.remove('bad')}}};
+  return {get:function(){return chosen},clear:clear,refresh:function(){vis();if(!on()){v.value='';q.classList.remove('bad')}}};
 }
 function boxHtml(){return '<input type=text class=acct-q placeholder="Type to search accounts" autocomplete=off aria-label="Account"><button type=button class=acct-x aria-label="Clear account">&times;</button><input type=hidden class=acct-v value=""><div class=acct-list role=listbox hidden></div>'}
 document.querySelectorAll('.acctbox.main').forEach(function(box){
@@ -3741,9 +3774,21 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
     }
     kidsRow.hidden=false;ksync(false);
   }
-  var first=true;
-  var main=initBox(box,accountsFor(dir,false),function(a,byUser){
+  var first=true,all=accountsFor(dir,false),tsel=tr.querySelector('.ttype'),TYPES={
+    out:[['gl','Expense (or other account)'],['ap','Supplier payment (a payable)'],['xfer','Transfer to your account']],
+    'in':[['cust','Customer / student payment'],['gl','Deposit (income or other)'],['xfer','Transfer from your account']]};
+  // Type: narrows the account list to one kind (only kinds this line can use are offered).
+  if(tsel){var o0=document.createElement('option');o0.value='';o0.textContent='Any type';tsel.appendChild(o0);
+    (TYPES[dir]||[]).forEach(function(t){if(!all.some(function(a){return a.k===t[0]}))return;
+      var o=document.createElement('option');o.value=t[0];o.textContent=t[1];tsel.appendChild(o)});
+    if(tsel.options.length<3)tsel.hidden=true;
+    var g=tsel.getAttribute('data-guess');if(g&&[].some.call(tsel.options,function(o){return o.value===g}))tsel.value=g;
+    tsel.addEventListener('change',function(){var a=main.get(),why=tr.querySelector('.ttype-why');if(why)why.hidden=true;
+      if(a&&tsel.value&&a.k!==tsel.value){main.clear();var q=box.querySelector('.acct-q');if(q&&q.focus)q.focus()}})}
+  function listed(){var k=tsel&&tsel.value;return k?all.filter(function(a){return a.k===k}):all}
+  var main=initBox(box,listed,function(a,byUser){
     isAr=!!(a&&a.cust);isAp=!!(a&&a.ap);
+    if(tsel&&a&&[].some.call(tsel.options,function(o){return o.value===a.k}))tsel.value=a.k;
     var ph=tr.querySelector('.pickhint');if(ph&&a)ph.remove();
     if(byUser&&cb)cb.checked=!!a&&(!isAp||!!(cust&&cust.get()));
     // A student's account in the other currency: the amount converts at the rate typed here.
@@ -3770,8 +3815,8 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
       else hc.textContent=fmt(u)+' at '+fmt(r)+' = '+fmt(Math.round(u*r*100)/100)+' into FX in Transit (the deal pays '+fmt(Math.round(u*hfwd*100)/100)+')';
       if(byUser&&cb)cb.checked=ok;count();
     };
-    var hopen=function(){hrow.hidden=false;hon.value='1';box.classList.add('off');hq.disabled=true;hbtn.classList.add('on');hsync(false)};
-    var hclose=function(){hrow.hidden=true;hon.value='';box.classList.remove('off');hq.disabled=false;hbtn.classList.remove('on');if(cb)cb.checked=!!main.get();count()};
+    var hopen=function(){hrow.hidden=false;hon.value='1';box.classList.add('off');hq.disabled=true;if(tsel)tsel.disabled=true;hbtn.classList.add('on');hsync(false)};
+    var hclose=function(){hrow.hidden=true;hon.value='';box.classList.remove('off');hq.disabled=false;if(tsel)tsel.disabled=false;hbtn.classList.remove('on');if(cb)cb.checked=!!main.get();count()};
     hbtn.addEventListener('click',function(){if(hrow.hidden){hopen();hsync(true)}else hclose()});
     hrow.querySelector('.hedge-cancel').addEventListener('click',hclose);
     [hr,hu].forEach(function(i){if(i)i.addEventListener('input',function(){hsync(true)})});
@@ -3839,7 +3884,7 @@ count();
 })();</script>
 {% endif %}
 {% if all_unmatched or in_books or user_matches %}
-<h2 id=sec-manual style="font-size:15px">Match manually</h2>
+<h2 id=sec-manual style="font-size:15px" data-sec data-state="{{ 'attn' if all_unmatched and in_books else 'done' }}" data-note="{{ (all_unmatched|length ~ ' bank line' ~ ('' if all_unmatched|length == 1 else 's') ~ ' unmatched') if all_unmatched and in_books else 'Nothing to pair' }}">Match manually</h2>
 <div class=sub style="margin:-4px 0 12px">Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</div>
 {% if user_matches %}
 <table><tr><th>Matched by you</th><th>Statement side</th><th>Books side</th><th class=a>Difference</th><th></th></tr>
@@ -3912,24 +3957,27 @@ document.querySelectorAll('.mm-open').forEach(function(b){b.addEventListener('cl
 document.querySelectorAll('.mm-edit').forEach(function(b){b.addEventListener('click',function(){
   var ls=ids(b,'data-lines'),ts=ids(b,'data-txns');pick(ls,ts,ls.join(',')+'|'+ts.join(','));})});
 var E={{ mm_edit|tojson }};
+if(E){window.__mmOpen=1;}
 if(E)pick(E.l,E.t,E.l.join(',')+'|'+E.t.join(','));
 f.addEventListener('submit',function(e){if(diff!==0&&!confirm('The two sides differ by '+fmt(diff)+'. Match anyway? The difference will show under amount differences.'))e.preventDefault()});
 update(false);
 })();</script>
 {% endif %}
 {% endif %}
-{% if n_xfer or xfer_recorded or xfer_dismissed %}<h2 id=sec-transfers style="font-size:15px">Possible transfers between your own accounts ({{ n_xfer }})</h2>
+{% if n_xfer or xfer_recorded or xfer_dismissed %}<h2 id=sec-transfers style="font-size:15px" data-sec data-state="{{ 'attn' if n_xfer else 'done' }}" data-note="{{ (n_xfer ~ ' to check') if n_xfer else 'None to check' }}">Possible transfers between your own accounts ({{ n_xfer }})</h2>
 <div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 13px;border-radius:9px;font-size:13px;margin:0 0 12px;line-height:1.5">Suggestions only \u2014 check each pair first. A genuine transfer is recorded once, as a Transfer between the two accounts, never as an expense on one and a deposit on the other. <em>Record as one transfer</em> does that and matches both bank lines to it. <em>Edit</em> picks a different counterpart (or just the other account, when its statement isn't uploaded); <em>Not a transfer</em> hides a wrong suggestion.</div>
-{% if n_xfer %}<table class=xfertbl><tr><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
+{% if n_xfer %}<form method=post action="{{ url_for('transfer_dismiss', name=name) }}" id=xferbulk class=xferbar>
+<span class=xb-n>Tick the suggestions that aren't transfers</span><button type=submit class=btn-sm data-busy="Hiding the suggestions..." disabled>Not a transfer (selected)</button></form>
+<table class=xfertbl><tr><th><input type=checkbox class=xb-all title="Select all" aria-label="Select all suggestions"></th><th>Date</th><th>On this statement</th><th class=a>Amount</th><th>Possible counterpart</th><th>Why flagged</th></tr>
 {% for lid, d, a, who in all_unmatched %}{% if xfers.get(lid) %}{% for c in xfers[lid] %}
-<tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
+<tr><td><input type=checkbox name=pick value="{{ lid }}|{{ c.key }}" form=xferbulk class=xb-pick aria-label="Not a transfer"></td><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td>
 <td class=desc><strong>{{ c.account }}</strong><br><span style="color:var(--muted);font-size:12px">{{ c.date }} \u00b7 {{ c.amount|money }}{% if c.who %} \u00b7 {{ c.who }}{% endif %}</span></td>
 <td style="font-size:12px;color:var(--muted);white-space:normal;min-width:220px">{{ c.note }}<div class=btnrow style="margin-top:6px;flex-wrap:wrap">
 {% if c.rule == 'unrecorded' %}{% if not acct_linked or not c.other_linked %}<span>Both accounts must be linked to QuickBooks to record it here.</span>{% elif signed_off or c.other_signed %}<span>A statement is signed off \u2014 reopen it to record this.</span>{% else %}<form method=post action="{{ url_for('record_transfer', name=name) }}" onsubmit="return confirm(this.dataset.q)" data-q="Record one transfer of {{ a|abs|money }} between {{ name }} and {{ c.account }} in QuickBooks, and match both bank lines to it?"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.line_id }}"><button type=submit class=btn-sm>Record as one transfer</button></form>{% endif %}{% endif %}
 {% if loop.first and not signed_off and acct_linked %}<button type=button class="btn-sm xfer-edit" data-line="{{ lid }}" aria-expanded=false>Edit</button>{% endif %}
 <form method=post action="{{ url_for('transfer_dismiss', name=name) }}"><input type=hidden name=line value="{{ lid }}"><input type=hidden name=other value="{{ c.key }}"><button type=submit class=btn-sm data-busy="Hiding this suggestion...">Not a transfer</button></form>
 </div></td></tr>
-{% if loop.last and not signed_off and acct_linked %}<tr class=xferedit id="xe-{{ lid }}" hidden><td></td><td colspan=4 style="white-space:normal;background:#f8faff">
+{% if loop.last and not signed_off and acct_linked %}<tr class=xferedit id="xe-{{ lid }}" hidden><td></td><td colspan=5 style="white-space:normal;background:#f8faff">
 <form method=post action="{{ url_for('record_transfer', name=name) }}" class=xe-form data-amt="{{ a|abs|money }}"><input type=hidden name=line value="{{ lid }}">
 <div class=splithead>Record {{ a|abs|money }} as a transfer {{ 'to' if a < 0 else 'from' }} another of your accounts. Pick the matching line on its statement, or just the account if its statement isn't uploaded (only this line is matched then).</div>
 {% set ch = xfer_choices.get(lid, []) %}{% for o in ch %}<label class=xe-opt><input type=radio name=other value="{{ o.line_id }}"{% if not o.linked %} disabled{% endif %}> <b>{{ o.account }}</b> \u00b7 {{ o.date }} \u00b7 {{ o.amount|money }}{% if o.who %} \u00b7 {{ o.who }}{% endif %}{% if not o.linked %} <span class=hint>(not linked to QuickBooks)</span>{% endif %}</label>
@@ -3948,7 +3996,23 @@ update(false);
 {% for x in xfer_dismissed %}<tr><td>{{ x.date }}</td><td class=desc>{{ x.who }}</td><td class=a>{{ x.amount|money }}</td><td class=desc>{{ x.c.account }} \u00b7 {{ x.c.date }} \u00b7 {{ x.c.amount|money }}{% if x.by %}<br><span class=hint>hidden by {{ x.by }}</span>{% endif %}</td>
 <td><form method=post action="{{ url_for('transfer_restore', name=name) }}"><input type=hidden name=line value="{{ x.line_id }}"><input type=hidden name=other value="{{ x.c.key }}"><button type=submit class=btn-sm data-busy="Restoring the suggestion...">Restore</button></form></td></tr>{% endfor %}</table></details>{% endif %}
 <style>.xe-opt{display:block;padding:5px 0;font-size:13px}.xe-opt select{margin-left:6px;padding:4px 6px;border:1px solid var(--line);border-radius:7px;font-size:13px;max-width:100%}
-.xfertbl .btnrow form{margin:0}</style>
+.xfertbl .btnrow form{margin:0}
+.xferbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 6px;font-size:13px;color:var(--muted)}</style>
+<script>(function(){
+// Bulk 'Not a transfer': tick rows (or the header box), then hide them all at once.
+var bf=document.getElementById('xferbulk');if(!bf)return;
+var picks=[].slice.call(document.querySelectorAll('.xb-pick')),all=document.querySelector('.xb-all'),
+    btn=bf.querySelector('button'),lab=bf.querySelector('.xb-n');
+function upd(){var n=picks.filter(function(p){return p.checked}).length;btn.disabled=!n;
+  btn.textContent=n?'Not a transfer ('+n+')':'Not a transfer (selected)';
+  lab.textContent=n?n+' suggestion'+(n==1?'':'s')+' ticked':'Tick the suggestions that aren’t transfers';
+  if(all){all.checked=n&&n===picks.length;all.indeterminate=n>0&&n<picks.length}}
+picks.forEach(function(p){p.addEventListener('change',upd)});
+if(all)all.addEventListener('change',function(){picks.forEach(function(p){p.checked=all.checked});upd()});
+bf.addEventListener('submit',function(e){var n=picks.filter(function(p){return p.checked}).length;
+  if(!n||!confirm('Mark '+n+' suggestion'+(n==1?'':'s')+' as not a transfer? They can be restored from the hidden list.'))e.preventDefault()});
+upd();
+})();</script>
 <script>(function(){
 // Edit: open the chooser under the line; picking an account ticks "Only the account".
 document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.getElementById('xe-'+b.getAttribute('data-line'));if(!row)return;
@@ -3963,12 +4027,13 @@ document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.get
     if(!confirm('Record a transfer of '+f.getAttribute('data-amt')+(acct?' with '+acct.textContent:' between these two lines')+' in QuickBooks?'))e.preventDefault()});
 });})();</script>
 {% endif %}
-<h2 id=sec-exceptions style="font-size:15px">On statement, not in books ({{ on_stmt|length }})</h2>
+<h2 id=sec-exceptions style="font-size:15px" data-sec data-state="{{ 'attn' if on_stmt else 'done' }}" data-note="{{ (on_stmt|length ~ ' to clear') if on_stmt else 'None' }}">On statement, not in books ({{ on_stmt|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in on_stmt %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
-<h2 style="font-size:15px">In books, not on statement ({{ in_books|length }})</h2>
+<h2 id=sec-inbooks style="font-size:15px" data-sec data-state="{{ 'attn' if in_books and rec.status!='balanced' else 'done' }}" data-note="{{ (in_books|length ~ ' outstanding') if in_books else 'None' }}">In books, not on statement ({{ in_books|length }})</h2>
 <table class=exc><tr><th>Date</th><th>Description</th><th class=a>Amount</th></tr>
 {% for _, d, a, who in in_books %}<tr><td>{{ d }}{% if d < p_start %} <span class="tag bf">brought forward</span>{% endif %}</td><td class=desc>{{ who }}</td><td class=a>{{ a|money }}</td></tr>{% endfor %}</table>
+<div id=sec-end></div>
 {% endif %}
 <style>th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover{color:var(--accent)}
 th.sortable .sortind{font-size:11px;margin-left:4px;color:var(--accent);font-weight:600}</style>
@@ -4022,6 +4087,61 @@ document.querySelectorAll('.wrap table').forEach(function(tbl,ti){
   if(sc&&sc.modes[+saved[1]])apply(sc,+saved[1],false);
 });
 })();</script>
+<style>.dsecbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0 4px;font-size:13px;color:var(--muted)}
+.dsecbar b{color:var(--ink)}.dsecbar button{background:none;border:0;padding:0;color:var(--accent);font:inherit;font-weight:600;cursor:pointer}
+.dsec>h2.dsec-h{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;margin:12px 0 10px;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:10px}
+.dsec>h2.dsec-h:hover{border-color:var(--accent)}
+.dsec.attn>h2.dsec-h{border-left-color:var(--warn)}.dsec.ready>h2.dsec-h{border-left-color:var(--accent)}.dsec.done>h2.dsec-h{border-left-color:var(--ok);color:#475467;font-weight:600}
+.dsec-chev{display:inline-block;width:12px;font-size:10px;color:var(--muted);transition:transform .15s}.dsec.closed .dsec-chev{transform:rotate(-90deg)}
+.dsec-badge{margin-left:auto;font-size:11.5px;font-weight:600;padding:2px 10px;border-radius:999px;white-space:nowrap}
+.dsec.attn .dsec-badge{background:var(--warn-soft);color:var(--warn)}.dsec.ready .dsec-badge{background:var(--accent-soft);color:var(--accent)}.dsec.done .dsec-badge{background:var(--ok-soft);color:var(--ok)}
+.dsec-body{padding:0 2px 6px}</style>
+<script>(function(){
+// Each section heading folds its section. Sections that need work come first and start open; finished
+// ones go to the bottom, folded. A section you open or fold stays that way (this tab) until its state changes.
+var hs=[].slice.call(document.querySelectorAll('h2[data-sec]'));if(!hs.length)return;
+var parent=hs[0].parentNode;hs=hs.filter(function(h){return h.parentNode===parent});
+var end=document.getElementById('sec-end'),RANK={attn:0,ready:1,done:2};
+function store(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v)}catch(e){return null}}
+var anchor=document.createComment('sections');parent.insertBefore(anchor,hs[0]);
+var secs=hs.map(function(h,i){
+  var st=RANK.hasOwnProperty(h.getAttribute('data-state'))?h.getAttribute('data-state'):'done';
+  var el=document.createElement('section'),body=document.createElement('div');
+  el.className='dsec '+st;body.className='dsec-body';parent.insertBefore(el,h);
+  var n=h.nextSibling;
+  while(n&&n!==end&&n!==anchor&&!(n.nodeType===1&&hs.indexOf(n)>=0)){var nx=n.nextSibling;body.appendChild(n);n=nx}
+  el.appendChild(h);el.appendChild(body);
+  h.setAttribute('data-title',h.textContent.replace(/ +/g,' ').trim());h.classList.add('dsec-h');h.setAttribute('role','button');h.tabIndex=0;
+  var chev=document.createElement('span');chev.className='dsec-chev';chev.textContent='\\u25bc';h.insertBefore(chev,h.firstChild);
+  var badge=document.createElement('span');badge.className='dsec-badge';
+  badge.textContent=(st==='done'?'\\u2713 ':'')+(h.getAttribute('data-note')||(st==='done'?'Done':'Needs attention'));h.appendChild(badge);
+  var s={el:el,h:h,body:body,st:st,i:i,key:'sec:'+location.pathname+':'+h.id+':'+st};
+  var saved=store(s.key);set(s,saved===null?st!=='done':saved==='1',false);
+  h.addEventListener('click',function(){set(s,el.classList.contains('closed'),true)});
+  h.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();set(s,el.classList.contains('closed'),true)}});
+  return s});
+function set(s,open,save){s.el.classList.toggle('closed',!open);s.body.hidden=!open;s.h.setAttribute('aria-expanded',String(open));if(save)store(s.key,open?'1':'0')}
+secs.slice().sort(function(a,b){return RANK[a.st]-RANK[b.st]||a.i-b.i}).forEach(function(s){parent.insertBefore(s.el,anchor)});
+// summary line with expand / collapse all
+var n=secs.filter(function(s){return s.st==='attn'}).length,bar=document.createElement('div');bar.className='dsecbar';
+var t=document.createElement('span');
+if(n){t.appendChild(document.createElement('b')).textContent=n+' section'+(n==1?' needs':'s need')+' attention';t.appendChild(document.createTextNode(' \\u2014 shown first; finished sections are folded below.'))}
+else t.textContent=secs.some(function(s){return s.st==='ready'})?'Nothing left to fix \\u2014 ready to sign off.':'Nothing needs attention.';
+bar.appendChild(t);
+[['Expand all',true],['Collapse all',false]].forEach(function(p){var b=document.createElement('button');b.type='button';b.textContent=p[0];
+  b.addEventListener('click',function(){secs.forEach(function(s){set(s,p[1],true)})});bar.appendChild(b)});
+parent.insertBefore(bar,secs.slice().sort(function(a,b){return RANK[a.st]-RANK[b.st]||a.i-b.i})[0].el);
+// anything that jumps into a folded section opens it first
+function reveal(id){var el=id&&document.getElementById(id);if(!el)return;
+  secs.forEach(function(s){if(s.el.contains(el)&&s.el.classList.contains('closed'))set(s,true,false)})}
+document.addEventListener('click',function(e){var t=e.target.closest&&e.target.closest('#dtiles .tile,.mm-open,.mm-edit,a[href^="#"]');if(!t)return;
+  if(t.classList.contains('tile')){var id=t.getAttribute('data-target');reveal(document.getElementById(id)?id:t.getAttribute('data-fallback'))}
+  else if(t.tagName==='A')reveal(t.getAttribute('href').slice(1));else reveal('sec-manual')},true);
+function fromHash(){reveal(decodeURIComponent(location.hash.slice(1)))}
+window.addEventListener('hashchange',fromHash);
+if(location.hash){fromHash();var el=document.getElementById(decodeURIComponent(location.hash.slice(1)));if(el&&el.scrollIntoView)el.scrollIntoView()}
+if(window.__mmOpen){reveal("sec-manual");var mm=document.getElementById("sec-manual");if(mm&&mm.scrollIntoView)mm.scrollIntoView()}
+})();</script>
 <script>(function(){function go(btn){document.querySelectorAll('#dtiles .tile').forEach(function(t){t.classList.toggle('active',t===btn)});var el=document.getElementById(btn.getAttribute('data-target'));if(!el){var fb=btn.getAttribute('data-fallback'); if(fb) el=document.getElementById(fb);}if(el){el.scrollIntoView({behavior:'smooth',block:'start'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');}}document.querySelectorAll('#dtiles .tile').forEach(function(t){t.addEventListener('click',function(){go(t)})});})();</script>
 </div></div><div class=appfoot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
 <div id=loadingov><div class=spin></div><div class=msg id=loadingmsg>Loading...</div></div>
@@ -4069,9 +4189,9 @@ var heads=[].slice.call(document.querySelectorAll('h2[id^="sec-"]'));
 if(heads.length<2)return;
 menu.setAttribute('data-built','1');
 var NAMES={'sec-balance':'Balance','sec-review':'Suggested','sec-matched':'Matched','sec-record':'Record','sec-manual':'Match manually',
-  'sec-transfers':'Transfers','sec-exceptions':'Not in books'};
+  'sec-transfers':'Transfers','sec-exceptions':'Not in books','sec-inbooks':'Not on statement'};
 function label(h){
-  var t=(h.textContent||'').replace(/ +/g,' ').trim(),name=NAMES[h.id],n=null,m;
+  var t=(h.getAttribute('data-title')||h.textContent||'').replace(/ +/g,' ').trim(),name=NAMES[h.id],n=null,m;
   if(!name){name=t.split(' (')[0].split(' —')[0];if(name.length>22)name=name.slice(0,21)+'…';}
   if((m=t.match(/([0-9]+) to review/)))n=+m[1];
   else if((m=t.match(/[(]([^)]*)[)]/))){var ds=m[1].match(/[0-9][0-9,]*/g);if(ds){n=0;ds.forEach(function(x){n+=+x.split(',').join('');});}}
@@ -4085,6 +4205,7 @@ function setOn(a){
 }
 var items=heads.map(function(h){
   var l=label(h),a=document.createElement('a');a.href='#'+h.id;a.textContent=l.name;
+  if(h.getAttribute('data-state')==='attn'){a.classList.add('attn');a.title='Needs attention'}
   if(l.n!==null){var s=document.createElement('span');s.className='n';s.textContent=' ('+l.n+')';a.appendChild(s);}
   a.addEventListener('click',function(e){
     if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
@@ -4180,6 +4301,7 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=TRANSFER_WINDOW_
         out.setdefault(str(lid), []).append(
             {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who, "key": f"line:{other_lid}",
              "line_id": str(other_lid), "other_signed": bool(other_signed), "other_linked": bool(other_qbo),
+             "other_qbo": other_qbo,
              "note": "Opposite entry on another bank statement, not recorded in QuickBooks either side."})
 
     # Rule 2: unmatched BOOK transaction on another account, money moving the same way
@@ -4352,6 +4474,16 @@ def reconcile(cur, acct_uuid, stmt):
     return r
 
 
+def _record_rank(w):
+    """Order of the 'record them' list: problems first (interrupted, taken), then lines to record,
+    then lines that can't be recorded here, and lines already recorded (awaiting a refresh) last."""
+    if w["wb"] in ("pending", "taken"):
+        return 0
+    if w["wb"] == "done":
+        return 3
+    return 1 if w["recordable"] else 2
+
+
 def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     s = _latest_statement(cur, acct_uuid)
     if not s: return {"has_results": False}
@@ -4372,7 +4504,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     cur.execute("""SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s
                    AND (match_type IN ('fuzzy','many_to_one','manual') OR (match_type='exact' AND confidence < 1))
                    AND created_by <> 'user'
-                   ORDER BY match_type='exact', status<>'proposed', match_type;""", (sid,))
+                   ORDER BY status<>'proposed', match_type='exact', match_type;""", (sid,))
     rmatches = cur.fetchall()
     cur.execute("""SELECT match_id, amount_delta, confirmed_by, confirmed_at FROM match
                    WHERE statement_id=%s AND created_by='user' AND status='confirmed' ORDER BY confirmed_at;""", (sid,))
@@ -4507,6 +4639,21 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         choices = transfer_choices(cur, acct_uuid, [l for l in _unmatched if str(l[0]) in xfers])
     except Exception:
         xfers, xfer_dismissed, choices = {}, [], {}   # a suggestion engine must never break the reconciliation itself
+    xt_ids = {a["id"] for a in xt if a.get("xfer")}
+    for item in writebacks + deposits:
+        aid = item["acct_id"] or ""
+        kind = ("cust" if aid.startswith("cust:") or coa_type.get(aid) == "Accounts Receivable" else
+                "xfer" if aid in xt_ids else "ap" if coa_type.get(aid) == "Accounts Payable" else "gl" if aid else None)
+        pairs = [c for c in xfers.get(str(item["line_id"]), []) if c.get("rule") == "unrecorded"]
+        pair = {**pairs[0], "d": item["date"]} if len(pairs) == 1 else None
+        conf = (item["sug"] or {}).get("conf")
+        item["ttype"], item["ttype_why"] = guess_type(item["who"], item["out"], item["amount"], kind,
+                                                      conf if kind else None, pair)
+        if item.get("saved") and kind:
+            item["ttype"], item["ttype_why"] = kind, "Your saved choice"
+        # A clear transfer pair with no account chosen yet: suggest the other account (not ticked).
+        if pair and not aid and not item["xfer_only"] and pair.get("other_qbo") in xt_ids:
+            item["acct_id"] = pair["other_qbo"]
     return {"xfers": xfers, "n_xfer": sum(len(v) for v in xfers.values()), "all_unmatched": _all_unmatched,
             "xfer_choices": choices, "xfer_dismissed": xfer_dismissed, "xfer_recorded": recorded_transfers(cur, sid),
             "xfer_accounts": [a for a in xt if a.get("xfer")] if acct_qbo else [],
@@ -4515,6 +4662,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
+            "record_rows": sorted(writebacks + deposits, key=_record_rank),
+            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] != "done"),
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "acct_linked": bool(acct_qbo),
@@ -5607,14 +5756,26 @@ def _xfer_line_of(cur, name, lid):
 
 @app.route("/account/<name>/transfer_dismiss", methods=["POST"])
 def transfer_dismiss(name):
-    """'Not a transfer': hide this suggested pairing (it can be restored)."""
-    lid, other = request.form.get("line") or "", (request.form.get("other") or "")[:80]
+    """'Not a transfer': hide suggested pairings (they can be restored). One pair from its own button
+    (line + other), or several ticked at once (pick = "line|other")."""
+    pairs = [p.split("|", 1) for p in request.form.getlist("pick") if "|" in p]
+    if request.form.get("line"):
+        pairs.append([request.form.get("line"), request.form.get("other") or ""])
     conn = get_conn(); cur = conn.cursor()
-    if other and _xfer_line_of(cur, name, lid):
-        cur.execute("""INSERT INTO transfer_dismissal (line_id, other, dismissed_by) VALUES (%s,%s,%s)
-                       ON CONFLICT DO NOTHING;""", (lid, other, session.get("name") or "user"))
-        conn.commit()
+    n = 0
+    for lid, other in pairs[:500]:
+        other = other[:80]
+        if other and _xfer_line_of(cur, name, lid):
+            cur.execute("""INSERT INTO transfer_dismissal (line_id, other, dismissed_by) VALUES (%s,%s,%s)
+                           ON CONFLICT DO NOTHING;""", (lid, other, session.get("name") or "user"))
+            n += cur.rowcount
+    conn.commit()
+    if n == 1:
         session["detail_msg"] = "Hidden: it won't be suggested as a transfer again. Restore it below if that was a mistake."
+    elif n:
+        session["detail_msg"] = f"Hidden {n} suggestions: they won't be suggested as transfers again. Restore any below if that was a mistake."
+    else:
+        session["detail_msg"] = "Nothing hidden: tick the suggestions that aren't transfers first."
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name) + "#sec-transfers")
 
