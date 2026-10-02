@@ -53,10 +53,13 @@ upload("Stanbic UGX", """Date,Description,Debit,Credit,Balance
 jan_id = str(q1("SELECT statement_id FROM statement")[0])
 
 # ---- currencies stay separate ----------------------------------------------------------------
-book(UGX2, "c1", "2026-01-05", -2500, "Bank charge (Centenary)")
-book(USD, "u1", "2026-01-05", -2500, "Bank charge (USD)")
-k = c.cursor(); d = A.compute_detail(k, UGX, "bank", "35"); c.rollback()
-flagged = {x["account"] for v in d["xfers"].values() for x in v}
+book(UGX2, "c1", "2026-01-10", -200000, "Supplier cheque (Centenary)")
+book(USD, "u1", "2026-01-10", -200000, "Supplier cheque (USD)")
+# (bank charges are never suggested as transfers, so the probe is a supplier payment: supplier, date, amount)
+import datetime, decimal
+k = c.cursor(); xf = A.transfer_candidates(k, UGX, [("00000000-0000-0000-0000-00000000f001", datetime.date(2026, 1, 10),
+                                                     decimal.Decimal(-200000), "Supplier cheque 3")]); c.rollback()
+flagged = {x["account"] for v in xf.values() for x in v}
 check("transfer check still compares same-currency banks", "Centenary UGX" in flagged)
 check("…but never a different currency (same number, different money)", "Stanbic USD" not in flagged)
 

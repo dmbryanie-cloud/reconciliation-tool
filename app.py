@@ -5271,6 +5271,15 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=None):
         window = rule("transfer_days")
     if not unmatched_lines:
         return {}
+    # Bank charges are never transfers: every bank takes the same small amounts (excise duty, fees)
+    # again and again, so a charge here and one on another bank look alike without being related.
+    cur.execute("""SELECT line_id::text, coalesce(description,'') || ' ' || coalesce(counterparty,'')
+                   FROM statement_line WHERE line_id = ANY(%s::uuid[]);""", ([str(l[0]) for l in unmatched_lines],))
+    text = dict(cur.fetchall())
+    unmatched_lines = [l for l in unmatched_lines
+                       if not is_bank_charge(text.get(str(l[0])) or (l[3] if len(l) > 3 else ""), l[2])]
+    if not unmatched_lines:
+        return {}
     ids = [str(l[0]) for l in unmatched_lines]
     dts = [l[1] for l in unmatched_lines]
     amts = [l[2] for l in unmatched_lines]
@@ -5300,6 +5309,8 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=None):
                           WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');
     """, (ids, dts, amts, acct_uuid, acct_uuid, m_this, window, window))
     for lid, nm, d, a, who, other_lid, other_signed, other_qbo in cur.fetchall():
+        if is_bank_charge(who, a):
+            continue
         out.setdefault(str(lid), []).append(
             {"rule": "unrecorded", "account": nm, "date": d, "amount": a, "who": who, "key": f"line:{other_lid}",
              "line_id": str(other_lid), "other_signed": bool(other_signed), "other_linked": bool(other_qbo),
@@ -5323,6 +5334,8 @@ def transfer_candidates(cur, acct_uuid, unmatched_lines, window=None):
                           WHERE mbt.txn_id = bt.txn_id AND m.status = 'confirmed');
     """, (ids, dts, amts, acct_uuid, window, window, acct_uuid, m_this))
     for lid, nm, d, a, who, tid in cur.fetchall():
+        if is_bank_charge(who, a):
+            continue
         out.setdefault(str(lid), []).append(
             {"rule": "wrong_account", "account": nm, "date": d, "amount": a, "who": who, "key": f"book:{tid}",
              "note": "Recorded in QuickBooks against this account instead \u2014 likely posted to the wrong bank."})
@@ -7065,6 +7078,22 @@ def _record_transfer_pair(name, lid, other):
                              (" and matched both bank lines." if matched == 2 else
                               ". It will match on the next refresh."))
 
+def _xfer_pairs(cur, name):
+    """The (line, other) pairs posted (pick = "line|other", or line + other), keeping only lines on
+    account `name`'s statements -- checked in one query, however many are ticked."""
+    pairs = [p.split("|", 1) for p in request.form.getlist("pick") if "|" in p]
+    if request.form.get("line"):
+        pairs.append([request.form.get("line"), request.form.get("other") or ""])
+    pairs = list(dict.fromkeys((l.strip().lower(), o.strip()[:80]) for l, o in pairs[:5000] if o.strip() and _is_uuid(l.strip())))
+    if not pairs:
+        return []
+    cur.execute("""SELECT sl.line_id::text FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   JOIN account a ON a.account_id=s.account_id WHERE sl.line_id = ANY(%s::uuid[]) AND a.name=%s;""",
+                (list({l for l, _ in pairs}), name))
+    ok = {r[0] for r in cur.fetchall()}
+    return [(l, o) for l, o in pairs if l in ok]
+
+
 def _xfer_line_of(cur, name, lid):
     """The statement line `lid` on account `name`'s latest statement, or None."""
     try:
@@ -7080,17 +7109,14 @@ def _xfer_line_of(cur, name, lid):
 def transfer_dismiss(name):
     """'Not a transfer': hide suggested pairings (they can be restored). One pair from its own button
     (line + other), or several ticked at once (pick = "line|other")."""
-    pairs = [p.split("|", 1) for p in request.form.getlist("pick") if "|" in p]
-    if request.form.get("line"):
-        pairs.append([request.form.get("line"), request.form.get("other") or ""])
     conn = get_conn(); cur = conn.cursor()
+    pairs = _xfer_pairs(cur, name)
     n = 0
-    for lid, other in pairs[:500]:
-        other = other[:80]
-        if other and _xfer_line_of(cur, name, lid):
-            cur.execute("""INSERT INTO transfer_dismissal (line_id, other, dismissed_by) VALUES (%s,%s,%s)
-                           ON CONFLICT DO NOTHING;""", (lid, other, session.get("name") or "user"))
-            n += cur.rowcount
+    if pairs:
+        who = session.get("name") or "user"
+        n = len(execute_values(cur, """INSERT INTO transfer_dismissal (line_id, other, dismissed_by) VALUES %s
+                                       ON CONFLICT DO NOTHING RETURNING 1""",
+                               [(l, o, who) for l, o in pairs], template="(%s::uuid, %s, %s)", fetch=True))
     conn.commit()
     if n == 1:
         session["detail_msg"] = "Hidden: it won't be suggested as a transfer again. Restore it below if that was a mistake."
@@ -7105,15 +7131,14 @@ def transfer_dismiss(name):
 @app.route("/account/<name>/transfer_restore", methods=["POST"])
 def transfer_restore(name):
     """Bring back hidden 'Not a transfer' suggestions: one (line + other) or the ticked ones (pick)."""
-    pairs = [p.split("|", 1) for p in request.form.getlist("pick") if "|" in p]
-    if request.form.get("line"):
-        pairs.append([request.form.get("line"), request.form.get("other") or ""])
     conn = get_conn(); cur = conn.cursor()
+    pairs = _xfer_pairs(cur, name)
     n = 0
-    for lid, other in pairs[:500]:
-        if _xfer_line_of(cur, name, lid):
-            cur.execute("DELETE FROM transfer_dismissal WHERE line_id=%s AND other=%s;", (lid, other[:80]))
-            n += cur.rowcount
+    if pairs:
+        cur.execute("""DELETE FROM transfer_dismissal d USING unnest(%s::uuid[], %s::text[]) AS p(line_id, other)
+                       WHERE d.line_id = p.line_id AND d.other = p.other;""",
+                    ([l for l, _ in pairs], [o for _, o in pairs]))
+        n = cur.rowcount
     conn.commit()
     if n:
         session["detail_msg"] = "Restored: the suggestion is back." if n == 1 else f"Restored {n} suggestions."
