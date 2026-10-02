@@ -1463,16 +1463,22 @@ def resolve_coa(coa, category):
     return next((a for a in coa if a["name"] == leaf), None)
 
 
-def transfer_targets(cur, acct_qbo, atype, currency):
-    """Your other bank (and card) accounts a line can be recorded as a transfer to or from.
-    Same currency only -- UGX money moves between UGX accounts, USD between USD. A card is
-    paid from a bank, so card lines only offer banks."""
+def transfer_targets(cur, acct_qbo, atype, currency, home=None):
+    """Your other bank (and card) accounts a line can be recorded as a transfer to or from: those in
+    the same currency, and -- at an exchange rate -- those in another currency when one of the two
+    is the home currency (UGX bank <-> USD bank). QuickBooks can't transfer between two foreign
+    currencies. "ccy" is set on the other-currency ones. A card is paid from a bank, so card lines
+    only offer banks."""
     types = ["Bank"] if atype == "credit_card" else ["Bank", "Credit Card"]
-    cur.execute("""SELECT qbo_id, name, fqn, account_type FROM qbo_coa
+    home = home or qbo_home_currency(cur)
+    cur.execute("""SELECT qbo_id, name, fqn, account_type, currency FROM qbo_coa
                    WHERE coalesce(active, true) AND account_type = ANY(%s) AND qbo_id <> %s
-                     AND (%s::text IS NULL OR currency IS NULL OR currency = %s) ORDER BY fqn;""",
-                (types, acct_qbo or "", currency, currency))
-    return [{"id": i, "name": n, "fqn": f or n, "type": t, "xfer": True} for i, n, f, t in cur.fetchall()]
+                     AND (%s::text IS NULL OR currency IS NULL OR currency = %s
+                          OR (%s::text IS NOT NULL AND (currency = %s OR %s = %s)))
+                   ORDER BY (%s::text IS NOT NULL AND currency IS DISTINCT FROM %s), fqn;""",
+                (types, acct_qbo or "", currency, currency, home, home, currency, home, currency, currency))
+    return [{"id": i, "name": n, "fqn": f or n, "type": t, "xfer": True,
+             "ccy": c if c and currency and c != currency else None} for i, n, f, t, c in cur.fetchall()]
 
 
 def transfer_ends(this_qbo, other_qbo, amount, atype):
@@ -1658,7 +1664,7 @@ def qbo_record_transfer(token, from_qbo, to_qbo, amount_abs, txn_date, desc, cur
                currency, rate)
     res = qbo_post(token, "Transfer", body)
     ent = res.get("Transfer") or {}
-    return "Transfer", str(ent.get("Id") or ""), ent or body
+    return "Transfer", str(ent.get("Id") or ""), {**body, **ent}   # what was sent, as QuickBooks stored it
 
 
 def store_transfer(cur, new_id, ent, txn_date, desc, names):
@@ -4943,7 +4949,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
 <h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else ('Recorded \u2014 matches on the next refresh' if record_rows else 'Nothing to record') }}">Not in QuickBooks yet — record them ({{ record_rows|length }})</h2>
-<div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer (same currency only); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
+<div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer; to or from a bank in another currency it's in the foreign currency, at the rate you type (or QuickBooks' rate for the date); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
 {% if rec_job %}{% set rj_pct = ((rec_job.n or 0) * 100 // (rec_job.total or 1)) if rec_job.total else 0 %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">
 <div class=rj-top><span>Recording in QuickBooks…</span><b class=rj-pct>{{ rj_pct }}%</b></div>
 <div class="bar rj-bar" role=progressbar aria-label="Recording in QuickBooks" aria-valuemin=0 aria-valuemax=100 aria-valuenow="{{ rj_pct }}"><i style="width:{{ rj_pct }}%"></i></div>
@@ -4976,7 +4982,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
 <input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
 <input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
-{% if x_ccy and not w.out %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class="rate xrate" inputmode=decimal hidden placeholder="{{ acct_ccy }} per {{ x_ccy }}" aria-label="{{ x_ccy }} rate" title="The rate the {{ acct_ccy }} received converts to the student's {{ x_ccy }} account at ({{ acct_ccy }} per {{ x_ccy }}). Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}
+{% if (x_ccy and not w.out) or (xfer_fx and not fx_ccy) %}{% set xc = x_ccy if (x_ccy and not w.out) else xfer_fx %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class="rate xrate" inputmode=decimal hidden placeholder="{{ acct_ccy }} per {{ xc }}" aria-label="{{ xc }} rate" data-date="{{ w.date }}" title="The rate the {{ acct_ccy }} converts at ({{ acct_ccy }} per {{ xc }}). Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}
 {% if w.hedge %}<input type=hidden name="hedge_{{ w.line_id }}" class=hedge-on value="{{ '1' if w.hedge_on else '' }}">{% endif %}
 {% if w.xfer_only %}<div class=hint>Card payment: choose the bank it was paid from</div>{% elif w.is_xfer %}<div class=hint>Recorded as a transfer {{ 'to' if w.out else 'from' }} this account</div>{% endif %}{% if w.sug and not w.acct_id and not w.saved %}<div class=hint>'{{ w.sug.cat }}' isn't in your chart of accounts any more</div>{% elif w.sug and not w.saved %}<div class=hint>{{ "%.0f"|format(w.sug.conf*100) }}% match</div>{% endif %}</div></td>
 <td><div class=custbox data-sel="{{ w.vend }}"><input name="payee_{{ w.line_id }}" value="{{ w.payee or '' }}" placeholder="optional" class="payee acct-q" autocomplete=off aria-label="Payee"><button type=button class=acct-x title="Clear the customer" aria-label="Clear customer">&times;</button><input type=hidden name="cust_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>{% if w.dups %}<label class=hint style="display:flex;gap:5px;align-items:center;margin-top:6px"><input type=checkbox name="dupok_{{ w.line_id }}" value=1 {% if w.dupok %}checked{% endif %}> Not a duplicate</label>{% endif %}<input type=hidden name="psug_{{ w.line_id }}" value="{{ w.payee or '' }}"><input type=hidden name="pref_{{ w.line_id }}" value="{{ w.payee_ref or '' }}"></td>
@@ -5025,7 +5031,7 @@ function accountsFor(dir,split){
   if(dir!=='xfer')coa.forEach(function(a){if(!a.x&&a.t!==AR&&(a.t!==AP||(dir==='out'&&!split)))out.push(a)});
   out.sort(function(a,b){var x=pref.indexOf(a.t),y=pref.indexOf(b.t);x=x<0?99:x;y=y<0?99:y;return x-y||a.t.localeCompare(b.t)||a.n.localeCompare(b.n)});
   coa.forEach(function(a){if(split?a.x===2:a.x===1)out.push(a)});
-  var list=out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir),ap:a.t===AP,k:a.x===1?'xfer':a.x===2?'bank':a.t===AP?'ap':'gl',rank:i,low:a.n.toLowerCase()}});
+  var list=out.map(function(a,i){return {id:a.id,n:a.n,t:typeLabel(a,dir)+(a.c?' ('+a.c+', at a rate)':''),ap:a.t===AP,k:a.x===1?'xfer':a.x===2?'bank':a.t===AP?'ap':'gl',rank:i,low:a.n.toLowerCase(),c:a.c||'',other:!!a.c}});
   return dir==='in'&&!split?studentList.concat(list):list;
 }
 var custList=studentList,vendList=vends.map(function(v,i){return {id:v.id,n:v.n,t:'Supplier',rank:i,low:v.n.toLowerCase()}});
@@ -5164,7 +5170,10 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
     var ph=tr.querySelector('.pickhint');if(ph&&a)ph.remove();
     if(byUser&&cb)cb.checked=!!a&&(!isAp||!!(cust&&cust.get()));
     // A student's account in the other currency: the amount converts at the rate typed here.
-    if(xr){xr.hidden=!(a&&a.other);if(xr.hidden&&!first)xr.value=''}
+    if(xr){xr.hidden=!(a&&a.other);if(xr.hidden&&!first)xr.value='';
+      if(a&&a.other){xr.placeholder=CCY+' per '+a.c;xr.setAttribute('aria-label',a.c+' rate');
+        xr.title=(a.cust?"The rate the "+CCY+" received converts to the student's "+a.c+" account at":
+          'The rate for this transfer: '+a.c+' = '+CCY+' amount ÷ rate')+' ('+CCY+' per '+a.c+"). Leave empty to use QuickBooks' rate for "+(xr.getAttribute('data-date')||'the date')+'.'}}
     if(cbox){cbox.classList.toggle('ar',isAp);cbox.classList.toggle('off',isAr);var pq=cbox.querySelector('.acct-q');
       pq.disabled=isAr;pq.placeholder=isAp?"Type the supplier's name":isAr?'the student':'optional';if(cust)cust.refresh()}
     kids(isAr?a:null,first);first=false;
@@ -5361,7 +5370,8 @@ update(false);
 {% set ch = xfer_choices.get(lid, []) %}{% for o in ch %}<label class=xe-opt><input type=radio name=other value="{{ o.line_id }}"{% if not o.linked %} disabled{% endif %}> <b>{{ o.account }}</b> \u00b7 {{ o.date }} \u00b7 {{ o.amount|money }}{% if o.who %} \u00b7 {{ o.who }}{% endif %}{% if not o.linked %} <span class=hint>(not linked to QuickBooks)</span>{% endif %}</label>
 {% else %}<div class=hint style="margin:4px 0">No other statement has this amount moving the other way within {{ 14 }} days.</div>{% endfor %}
 {% if xfer_accounts %}<label class=xe-opt><input type=radio name=other value="" class=xe-acct-r> Only the account:
-<select name=other_acct class=xe-acct><option value="">choose\u2026</option>{% for t in xfer_accounts %}<option value="{{ t.id }}">{{ t.fqn }}</option>{% endfor %}</select></label>{% endif %}
+<select name=other_acct class=xe-acct><option value="">choose\u2026</option>{% for t in xfer_accounts %}<option value="{{ t.id }}"{% if t.ccy %} data-ccy="{{ t.ccy }}"{% endif %}>{{ t.fqn }}{% if t.ccy %} ({{ t.ccy }}, at a rate){% endif %}</option>{% endfor %}</select></label>
+{% if xfer_fx %}<label class=xe-rate hidden> Rate <input name=rate class=rate inputmode=decimal placeholder="Rate (QuickBooks')"></label>{% endif %}{% endif %}
 <div class=btnrow style="margin-top:8px"><button type=submit class=btn-sm data-busy="Recording the transfer in QuickBooks...">Record transfer</button><button type=button class="btn-sm xe-cancel">Cancel</button></div>
 </form></td></tr>{% endif %}
 {% endfor %}{% endif %}{% endfor %}</table>{% endif %}
@@ -5378,7 +5388,7 @@ update(false);
 {% for o in xfer_rec_choices.get(t.line_id, []) %}<label class=xe-opt><input type=radio name=other value="{{ o.line_id }}"{% if not o.linked %} disabled{% endif %}> <b>{{ o.account }}</b> · {{ o.date }} · {{ o.amount|money }}{% if o.who %} · {{ o.who }}{% endif %}{% if not o.linked %} <span class=hint>(not linked to QuickBooks)</span>{% endif %}</label>
 {% else %}<div class=hint style="margin:4px 0">No unmatched line on another statement has this amount moving the other way within {{ 14 }} days.</div>{% endfor %}
 {% if xfer_accounts %}<label class=xe-opt><input type=radio name=other value="" class=xe-acct-r> Only the account:
-<select name=other_acct class=xe-acct><option value="">choose…</option>{% for a2 in xfer_accounts %}<option value="{{ a2.id }}">{{ a2.fqn }}</option>{% endfor %}</select></label>{% endif %}
+<select name=other_acct class=xe-acct><option value="">choose…</option>{% for a2 in xfer_same %}<option value="{{ a2.id }}">{{ a2.fqn }}</option>{% endfor %}</select></label>{% endif %}
 <div class=btnrow style="margin-top:8px"><button type=submit class=btn-sm data-busy="Changing the transfer in QuickBooks...">Save change</button><button type=button class="btn-sm xe-cancel">Cancel</button></div>
 </form></td></tr>{% endif %}{% endfor %}</table></details>
 <script>(function(){var d=document.getElementById('xferrec');if(!d)return;var k='xferrec:'+location.pathname;
@@ -5395,12 +5405,19 @@ d.addEventListener('toggle',function(){try{sessionStorage.setItem(k,d.open?'1':'
 .xfertbl .btnrow form{margin:0}
 </style>
 <script>(function(){
+var HOME={{ (home_ccy or '')|tojson }},MINE={{ (acct_ccy or '')|tojson }};
+function CCY_PAIR(c){return MINE&&MINE!==HOME?HOME+' per '+MINE:MINE+' per '+c}
 // Edit: open the chooser under the line; picking an account ticks "Only the account".
 document.querySelectorAll('.xfer-edit').forEach(function(b){var row=document.getElementById('xe-'+b.getAttribute('data-line'));if(!row)return;
   b.addEventListener('click',function(){row.hidden=!row.hidden;b.setAttribute('aria-expanded',String(!row.hidden))});
   row.querySelector('.xe-cancel').addEventListener('click',function(){row.hidden=true;b.setAttribute('aria-expanded','false')});
   var sel=row.querySelector('.xe-acct'),r=row.querySelector('.xe-acct-r'),f=row.querySelector('.xe-form');
-  if(sel&&r)sel.addEventListener('change',function(){if(sel.value)r.checked=true});
+  var xr=row.querySelector('.xe-rate'),xri=xr&&xr.querySelector('input');
+  // Another currency: the rate box (UGX per USD, say); empty uses QuickBooks' rate for the date.
+  function rateBox(){if(!xr)return;var o=sel.options[sel.selectedIndex],c=r&&r.checked&&o?o.getAttribute('data-ccy'):null;
+    xr.hidden=!c;if(c){var a=CCY_PAIR(c);xri.placeholder=a;xri.title=a+". Leave empty to use QuickBooks' rate for the date."}else xri.value=''}
+  if(sel&&r)sel.addEventListener('change',function(){if(sel.value)r.checked=true;rateBox()});
+  row.querySelectorAll('input[name=other]').forEach(function(i){i.addEventListener('change',rateBox)});
   f.addEventListener('submit',function(e){if(f._rbok)return;var pick=f.querySelector('input[name=other]:checked');
     var acct=pick&&pick.classList.contains('xe-acct-r')?sel.options[sel.selectedIndex]:null;
     if(!pick||(acct&&!sel.value)){e.preventDefault();var h=f.querySelector('.xe-err');if(!h){h=document.createElement('div');h.className='hint bad xe-err';f.appendChild(h)}
@@ -6034,6 +6051,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "xfer_choices": choices, "xfer_dismissed": xfer_dismissed, "xfer_recorded": xrec,
             "xfer_rec_choices": xrec_choices,
             "xfer_accounts": [a for a in xt if a.get("xfer")] if acct_qbo else [],
+            "xfer_same": [a for a in xt if a.get("xfer") and not a.get("ccy")] if acct_qbo else [],
+            "xfer_fx": next((a["ccy"] for a in xt if a.get("ccy")), None),
             "has_results": True, "p_start": ps, "p_end": pe,
             "signed_off": signed.strftime("%Y-%m-%d") if signed else None,
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
@@ -6046,7 +6065,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "acct_linked": bool(acct_qbo),
             "coa_json": Markup(json.dumps([{"id": a["id"], "n": a["fqn"], "t": a["type"],
-                                            "x": 1 if a.get("xfer") else 2 if a.get("bank") else 0}
+                                            "x": 1 if a.get("xfer") else 2 if a.get("bank") else 0,
+                                            **({"c": a["ccy"]} if a.get("xfer") and a.get("ccy") else {})}
                                            for a in coa + xt + sb]).replace("<", "\\u003c")),
             "cust_json": Markup(json.dumps(custs).replace("<", "\\u003c")),
             "vend_json": Markup(json.dumps(vends).replace("<", "\\u003c")), "acct_ccy": acct_ccy, "x_ccy": also,
@@ -7052,6 +7072,26 @@ def _record_run(name, form, ids, user, progress=None):
                 except Exception:
                     problems.append(f"{label}: QuickBooks has no {foreign} rate for {d}. Type the rate "
                                     f"({home} per {foreign}) in the Rate box and record again"); continue
+        xfer_amt, xfer_ccy, xfer_rate = abs(amt), foreign, rate
+        x_to = acc.get("ccy") if is_xfer else None
+        if x_to and x_to != home:
+            # From a home-currency bank to one in USD (say): QuickBooks records it in USD. The USD
+            # account receives this bank's amount divided by the rate; the rate sent is the exact one
+            # that turns that USD back into this line's amount, so both sides tie to the cent.
+            typed = (form.get(f"rate_{lid}") or "").replace(",", "").strip()
+            try:
+                if typed:
+                    t_rate = Decimal(typed); assert t_rate > 0
+                else:
+                    token = token or qbo_token()
+                    t_rate = Decimal(str(rates[(x_to, d)] if (x_to, d) in rates else qbo_exchange_rate(token, x_to, d)))
+                    rates[(x_to, d)] = t_rate
+                xfer_amt = (abs(amt) / t_rate).quantize(Decimal("0.01"))
+                assert xfer_amt > 0
+            except Exception:
+                problems.append(f"{label}: type the rate ({ccy} per {x_to}) to transfer it to {acc['name']}"
+                                if not typed else f"{label}: the rate '{typed}' isn't a usable number"); continue
+            xfer_ccy, xfer_rate = x_to, float(round(abs(amt) / xfer_amt, 10))
         if not kids:
             twin_days = 0 if is_bank_charge(desc, amt) else TWIN_DAYS    # a bank charge: the same day only
             twin = next((t for t in pool if str(t[0]) not in taken and t[2] == amt and abs((t[1] - d).days) <= twin_days
@@ -7079,7 +7119,7 @@ def _record_run(name, form, ids, user, progress=None):
                 payee = ""
             elif is_xfer:
                 frm, to = transfer_ends(acct_qbo, acc["id"], amt, atype)
-                entity, new_id, ent = qbo_record_transfer(token, frm, to, abs(amt), d, desc, foreign, rate)
+                entity, new_id, ent = qbo_record_transfer(token, frm, to, xfer_amt, d, desc, xfer_ccy, xfer_rate)
                 payee = ""
             elif is_ar and kids:
                 paid = []
@@ -7106,7 +7146,7 @@ def _record_run(name, form, ids, user, progress=None):
                       WHERE line_id=%s;""", (entity, new_id or None, fqn, payee or None, lid))
         k2.execute("DELETE FROM record_draft WHERE line_id=%s;", (lid,))
         if new_id and is_xfer:
-            ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(amt)}
+            ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": xfer_amt}
             touched.update(a for a in store_transfer(k2, new_id, ent, d, desc, names) if a != str(acct_uuid))
         elif new_id and kids:
             # One payment per child; the bank line is matched to all of them.
@@ -7364,13 +7404,13 @@ def _record_transfer_one_side(name, lid, other_acct, back):
                "This line is already matched." if me[10] else
                "The statement is signed off. Reopen it to record this transfer." if me[5] else
                "This account must be linked to QuickBooks." if not me[7] else
-               "Choose one of your accounts in the same currency." if other_acct not in targets else None)
+               "Choose one of your other accounts (linked to QuickBooks)." if other_acct not in targets else None)
     if problem:
         cur.close(); conn.close(); session["detail_msg"] = problem; return back
     cur.close(); conn.close()
     # The regular record path does the rest (claim, QuickBooks, books, matching this line).
-    msg = _record_run(name, {"only": str(me[0]), f"acct_{me[0]}": other_acct, f"dupok_{me[0]}": "1"}, [str(me[0])],
-                      session.get("name"))
+    msg = _record_run(name, {"only": str(me[0]), f"acct_{me[0]}": other_acct, f"dupok_{me[0]}": "1",
+                             f"rate_{me[0]}": request.form.get("rate") or ""}, [str(me[0])], session.get("name"))
     session["detail_msg"] = msg
     return back
 
@@ -7428,20 +7468,30 @@ def _record_transfer_pair(name, lid, other):
     cur.execute(q, (lid,)); me = cur.fetchone()
     cur.execute(q, (other,)); them = cur.fetchone()
     problem = None
+    home = qbo_home_currency(cur)
+    cross = bool(me and them and (me[9] or "") != (them[9] or ""))
+    flow = lambda r: r[2] * (-1 if r[8] == "credit_card" else 1)
     if not me or not them or me[10] != name:
         problem = "Those bank lines weren't found. Reload and try again."
-    elif me[6] == them[6] or (me[9] or "") != (them[9] or ""):
-        problem = "A transfer needs two different accounts in the same currency."
+    elif me[6] == them[6] or (cross and (not me[9] or not them[9] or not home or home not in (me[9], them[9]))):
+        problem = (f"A transfer needs two different accounts, in the same currency or one of them in {home}."
+                   if home else "A transfer needs two different accounts in the same currency.")
     elif me[11] or them[11]:
         problem = "One of those bank lines is already matched."
     elif me[5] or them[5]:
         problem = "A statement is signed off. Reopen it to record this transfer."
     elif not me[7] or not them[7]:
         problem = "Both accounts must be linked to QuickBooks."
-    elif (me[2] * (-1 if me[8] == "credit_card" else 1)) != -(them[2] * (-1 if them[8] == "credit_card" else 1)):
+    elif (not cross and flow(me) != -flow(them)) or (cross and (not flow(me) or (flow(me) > 0) == (flow(them) > 0))):
         problem = "The two lines aren't the same money moving in opposite directions."
     if problem:
         cur.close(); conn.close(); return False, problem
+    amount, x_ccy, x_rate = abs(me[2]), None, None
+    if cross:
+        # In the foreign currency, at the rate the two bank amounts imply (UGX 3,700,000 for USD 1,000 = 3,700).
+        fx, hm = (me, them) if me[9] != home else (them, me)
+        amount, x_ccy = abs(fx[2]), fx[9]
+        x_rate = float(round(abs(hm[2]) / amount, 10))
     frm, to = transfer_ends(me[7], them[7], me[2], me[8])
     out_line = me if frm == me[7] else them   # dated when the money left
     d, desc = out_line[1], out_line[3]
@@ -7452,7 +7502,7 @@ def _record_transfer_pair(name, lid, other):
         conn.commit(); cur.close(); conn.close()
         return False, "The other bank line is already recorded or in progress."
     try:
-        entity, new_id, ent = qbo_record_transfer(qbo_token(), frm, to, abs(me[2]), d, desc)
+        entity, new_id, ent = qbo_record_transfer(qbo_token(), frm, to, amount, d, desc, x_ccy, x_rate)
     except Exception as e:
         err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
         cur.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id = ANY(%s::uuid[]);",
@@ -7468,7 +7518,7 @@ def _record_transfer_pair(name, lid, other):
                 (entity, new_id or None, names.get(me[7]), str(them[0])))
     booked = {}
     if new_id:
-        ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": abs(me[2])}
+        ent = {**ent, "FromAccountRef": {"value": frm}, "ToAccountRef": {"value": to}, "Amount": amount}
         booked = store_transfer(cur, new_id, ent, d, desc, names)
     conn.commit()
     # Match each bank line to its side of the transfer, as if the user had matched it by hand --
@@ -7493,7 +7543,8 @@ def _record_transfer_pair(name, lid, other):
     conn.commit(); cur.close(); conn.close()
     for sid in {me[4], them[4]}:
         _after_review(sid)
-    return True, (f"Recorded a transfer of {_money(abs(me[2]))} from {names.get(frm)} to {names.get(to)} "
+    what = f"{x_ccy} {_money(amount)} at {x_rate:,.2f}" if cross else _money(amount)
+    return True, (f"Recorded a transfer of {what} from {names.get(frm)} to {names.get(to)} "
                              f"in QuickBooks" + (f" (#{new_id})" if new_id else "") +
                              (" and matched both bank lines." if matched == 2 else
                               ". It will match on the next refresh."))
@@ -7681,7 +7732,10 @@ def transfer_change(name):
                       OR m.match_id IN (SELECT match_id FROM match_statement_line WHERE line_id = ANY(%s::uuid[]));""",
                 ([b[0] for b in books], [l[0] for l in lines]))
     matches = cur.fetchall()
-    targets = {t["id"]: t for t in transfer_targets(cur, me[5], me[6], me[7])} if me else {}
+    targets = {t["id"]: t for t in transfer_targets(cur, me[5], me[6], me[7]) if not t["ccy"]} if me else {}
+    cur.execute("""SELECT count(DISTINCT a.currency) FROM book_txn bt JOIN account a ON a.account_id=bt.account_id
+                   WHERE bt.source_txn_type='Transfer' AND bt.source_txn_id=%s;""", (qid,))
+    two_ccy = (cur.fetchone() or [0])[0] > 1
     problem = None
     if not qid or not me:
         problem = "That transfer wasn't recorded from this account here, so it can't be changed from this page."
@@ -7693,6 +7747,8 @@ def transfer_change(name):
         problem = "That bank line is already matched."
     elif them and (me[8] * (-1 if me[6] == "credit_card" else 1)) != -(them[8] * (-1 if them[6] == "credit_card" else 1)):
         problem = "The two lines aren't the same money moving in opposite directions."
+    elif two_ccy:
+        problem = "A transfer between two currencies can't be changed here. Undo it, then record it again."
     elif not new_qbo or new_qbo not in targets:
         problem = "Choose one of your other accounts in the same currency (linked to QuickBooks)."
     if problem:

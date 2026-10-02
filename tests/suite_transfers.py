@@ -1,5 +1,5 @@
 """Recording transfers between your own accounts: from the record table (one line), as one
-transfer for a pair seen on two statements, card payments from a bank, same currency only.
+transfer for a pair seen on two statements, card payments from a bank. Across currencies: tests/suite_transfer_fx.py.
 
 QuickBooks is fully mocked -- no network.
 
@@ -70,13 +70,15 @@ upload("Visa", [("2026-09-15", "PAYMENT THANK YOU", -300000), ("2026-09-25", "PA
 # ---- the picker ------------------------------------------------------------------------------
 page = cl.get("/account/Stanbic UGX").data.decode()
 xs = {a["n"] for a in coa_json(page) if a["x"]}
-check("bank lines can be recorded as transfers to your other same-currency accounts", xs == {"Centenary UGX", "Visa"})
-check("…never to itself or across currencies", "Stanbic UGX" not in xs and "Stanbic USD" not in xs)
+check("bank lines can be recorded as transfers to your other accounts", xs == {"Centenary UGX", "Visa", "Stanbic USD"})
+check("…never to itself; the USD bank is marked as another currency", "Stanbic UGX" not in xs
+      and [a.get("c") for a in coa_json(page) if a["n"] == "Stanbic USD"] == ["USD"])
 check("transfer group labelled in the picker", "Transfer to your account" in page)
 vpage = cl.get("/account/Visa").data.decode()
 check("card: payments pick the bank they came from", "Card payment: choose the bank it was paid from" in vpage
       and 'data-dir="xfer"' in vpage)
-check("card: only banks offered as the other side", {a["n"] for a in coa_json(vpage) if a["x"]} == {"Stanbic UGX", "Centenary UGX"})
+check("card: only banks offered as the other side (the USD one at a rate)",
+      {a["n"]: a.get("c") for a in coa_json(vpage) if a["x"]} == {"Stanbic UGX": None, "Centenary UGX": None, "Stanbic USD": "USD"})
 
 # ---- suggestions: pairs seen on two statements -----------------------------------------------
 k = c.cursor(); d = A.compute_detail(k, UGX, "bank", "35"); c.rollback()
@@ -93,8 +95,8 @@ check("each section heading has its own id (transfers and not-in-books apart)", 
 # ---- one line from the record table ------------------------------------------------------------
 L1, C1 = lid("TRANSFER TO CENTENARY"), lid("FROM STANBIC")
 n = len(POSTS)
-cl.post("/account/Stanbic UGX/record", data={"only": L1, f"acct_{L1}": "37"})
-check("refuses a transfer to another currency", len(POSTS) == n)
+cl.post("/account/Stanbic UGX/record", data={"only": L1, f"acct_{L1}": "37", f"rate_{L1}": "abc"})
+check("refuses a transfer to another currency with a rate that isn't a number", len(POSTS) == n)
 cl.post("/account/Stanbic UGX/record", data={"only": L1, f"acct_{L1}": "36"})
 ent, body = POSTS[-1]
 check("recorded as ONE QuickBooks Transfer, Stanbic -> Centenary",
@@ -114,10 +116,8 @@ cl.post("/account/Stanbic UGX/record", data={"only": L1, f"acct_{L1}": "36"})
 check("can't be recorded twice", len(POSTS) == n)
 
 # ---- a pair: one transfer, both lines matched ------------------------------------------------
-L2, C2, UL = lid("INTERNAL TRF"), lid("INTERNAL TRF IN"), lid("USD TRF IN")
+L2, C2 = lid("INTERNAL TRF"), lid("INTERNAL TRF IN")
 n = len(POSTS)
-cl.post("/account/Stanbic UGX/transfer", data={"line": L2, "other": UL})
-check("pair refused across currencies", len(POSTS) == n)
 cl.post("/account/Stanbic UGX/transfer", data={"line": L2, "other": lid("VISA PAYMENT")})
 check("pair refused on the same account", len(POSTS) == n)
 cl.post("/account/Stanbic UGX/transfer", data={"line": C2, "other": L2})

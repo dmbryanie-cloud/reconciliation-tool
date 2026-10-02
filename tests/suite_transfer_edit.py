@@ -106,7 +106,7 @@ check("recorded transfers are listed with Undo", f"QuickBooks #{XID}" in sec and
 # ---- Edit: just the account (its statement isn't uploaded) --------------------------------------------------------
 n = len(POSTS)
 cl.post("/account/Stanbic UGX/transfer", data={"line": S2, "other": "", "other_acct": "83"})
-check("only your own accounts can be the other side", len(POSTS) == n and "same currency" in msg())
+check("only your own accounts can be the other side", len(POSTS) == n and "your other accounts" in msg())
 cl.post("/account/Stanbic UGX/transfer", data={"line": S2, "other": "", "other_acct": "38"})
 ent, body = POSTS[-1]
 check("only the account: a Transfer to Centenary, this line matched", len(POSTS) == n + 1 and ent == "Transfer"
