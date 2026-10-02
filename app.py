@@ -19,6 +19,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
 import threading
+import traceback
+from werkzeug.exceptions import HTTPException
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
@@ -64,18 +66,127 @@ QBO_REDIRECT_URI = os.environ.get("QBO_REDIRECT_URI", "https://reconciliation-to
 QBO_SCOPE = "com.intuit.quickbooks.accounting"
 
 
+# ---------------- database connections ----------------
+# The database is a long way from the web server: opening a connection (network, encryption,
+# sign-in) costs far more than a query. So connections are kept and reused -- close() hands one
+# back for the next caller instead of hanging up -- and one that sat idle a while is checked first.
+POOL_KEEP = 8             # idle connections kept per server process
+POOL_CHECK_AFTER = 30     # seconds idle before a kept connection is checked with SELECT 1
+POOL_MAX_IDLE = 240       # idle longer than this: hang up and open a fresh one
+_idle, _idle_lock, _idle_pid = [], threading.Lock(), os.getpid()
+
+
+def _tally(kind, secs):
+    """Count a query or a new connection against the current page (for Server-Timing and the slow-page log)."""
+    if has_request_context():
+        t = g.get("_db")
+        if t is None:
+            t = g._db = {"q": 0, "q_ms": 0.0, "conn": 0, "conn_ms": 0.0}
+        t[kind] += 1
+        t[kind + "_ms"] += secs * 1000
+
+
+class _TimedCursor(psycopg2.extensions.cursor):
+    def execute(self, query, vars=None):
+        t = time.perf_counter()
+        try:
+            return super().execute(query, vars)
+        finally:
+            _tally("q", time.perf_counter() - t)
+
+
+def _connect():
+    t = time.perf_counter()
+    c = psycopg2.connect(DB_URL, connect_timeout=20, keepalives=1, keepalives_idle=30, keepalives_interval=10,
+                         keepalives_count=3, cursor_factory=_TimedCursor)
+    _tally("conn", time.perf_counter() - t)
+    return c
+
+
+class _Pooled:
+    """A kept connection on loan. close() rolls back anything uncommitted (as hanging up would)
+    and hands it back. If it's never closed, it's simply dropped, and Python closes it."""
+    def __init__(self, c):
+        object.__setattr__(self, "_c", c)
+        object.__setattr__(self, "_back", False)
+
+    def __getattr__(self, k):
+        return getattr(self._c, k)
+
+    def __setattr__(self, k, v):
+        setattr(self._c, k, v)
+
+    def close(self):
+        if self._back:
+            return
+        object.__setattr__(self, "_back", True)
+        c = self._c
+        if c.closed:
+            return
+        try:
+            c.rollback()
+            if c.autocommit:
+                c.autocommit = False
+        except Exception:
+            c.close()
+            return
+        with _idle_lock:
+            if os.getpid() == _idle_pid and len(_idle) < POOL_KEEP:
+                _idle.append((c, time.time()))
+                return
+        c.close()
+
+
 def get_conn():
-    return psycopg2.connect(DB_URL)
+    global _idle, _idle_pid
+    while True:
+        with _idle_lock:
+            if os.getpid() != _idle_pid:
+                # A new server process: the kept connections belong to its parent. Leave them be
+                # (closing them here would hang up the parent's), and start afresh.
+                _idle_pid, _idle = os.getpid(), []
+                _forked.append(_idle)
+            item = _idle.pop() if _idle else None
+        if item is None:
+            return _Pooled(_connect())
+        c, since = item
+        age = time.time() - since
+        if c.closed or age > POOL_MAX_IDLE:
+            try:
+                c.close()
+            except Exception:
+                pass
+            continue
+        if age > POOL_CHECK_AFTER:
+            try:
+                k = c.cursor(); k.execute("SELECT 1;"); k.close(); c.rollback()
+            except Exception:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                continue
+        return _Pooled(c)
+
+
+_forked = []
 
 
 def get_config(key):
+    # Read once per page: rules and settings are asked for many times while a page is built.
+    cache = g.setdefault("_cfg", {}) if has_request_context() else None
+    if cache is not None and key in cache:
+        return cache[key]
     try:
         conn = get_conn(); cur = conn.cursor()
         cur.execute("SELECT value FROM app_config WHERE key=%s;", (key,))
         row = cur.fetchone(); cur.close(); conn.close()
-        return row[0] if row else None
+        v = row[0] if row else None
     except Exception:
         return None
+    if cache is not None:
+        cache[key] = v
+    return v
 
 
 def set_config(key, value):
@@ -83,6 +194,75 @@ def set_config(key, value):
     cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
     cur.execute("INSERT INTO app_config (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;", (key, value))
     conn.commit(); cur.close(); conn.close()
+    if has_request_context() and "_cfg" in g:
+        g._cfg[key] = value
+
+
+# ---------------- page timing and the problems log ----------------
+# Every page says how long it spent in the database (Server-Timing header). Pages that fail, or
+# take longer than SLOW_MS, are written to problem_log -- shown to admins under Settings -- so a
+# "server error" or a slow page can be traced afterwards. No amounts or bank details are kept.
+SLOW_MS = 5000
+
+
+@app.before_request
+def _start_timer():
+    g._t0 = time.perf_counter()
+
+
+def log_problem(kind, detail="", ms=None):
+    """Write one row to problem_log; returns its number, or None if it couldn't be saved."""
+    t = g.get("_db") or {} if has_request_context() else {}
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""INSERT INTO problem_log (kind, username, method, path, ms, queries, detail)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id;""",
+                    (kind, session.get("username") or ("admin" if session.get("authed") else None) if has_request_context() else None,
+                     request.method if has_request_context() else None,
+                     request.path[:200] if has_request_context() else None,
+                     None if ms is None else int(ms), t.get("q"), (detail or "")[:2000]))
+        ref = cur.fetchone()[0]
+        cur.execute("DELETE FROM problem_log WHERE id <= %s;", (ref - 1000,))
+        conn.commit(); cur.close(); conn.close()
+        return ref
+    except Exception as e:
+        print("problem_log:", e)
+        return None
+
+
+@app.after_request
+def _timing(resp):
+    t0 = g.get("_t0")
+    if t0 is None:
+        return resp
+    ms = (time.perf_counter() - t0) * 1000
+    t = g.get("_db") or {}
+    resp.headers["Server-Timing"] = (f'db;dur={t.get("q_ms", 0):.0f};desc="{t.get("q", 0)} queries", '
+                                     f'conn;dur={t.get("conn_ms", 0):.0f};desc="{t.get("conn", 0)} new", total;dur={ms:.0f}')
+    if ms > SLOW_MS and request.endpoint not in ("static", "health"):
+        log_problem("slow", f'{t.get("q", 0)} queries took {t.get("q_ms", 0) / 1000:.1f}s; '
+                            f'{t.get("conn", 0)} new connections took {t.get("conn_ms", 0) / 1000:.1f}s', ms)
+    return resp
+
+
+@app.errorhandler(Exception)
+def _on_error(e):
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("error on %s %s", request.method, request.path)   # the full traceback, in the server log
+    frames = [f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in traceback.extract_tb(e.__traceback__)
+              if f.filename.endswith("app.py")][-6:]
+    msg = (str(e).strip().splitlines() or [""])[0][:300]
+    t0 = g.get("_t0")
+    ref = log_problem("error", f"{type(e).__name__}: {msg}\n" + "\n".join(frames),
+                      (time.perf_counter() - t0) * 1000 if t0 else None)
+    back = request.referrer if request.referrer and request.referrer.startswith(request.host_url) else url_for("dashboard")
+    return (f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>Something went wrong</title><div style='font:15px system-ui,sans-serif;max-width:560px;margin:60px auto;padding:0 16px'>"
+            f"<h1 style='font-size:20px'>Something went wrong</h1><p>The app hit a problem and stopped part-way. "
+            f"It has been logged{' as problem #' + str(ref) if ref else ''}, so it can be traced.</p>"
+            f"<p>Go back and reload the page to see what was saved before trying again.</p>"
+            f"<p><a href='{escape(back)}'>Go back</a></p></div>"), 500
 
 
 # ---------------- background sync ----------------
@@ -1089,6 +1269,11 @@ try:
                           AND statement_id IN (SELECT statement_id FROM statement WHERE signed_off_at IS NULL);""")
         _cur.execute("INSERT INTO app_config (key, value) VALUES ('migr_proposed_v1', 'done');")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_line_amt_date ON statement_line (amount, posted_date);")
+    # "Is this line / entry already in a match?" is asked of every line on most pages.
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_msl_line ON match_statement_line (line_id);")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_mbt_txn ON match_book_txn (txn_id);")
+    _cur.execute("""CREATE TABLE IF NOT EXISTS problem_log (id serial PRIMARY KEY, at timestamptz NOT NULL DEFAULT now(),
+                    kind text NOT NULL, username text, method text, path text, ms int, queries int, detail text);""")
     _c.commit(); _cur.close(); _c.close()
 except Exception as e:
     print("startup check:", e)
@@ -1699,6 +1884,7 @@ html{color-scheme:light}
 @media (max-width:760px){.dsec>h2.dsec-h{flex-wrap:wrap}.tsearch.in-h{flex-wrap:wrap;margin-left:0;flex-basis:100%;order:5}.tsearch.in-h input{flex:1 1 200px;width:auto}}
 .tsearch .btn-sm{width:auto;display:inline-flex;padding:3px 10px}.tsearch .ts-n{font-size:12px;color:var(--muted)}
 tr.tsx{display:none!important}
+details.ignlist{margin:12px 0 4px}details.ignlist summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
 .bulkbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px;padding:5px 8px;font-size:13px;color:var(--muted);border:1px dashed transparent;border-radius:8px}
 .bulkbar.on{background:#f4f7fc;border-color:#c9d6ea;color:var(--ink,#1d2433)}.bulkbar .bk-n{margin-right:4px}
 .bulkbar button:disabled{opacity:.55;cursor:default}th.bk,td.bk{width:26px;padding-right:0!important}
@@ -1930,6 +2116,9 @@ details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6p
 .bar{height:6px;border-radius:99px;background:var(--line-soft);overflow:hidden;min-width:70px}
 .bar i{display:block;height:100%;background:var(--ok);border-radius:99px}
 .bar.attn i{background:#e08a3e}
+#recjob .rj-top{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:6px}
+#recjob .rj-pct{font-variant-numeric:tabular-nums;font-size:14px}#recjob .rj-bar{height:8px}#recjob .rj-bar i{transition:width .4s ease}
+#recjob .hint{margin-top:5px}
 .scrim{position:fixed;inset:0;background:rgba(19,33,59,.35);z-index:60}
 .drawer{position:fixed;top:0;right:0;bottom:0;width:min(460px,100%);background:var(--panel);z-index:61;box-shadow:-12px 0 40px rgba(19,33,59,.18);display:flex;flex-direction:column}
 .drawer-h{display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line)}
@@ -2207,7 +2396,7 @@ document.querySelectorAll('form.bulkbar').forEach(function(bf){
 var fl=document.getElementById('flash');
 if(fl){var note=!fl.classList.contains('ok')&&/^\\s*(nothing (changed|hidden|to save|to record)|pick at least)/i.test(fl.textContent);if(note)fl.classList.add('note');
   var bad=!note&&!fl.classList.contains('ok')&&/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
-  else if(!note&&/^\\s*(confirmed|rejected|recorded|saved|matched|signed off|restored)\\b/i.test(fl.textContent))fl.classList.add('ok');
+  else if(!note&&/^\\s*(confirmed|rejected|recorded|saved|matched|signed off|restored|ignored)\\b/i.test(fl.textContent))fl.classList.add('ok');
   var x=document.createElement('button');x.type='button';x.className='x';x.setAttribute('aria-label','Close');x.textContent='\\u00d7';
   x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad&&!fl.hasAttribute('data-stay'))setTimeout(function(){fl.hidden=true},note||fl.classList.contains('ok')?10000:6000)}
 })();</script>
@@ -2623,6 +2812,15 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <div style="padding:12px 14px" class=muted>A copy of every reconciliation, statement, match and user, as one file.</div>
 <div class=ptools><a href="{{ url_for('backup') }}" class=btn-sm>Download a backup now</a></div>
 </div>
+<div class="panel wide">
+<div class=panel-h><h2>Problems log</h2></div>
+<div style="padding:10px 14px 0" class=muted>Pages that failed with an error, or took longer than {{ slow_s }} seconds. Newest first, last 30 days.</div>
+<table><thead><tr><th>When</th><th>What</th><th>Who</th><th>Page</th><th class=a>Time</th><th>Details</th></tr></thead><tbody>
+{% for p in problems %}<tr><td style="white-space:nowrap">{{ p.at }}</td><td>{% if p.kind == 'error' %}<span class="pill bad">Error #{{ p.id }}</span>{% else %}<span class="pill attn">Slow</span>{% endif %}</td>
+<td>{{ p.who or '—' }}</td><td style="word-break:break-all">{{ p.method }} {{ p.path }}</td><td class=a>{{ '%.1f s'|format(p.ms / 1000) if p.ms is not none else '' }}</td>
+<td><pre style="margin:0;white-space:pre-wrap;font-size:11.5px;max-width:520px">{{ p.detail }}</pre></td></tr>
+{% else %}<tr><td colspan=6 class=muted>Nothing logged.</td></tr>{% endfor %}
+</tbody></table></div>
 </div>
 <style>.setgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
 .kv{display:grid;grid-template-columns:150px minmax(0,1fr);gap:7px 14px;padding:12px 14px;margin:0}.kv dt{color:var(--muted)}.kv dd{margin:0;font-weight:500}
@@ -2673,10 +2871,19 @@ def settings():
         home = qbo_home_currency(cur)
     except Exception:
         home = None
+    try:
+        cur.execute("""SELECT id, at, kind, username, method, path, ms, detail FROM problem_log
+                       WHERE at > now() - interval '30 days' ORDER BY id DESC LIMIT 50;""")
+        problems = [{"id": i, "at": at.astimezone(EAT).strftime("%d/%m/%Y %H:%M"), "kind": k, "who": u, "method": m,
+                     "path": p, "ms": ms, "detail": d} for i, at, k, u, m, p, ms, d in cur.fetchall()]
+    except Exception:
+        conn.rollback()
+        problems = []
     cur.close(); conn.close()
     return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(),
                                   company=get_config("company_name"), home=home, last_sync=last_sync_label(),
-                                  n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES})
+                                  n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES},
+                                  problems=problems, slow_s=SLOW_MS // 1000)
 
 
 REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reports · ReconBook</title>""" + CSS + """</head><body>
@@ -3190,7 +3397,7 @@ PERM_BY_ENDPOINT = {
     "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
-    "transfer_change": "record", "record_reset": "record",
+    "transfer_change": "record", "record_reset": "record", "record_ignore": "record",
     "transfer_undo": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
     "signoff": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
@@ -4297,9 +4504,12 @@ def reconciled_to(cur, acct_uuid):
 def cleared_to(cur, sid, ps, pe):
     """How far an open reconciliation has got: every bank line dated up to this day is matched (or
     recorded). The period end once all are; None while the first day still has open lines."""
-    cur.execute("""SELECT min(sl.posted_date) FROM statement_line sl WHERE sl.statement_id=%s AND sl.amount <> 0
-                     AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
-                                     WHERE msl.line_id = sl.line_id AND m.status = 'confirmed');""", (sid,))
+    cur.execute("""WITH done AS (SELECT DISTINCT msl.line_id FROM match_statement_line msl
+                                  JOIN match m ON m.match_id = msl.match_id
+                                  JOIN statement_line s2 ON s2.line_id = msl.line_id
+                                  WHERE s2.statement_id = %s AND m.status = 'confirmed')
+                   SELECT min(sl.posted_date) FROM statement_line sl LEFT JOIN done d ON d.line_id = sl.line_id
+                   WHERE sl.statement_id=%s AND sl.amount <> 0 AND d.line_id IS NULL;""", (sid, sid))
     first_open = cur.fetchone()[0]
     if first_open is None:
         return pe
@@ -4307,16 +4517,20 @@ def cleared_to(cur, sid, ps, pe):
     return day if day >= ps else None
 
 
-def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False):
+def account_summary(cur, acct_uuid, name, atype, currency=None, stmt=False, rec_to=False):
     s = _latest_statement(cur, acct_uuid) if stmt is False else stmt
-    rec_to = reconciled_to(cur, acct_uuid)
+    rec_to = reconciled_to(cur, acct_uuid) if rec_to is False else rec_to
     if not s: return {"name": name, "type": atype, "status": "none", "currency": currency, "rec_to": rec_to}
     sid, ps, pe, signed = s[:4]
-    cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
-                          count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
-                              SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
-                              WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
-                   FROM statement_line sl WHERE sl.statement_id = %s;""", (sid,))
+    # The statement's matched lines gathered once, not looked up line by line.
+    cur.execute("""WITH done AS (SELECT DISTINCT msl.line_id FROM match_statement_line msl
+                                  JOIN match m ON m.match_id = msl.match_id
+                                  JOIN statement_line s2 ON s2.line_id = msl.line_id
+                                  WHERE s2.statement_id = %s AND m.status = 'confirmed')
+                   SELECT count(*) FILTER (WHERE sl.amount <> 0),
+                          count(*) FILTER (WHERE sl.amount <> 0 AND d.line_id IS NOT NULL)
+                   FROM statement_line sl LEFT JOIN done d ON d.line_id = sl.line_id
+                   WHERE sl.statement_id = %s;""", (sid, sid))
     n_lines, n_matched = cur.fetchone()
     cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (sid,))
     prep, by, saved_at, saved_by = cur.fetchone() or (None, None, None, None)
@@ -4396,6 +4610,29 @@ ul.check li{display:flex;gap:10px;align-items:center;padding:5px 14px}
 </div>""" + SHELL_END + """</body></html>"""
 
 
+DASH_WORKERS = 6   # accounts summarised side by side on the dashboard
+
+
+def dashboard_summaries(jobs):
+    """account_summary for each (account, name, type, currency, statement, reconciled to), in order.
+    Each one with a statement asks the database a dozen questions, and most of its time is spent
+    waiting for the answers -- so they run side by side, each on its own connection."""
+    def one(job):
+        if not job[4]:
+            return account_summary(None, *job)    # no statement: nothing to ask
+        conn = get_conn(); cur = conn.cursor()
+        try:
+            return account_summary(cur, *job)
+        finally:
+            cur.close(); conn.close()
+    busy = sum(1 for j in jobs if j[4])
+    if busy < 2 or DASH_WORKERS < 2:
+        return [one(j) for j in jobs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(min(DASH_WORKERS, busy)) as ex:
+        return list(ex.map(one, jobs))
+
+
 @app.route("/")
 def dashboard():
     conn = get_conn(); cur = conn.cursor()
@@ -4411,11 +4648,14 @@ def dashboard():
         month = None
     if month not in months:
         month = months[0] if months else date.today().replace(day=1)
-    rows = []
-    for a, n, t, ccy in accts:
-        cur.execute(f"""SELECT {STMT_COLS} FROM statement WHERE account_id=%s AND date_trunc('month', period_end)::date=%s
-                        ORDER BY created_at DESC LIMIT 1;""", (a, month))
-        rows.append(account_summary(cur, a, n, t, (ccy or "").strip() or None, cur.fetchone()))
+    # Every account's statement for the month, and how far each is reconciled, in two questions.
+    cur.execute(f"""SELECT DISTINCT ON (account_id) account_id, {STMT_COLS} FROM statement
+                    WHERE date_trunc('month', period_end)::date=%s ORDER BY account_id, created_at DESC;""", (month,))
+    stmts = {r[0]: r[1:] for r in cur.fetchall()}
+    cur.execute("SELECT account_id, max(period_end) FROM statement WHERE signed_off_at IS NOT NULL GROUP BY account_id;")
+    rec_tos = dict(cur.fetchall())
+    rows = dashboard_summaries([(a, n, t, (ccy or "").strip() or None, stmts.get(a), rec_tos.get(a))
+                                for a, n, t, ccy in accts])
     # No statement yet first, then in progress, then signed off with the most recent sign-off last.
     rows.sort(key=lambda r: ({"none": 0, "open": 1, "signed": 2}[r["status"]],
                              r["signed_at"].timestamp() if r.get("signed_at") else 0, r["name"].lower()))
@@ -4702,12 +4942,17 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
 {% if writebacks or deposits %}
-<h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else 'Recorded \u2014 matches on the next refresh' }}">Not in QuickBooks yet — record them ({{ writebacks|length + deposits|length }})</h2>
+<h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else ('Recorded \u2014 matches on the next refresh' if record_rows else 'Nothing to record') }}">Not in QuickBooks yet — record them ({{ record_rows|length }})</h2>
 <div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer (same currency only); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
-{% if rec_job %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">Recording in QuickBooks: <b class=rj-n>{{ rec_job.n }}</b> of {{ rec_job.total }} lines done ({{ rec_job.done }} recorded so far). The list updates when it finishes.</div>
+{% if rec_job %}{% set rj_pct = ((rec_job.n or 0) * 100 // (rec_job.total or 1)) if rec_job.total else 0 %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">
+<div class=rj-top><span>Recording in QuickBooks…</span><b class=rj-pct>{{ rj_pct }}%</b></div>
+<div class="bar rj-bar" role=progressbar aria-label="Recording in QuickBooks" aria-valuemin=0 aria-valuemax=100 aria-valuenow="{{ rj_pct }}"><i style="width:{{ rj_pct }}%"></i></div>
+<div class=hint>The list updates when it finishes.</div></div>
 <script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
 function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
-  if(j.state==='running'){b.querySelector('.rj-n').textContent=j.n;setTimeout(tick,3000)}
+  if(j.state==='running'){var p=j.total?Math.min(100,Math.floor((j.n||0)*100/j.total)):0;
+    b.querySelector('.rj-pct').textContent=p+'%';b.querySelector('.rj-bar i').style.width=p+'%';
+    b.querySelector('.rj-bar').setAttribute('aria-valuenow',p);setTimeout(tick,3000)}
   else{location.hash='sec-record';location.reload()}}).catch(function(){setTimeout(tick,6000)})}
 setTimeout(tick,3000)})();</script>{% endif %}
 <form method=post action="{{ url_for('record', name=name) }}" id=recform data-ccy="{{ acct_ccy or '' }}">
@@ -4720,10 +4965,10 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <td class=desc>{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
 {% if w.dups and not w.wb %}<div class=dupwarn>&#9888; QuickBooks may already have this: {% for x in w.dups %}{{ x.date }} · {{ x.amount|money }}{% if x.who %} · {{ x.who }}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}.
 {% if w.dup_matchable %}<br><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable }}">Match it instead</button>
-{% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh.{% endif %}</div>{% endif %}</td>
+{% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh, or ignore it.<br>{% endif %} <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></div>{% endif %}</td>
 <td class=a>{{ w.amount|money }}</td>
-{% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">I checked — it's not in QuickBooks</button></td>
-{% elif w.wb == 'taken' %}<td colspan=3 style="white-space:normal"><span class=bad>The entry recorded for this line{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was paired with another identical line, so this one isn't in QuickBooks yet.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">Record this one again</button></td>
+{% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">I checked — it's not in QuickBooks</button> <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td>
+{% elif w.wb == 'taken' %}<td colspan=3 style="white-space:normal"><span class=bad>The entry recorded for this line{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was paired with another identical line, so this one isn't in QuickBooks yet.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">Record this one again</button> <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td>
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
@@ -4750,6 +4995,12 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <button type=submit formaction="{{ url_for('record_save', name=name) }}" class=btn-sm data-busy="Saving your selection..." title="Keep what's ticked and chosen, to carry on later">Save selection</button>
 <span id=selcount class=hint></span></div>
 </form>
+{% if ignored %}<details class=ignlist id=ignored><summary>Ignored — already in QuickBooks ({{ ignored|length }})</summary>
+<div class=hint style="margin:6px 0">Taken off the list to record. Each stays on the statement but not in the books until it's matched.</div>
+<table><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Ignored by</th><th></th></tr>
+{% for w in ignored %}<tr><td>{{ w.date }}</td><td class=desc>{{ w.who }}</td><td class=a>{{ w.amount|money }}</td><td>{{ w.ign_by or '—' }}</td>
+<td><form method=post action="{{ url_for('record_ignore', name=name, undo=1) }}"><button type=submit name=ignore value="{{ w.line_id }}" class=btn-sm data-busy="Restoring...">Undo</button></form></td></tr>{% endfor %}
+</table></details>{% endif %}
 <script id=coa-data type=application/json>{{ coa_json }}</script>
 <script id=cust-data type=application/json>{{ cust_json }}</script>
 <script id=vend-data type=application/json>{{ vend_json }}</script>
@@ -5547,12 +5798,15 @@ def reconcile(cur, acct_uuid, stmt):
     mt = {r[0] for r in cur.fetchall()}
     cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND status='proposed';", (sid,))
     n_pending = cur.fetchone()[0]
-    cur.execute("""SELECT d FROM (
-                     SELECT (SELECT coalesce(sum(sl.amount),0) FROM match_statement_line msl
-                               JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=m.match_id)
-                          - (SELECT coalesce(sum(bt.amount),0) FROM match_book_txn mbt
-                               JOIN book_txn bt ON bt.txn_id=mbt.txn_id WHERE mbt.match_id=m.match_id) AS d
-                     FROM match m WHERE m.statement_id=%s AND m.status='confirmed') q WHERE d<>0;""", (sid,))
+    # (statement - books) on each accepted match, totalled per match in one pass each side.
+    cur.execute("""WITH m AS (SELECT match_id FROM match WHERE statement_id=%s AND status='confirmed'),
+                        l AS (SELECT msl.match_id, sum(sl.amount) AS s FROM m JOIN match_statement_line msl ON msl.match_id=m.match_id
+                              JOIN statement_line sl ON sl.line_id=msl.line_id GROUP BY msl.match_id),
+                        b AS (SELECT mbt.match_id, sum(bt.amount) AS s FROM m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
+                              JOIN book_txn bt ON bt.txn_id=mbt.txn_id GROUP BY mbt.match_id)
+                   SELECT d FROM (SELECT coalesce(l.s,0) - coalesce(b.s,0) AS d FROM m
+                                  LEFT JOIN l ON l.match_id=m.match_id LEFT JOIN b ON b.match_id=m.match_id) q
+                   WHERE d<>0;""", (sid,))
     deltas = [r[0] for r in cur.fetchall()]
     cur.execute("""SELECT count(*) FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
                    JOIN book_txn bt ON bt.txn_id=mbt.txn_id
@@ -5593,7 +5847,7 @@ def _record_rank(w):
     then lines that can't be recorded here, and lines already recorded (awaiting a refresh) last."""
     if w["wb"] in ("pending", "taken"):
         return 0
-    if w["wb"] == "done":
+    if w["wb"] in ("done", "ignored"):
         return 3
     return 1 if w["recordable"] else 2
 
@@ -5665,11 +5919,14 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             except ValueError:
                 continue
             draft_meta = {"by": by, "at": at, "n": len(drafts)}
-    wb = {}
+    wb, ign_by = {}, {}
     if unmatched_lines:
-        cur.execute("SELECT line_id, status, qbo_id FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
+        cur.execute("SELECT line_id, status, qbo_id, error FROM writeback_log WHERE line_id = ANY(%s::uuid[]);",
                     ([str(l[0]) for l in unmatched_lines],))
-        wb = {str(r[0]): (r[1], r[2]) for r in cur.fetchall()}
+        for l_id, st_, q_, err in cur.fetchall():
+            wb[str(l_id)] = (st_, q_)
+            if st_ == "ignored":
+                ign_by[str(l_id)] = (err or "").replace("ignored by ", "", 1)
         for l_id in taken_elsewhere(cur, acct_uuid, [k for k, v in wb.items() if v[0] == "done"]):
             wb[l_id] = ("taken", wb[l_id][1])
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
@@ -5691,7 +5948,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         status, qbo_id = wb.get(str(lid), (None, None))
         item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
                 "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
-                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done", "taken") else None,
+                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done", "taken", "ignored") else None, "ign_by": ign_by.get(str(lid)),
                 "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not, "xfer_only": xfer_only,
                 "is_xfer": bool(acct and acct.get("xfer")),
                 "dups": dups.get(str(lid), [])[:3]}
@@ -5782,8 +6039,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
-            "record_rows": sorted(writebacks + deposits, key=_record_rank),
-            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] != "done"),
+            "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored"], key=_record_rank),
+            "ignored": sorted([w for w in writebacks + deposits if w["wb"] == "ignored"], key=lambda w: w["date"]),
+            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored")),
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "acct_linked": bool(acct_qbo),
@@ -6073,7 +6331,7 @@ def apply_focus(d, f0, f1):
     d["matched"] = [m for m in d["matched"] if inw(m[2])]
     d["reviewable"] = [r for r in d["reviewable"] if side_in(r)]
     d["user_matches"] = [u for u in d["user_matches"] if side_in(u)]
-    for k in ("writebacks", "deposits", "record_rows"):
+    for k in ("writebacks", "deposits", "record_rows", "ignored"):
         d[k] = [w for w in d[k] if inw(w["date"])]
     d["on_stmt"] = [l for l in d["on_stmt"] if inw(l[1])]
     d["in_books"] = [t for t in d["in_books"] if inw(t[1])]
@@ -6084,7 +6342,7 @@ def apply_focus(d, f0, f1):
     d["xfer_dismissed"] = [x for x in d["xfer_dismissed"] if inw(x["date"])]
     d["xfer_recorded"] = [t for t in d["xfer_recorded"] if inw(t["date"])]
     d["n_pending"] = sum(1 for r in d["reviewable"] if r["status"] == "proposed")
-    d["n_to_record"] = sum(1 for w in d["record_rows"] if w["wb"] != "done")
+    d["n_to_record"] = sum(1 for w in d["record_rows"] if w["wb"] not in ("done", "ignored"))
     return d
 
 
@@ -6129,12 +6387,15 @@ def detail(name):
         cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (st[0],))
         prep, signed_by, saved_at, saved_by = cur.fetchone() or (None, None, None, None)
         clr = None if st[3] else cleared_to(cur, st[0], st[1], st[2])
-        cur.execute("""SELECT count(*) FILTER (WHERE sl.amount <> 0),
-                              count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
-                                  SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
-                                  WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
-                       FROM statement_line sl WHERE sl.statement_id = %s
-                         AND sl.posted_date BETWEEN %s AND %s;""", (st[0], *(focus or (st[1], st[2]))))
+        cur.execute("""WITH done AS (SELECT DISTINCT msl.line_id FROM match_statement_line msl
+                                  JOIN match m ON m.match_id = msl.match_id
+                                  JOIN statement_line s2 ON s2.line_id = msl.line_id
+                                  WHERE s2.statement_id = %s AND m.status = 'confirmed')
+                       SELECT count(*) FILTER (WHERE sl.amount <> 0),
+                              count(*) FILTER (WHERE sl.amount <> 0 AND d.line_id IS NOT NULL)
+                       FROM statement_line sl LEFT JOIN done d ON d.line_id = sl.line_id
+                       WHERE sl.statement_id = %s AND sl.posted_date BETWEEN %s AND %s;""",
+                    (st[0], st[0], *(focus or (st[1], st[2]))))
         n_lines, n_matched_lines = cur.fetchone()
     cur.close(); conn.close()
     self_prepared = bool(rule("two_person") and prep and prep == session.get("name") and not session.get("is_admin"))
@@ -7525,6 +7786,39 @@ def record_reset(name):
                        WHERE line_id=%s AND (status='pending' OR (status='done' AND %s));""",
                     (session.get("name") or "user", lid, again))
         conn.commit(); cur.close(); conn.close()
+    return redirect(url_for("detail", name=name) + "#sec-record")
+
+
+@app.route("/account/<name>/record_ignore", methods=["POST"])
+def record_ignore(name):
+    """The line is already in QuickBooks: take it off the list to record without recording it (or undo
+    that). It stays unmatched -- on the statement, not in the books -- until it's matched."""
+    lid, undo = request.form.get("ignore") or "", bool(request.args.get("undo"))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT sl.posted_date, sl.amount FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   JOIN account a ON a.account_id=s.account_id
+                   WHERE a.name=%s AND sl.line_id::text=%s AND s.signed_off_at IS NULL;""", (name, lid))
+    row = cur.fetchone()
+    who = session.get("name") or session.get("username") or "user"
+    n = 0
+    if row and undo:
+        # Back to how it was: an entry already recorded for it shows again; otherwise it's ready to record.
+        cur.execute("""UPDATE writeback_log SET status = CASE WHEN coalesce(qbo_id,'') <> '' THEN 'done' ELSE 'failed' END,
+                         error = 'ignore undone by ' || %s WHERE line_id=%s AND status='ignored' RETURNING 1;""", (who, lid))
+        n = len(cur.fetchall())
+    elif row:
+        cur.execute("""INSERT INTO writeback_log (line_id, status, created_by, error) VALUES (%s, 'ignored', %s, 'ignored by ' || %s)
+                       ON CONFLICT (line_id) DO UPDATE SET status='ignored', error=EXCLUDED.error
+                       WHERE writeback_log.status <> 'ignored' RETURNING 1;""", (lid, who, who))
+        n = len(cur.fetchall())
+    conn.commit(); cur.close(); conn.close()
+    if n:
+        what = f"the line of {row[0].strftime('%d/%m/%Y')}, {row[1]:,.2f}"
+        log_activity(("undid ignoring " if undo else "ignored ") + what + ("" if undo else " (in QuickBooks)"), name)
+        session["detail_msg"] = (f"Restored {what}: it's back in the list to record." if undo else
+                                 f"Ignored {what}: it won't be recorded from here.")
+    else:
+        session["detail_msg"] = "Nothing changed: that line was already done, or its reconciliation is signed off."
     return redirect(url_for("detail", name=name) + "#sec-record")
 
 

@@ -121,7 +121,30 @@ A.set_config("record_job:Stanbic", json.dumps({"state": "running", "total": 10, 
 upload([("2026-09-25", "LATE ITEM", -900)])
 LI = lid("LATE ITEM")
 p = page()
-check("while recording: progress shown", "id=recjob" in p and "<b class=rj-n>3</b> of 10 lines done" in p)
+check("while recording: a progress bar with the percentage done", "id=recjob" in p and "<b class=rj-pct>30%</b>" in p
+      and 'aria-valuenow="30"><i style="width:30%">' in p and "lines done" not in p)
+import os, shutil, subprocess, tempfile
+node = shutil.which("node")
+if node and os.path.isdir(os.path.join(H.HERE, "node_modules", "jsdom")):
+    JS = r"""
+const { JSDOM } = require("jsdom");
+const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", pretendToBeVisual: true,
+  beforeParse(w) { w.fetch = () => Promise.resolve({ json: () => ({ state: "running", n: 7, total: 10 }) });
+                   const st = w.setTimeout; w.setTimeout = (f, ms) => st(f, ms > 100 ? 5 : ms); } });
+setTimeout(() => { const d = dom.window.document;
+  console.log(JSON.stringify({ pct: d.querySelector(".rj-pct").textContent, w: d.querySelector(".rj-bar i").style.width,
+                               aria: d.querySelector(".rj-bar").getAttribute("aria-valuenow") })); process.exit(0); }, 300);
+"""
+    f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(p); f.close()
+    g = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8"); g.write(JS); g.close()
+    try:
+        res = subprocess.run([node, g.name, f.name], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+    finally:
+        os.unlink(f.name); os.unlink(g.name)
+    o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
+    check("…and the bar moves as lines are recorded (70% after 7 of 10)", o == {"pct": "70%", "w": "70%", "aria": "70"})
+else:
+    print("SKIP browser check (no node/jsdom)")
 n = len(POSTS)
 cl.post("/account/Stanbic/record", data={"only": LI, f"acct_{LI}": "83"})
 check("…and a second recording waits for it", len(POSTS) == n and "Still recording 10 lines" in msg())
