@@ -52,6 +52,9 @@ const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => err
 const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
 const w = dom.window, d = w.document, out = {};
 const ts = d.querySelector('.tsearch[data-table=rectbl]'), inp = ts.querySelector("input"), n = ts.querySelector(".ts-n");
+const sec = ts.closest("section.dsec");
+out.inHead = ts.parentNode.classList.contains("dsec-h") && ts.nextElementSibling && ts.nextElementSibling.classList.contains("dsec-badge");
+inp.click(); inp.dispatchEvent(new w.KeyboardEvent("keydown", { key: " ", bubbles: true })); out.stillOpen = !sec.classList.contains("closed");
 const find = v => { inp.value = v; inp.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Enter", bubbles: true })); };
 const shown = () => [...d.querySelectorAll("#rectbl tr[data-amt]")].filter(r => !r.classList.contains("tsx"))
                       .map(r => r.querySelector(".desc").firstChild.nodeValue.trim());
@@ -82,6 +85,9 @@ out.errors = errors; console.log(JSON.stringify(out));
         print(res.stderr[-1500:])
     o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
     print("   ", o)
+    check("browser: the search sits in its section's heading, on the right before the status",
+          o.get("inHead") is True)
+    check("browser: clicking or typing a space in it doesn't fold the section", o.get("stillOpen") is True)
     check("browser: searching a word shows just those lines", o.get("excise") == ["EXCISE DUTY"] * 3
           and o.get("exciseN", "").startswith("Showing 3 of 12"))
     check("browser: Tick only these ticks the lines found and unticks every other",

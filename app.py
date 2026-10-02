@@ -1689,7 +1689,12 @@ html{color-scheme:light}
 [hidden]{display:none!important}
 .spin-sm{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:4px}
 .tsearch{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:6px 0}
-.tsearch input{flex:1 1 240px;max-width:420px;padding:5px 9px;border:1px solid var(--line);border-radius:6px;font-size:13px;background:var(--panel);color:var(--ink)}
+.tsearch input{flex:1 1 240px;max-width:420px;padding:5px 9px 5px 28px;border:1px solid #b9c2d0;border-radius:6px;font-size:13px;color:var(--ink);background:var(--panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23667085' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") no-repeat 9px center}
+.tsearch input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.tsearch.in-h{margin:0 0 0 auto;flex-wrap:nowrap;font-weight:400;cursor:default}
+.tsearch.in-h input{flex:0 1 280px;width:280px;min-width:150px}
+.tsearch.in-h+.dsec-badge{margin-left:8px}
+@media (max-width:760px){.dsec>h2.dsec-h{flex-wrap:wrap}.tsearch.in-h{flex-wrap:wrap;margin-left:0;flex-basis:100%;order:5}.tsearch.in-h input{flex:1 1 200px;width:auto}}
 .tsearch .btn-sm{width:auto;display:inline-flex;padding:3px 10px}.tsearch .ts-n{font-size:12px;color:var(--muted)}
 tr.tsx{display:none!important}
 .bulkbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px;padding:5px 8px;font-size:13px;color:var(--muted);border:1px dashed transparent;border-radius:8px}
@@ -1754,6 +1759,9 @@ tr:hover>td{background:var(--row)}
 .upload input[type=file]{font-size:12.5px}
 .exc th{color:var(--bad)}
 .recgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.fbal{background:var(--gold-soft);border:1px solid #e6d29a;border-left:4px solid var(--gold);border-radius:8px;padding:10px 12px;margin:0 0 14px}
+.fbal-h{font-size:13px;margin:0 0 8px}.fbal-h .muted{font-size:12px}
+.fbal .rec{background:var(--panel)}
 .recgrid table{margin:0}
 .rec td{white-space:normal}
 .rec tr.tot td{font-weight:600;background:#fbfbfc;border-top:1px solid var(--line)}
@@ -2129,6 +2137,11 @@ if(lf)lf.addEventListener('submit',function(){var rf=document.getElementById('re
 document.querySelectorAll('.tsearch').forEach(function(ts){
   var tb=document.getElementById(ts.getAttribute('data-table'));if(!tb)return;
   var inp=ts.querySelector('input'),out=ts.querySelector('.ts-n'),sel=ts.getAttribute('data-pick'),gs=null,tm=null;
+  // In its section's heading bar (right side, before the status), where it's seen even with the section folded.
+  var body=ts.closest('.dsec-body'),sec=body&&!ts.closest('details')&&body.parentNode,hd=sec&&sec.querySelector('h2.dsec-h');
+  if(hd&&!hd.querySelector('.tsearch')){ts.classList.add('in-h');hd.insertBefore(ts,hd.querySelector('.dsec-badge'));
+    ['click','keydown','keyup','mousedown'].forEach(function(t){ts.addEventListener(t,function(e){e.stopPropagation()})});
+    inp.addEventListener('focus',function(){if(sec.classList.contains('closed'))hd.click()})}
   var FOL=['splitrow','hedgerow','kidsrow','xferedit'];
   function groups(){var g=null,res=[];[].forEach.call(tb.rows,function(r){if(r.querySelector('th'))return;
     if(g&&FOL.some(function(c){return r.classList.contains(c)})){g.push(r);return}g=[r];res.push(g)});return res}
@@ -4566,13 +4579,40 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <button type=button class=tile data-target="sec-review" data-fallback="sec-matched"><span class=t-label>To review</span><span class="t-val {{ 'warn' if n_pending else '' }}">{{ n_pending }}</span></button>
 <button type=button class=tile data-target="sec-record" data-fallback="sec-exceptions"><span class=t-label>To record</span><span class="t-val {{ 'warn' if n_to_record else '' }}">{{ n_to_record }}</span></button>
 <button type=button class=tile data-target="sec-transfers" data-fallback="sec-record"><span class=t-label>Transfers</span><span class="t-val {{ 'warn' if n_xfer else '' }}">{{ n_xfer }}</span></button>
-<button type=button class=tile data-target="sec-balance"><span class=t-label>Difference</span><span class="t-val {{ 'bad' if rec.status=='out' else '' }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</span></button>
+{% if fbal %}<button type=button class=tile data-target="sec-balance" title="The difference as at {{ fbal.date.strftime('%d/%m/%Y') }}; the whole statement's is under Balance reconciliation"><span class=t-label>Difference at {{ fbal.date.strftime('%d/%m') }}</span><span class="t-val {{ 'bad' if fbal.diff else '' }}">{% if fbal.diff is none %}—{% else %}{{ fbal.diff|money }}{% endif %}</span></button>
+{% else %}<button type=button class=tile data-target="sec-balance"><span class=t-label>Difference</span><span class="t-val {{ 'bad' if rec.status=='out' else '' }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</span></button>{% endif %}
 <div class=so>{% if signed_off %}<span class="pill ok">Signed off {{ signed_off }}</span>{% if can('reopen') %}<form method=post action="{{ url_for('reopen', name=name) }}" data-confirm="Reopen this reconciliation? You can sign it off again afterwards."><button type=submit class=btn-sm>Undo sign-off</button></form>{% endif %}
 {% elif rec.status=='balanced' and not n_pending_all and can('signoff') and not self_prepared %}<form method=post action="{{ url_for('signoff', name=name) }}" data-confirm="Sign off this reconciliation? It is locked as reconciled for {{ p_start }} to {{ p_end }}."><button type=submit class=btn-go>Sign off</button></form><small>Balanced and reviewed</small>
 {% else %}<button type=button class=btn-go disabled title="{{ signoff_why }}">Sign off</button><small>{{ signoff_why }}</small>{% endif %}</div>
 </div>
 <h2 id=sec-balance style="font-size:15px" data-sec data-state="{{ 'done' if signed_off else ('ready' if rec.status=='balanced' else 'attn') }}" data-note="{{ ('Signed off ' ~ signed_off) if signed_off else ('Balanced' if rec.status=='balanced' else ('Out of balance' if rec.status=='out' else 'Balances needed')) }}">Balance reconciliation</h2>
 {% set cc = atype=='credit_card' %}
+{% if fbal %}{% set fd = fbal.date.strftime('%d/%m/%Y') %}<div class=fbal id=fbal>
+<div class=fbal-h><b>As at {{ fd }}</b> <span class=muted>— the dates you're focused on, worked out from the statement and the synced books</span></div>
+<div class=recgrid>
+<table class=rec>
+<tr><th colspan=2>Bank {{ 'card statement' if cc else 'statement' }}</th></tr>
+<tr><td>Balance at {{ fd }} <span class=src>· {{ 'opening + lines to that date' if fbal.bank_how == 'opening' else 'closing less the lines after it' }}</span></td><td class=a>{% if fbal.bank is none %}<span class=muted>needs the opening balance</span>{% else %}{{ fbal.bank|money }}{% endif %}</td></tr>
+<tr><td>Add: {{ 'charges' if cc else 'deposits' }} in books by then, not yet on statement ({{ fbal.n_out_in }})</td><td class=a>{{ fbal.out_in|money }}</td></tr>
+<tr><td>Less: {{ 'payments & refunds' if cc else 'payments' }} in books by then, not yet on statement ({{ fbal.n_out_out }})</td><td class=a>{{ fbal.out_out|money }}</td></tr>
+<tr class=tot><td>Adjusted bank balance</td><td class=a>{% if fbal.adj_bank is none %}—{% else %}{{ fbal.adj_bank|money }}{% endif %}</td></tr>
+</table>
+<table class=rec>
+<tr><th colspan=2>Books</th></tr>
+<tr><td>Book balance at {{ fd }} <span class=src>· at {{ p_end.strftime('%d/%m/%Y') }} less entries dated after {{ fd }}</span></td><td class=a>{% if fbal.book is none %}<span class=muted>needs the book balance</span>{% else %}{{ fbal.book|money }}{% endif %}</td></tr>
+<tr><td>Add/less: on statement by then, not in books ({{ fbal.n_unrec }})</td><td class=a>{{ fbal.unrec|money }}</td></tr>
+<tr><td>Add/less: amount differences on matched items ({{ fbal.n_match_adj }})</td><td class=a>{{ fbal.match_adj|money }}</td></tr>
+<tr class=tot><td>Adjusted book balance</td><td class=a>{% if fbal.adj_book is none %}—{% else %}{{ fbal.adj_book|money }}{% endif %}</td></tr>
+</table>
+</div>
+<div class="recres {{ 'incomplete' if fbal.diff is none else ('balanced' if fbal.diff == 0 else 'out') }}">
+{% if fbal.diff is none %}<span>Enter the {{ fbal.missing }} under Edit balances (for the whole statement) to see this</span><span>—</span>
+{% elif fbal.diff == 0 %}<span>&#10003; Balanced at {{ fd }}</span><span>0.00</span>
+{% else %}<span>Out of balance at {{ fd }}</span><span>{{ fbal.diff|money }}</span>{% endif %}
+</div>
+<div class=sub style="margin:4px 0 4px;font-size:12.5px">A match counts as cleared at {{ fd }} only when both its sides are dated by then. The book balance assumes the books are synced; refresh from QuickBooks if entries were added since. Below: the whole statement ({{ p_start.strftime('%d/%m/%Y') }} – {{ p_end.strftime('%d/%m/%Y') }}), which is what's signed off.</div>
+</div>
+{% endif %}
 <div class=recgrid>
 <table class=rec>
 <tr><th colspan=2>Bank {{ 'card statement' if cc else 'statement' }}</th></tr>
@@ -4601,11 +4641,12 @@ f.querySelector('button[type=submit]').click()})})();</script>
 {% if rec.bf_count %}<div class=sub style="margin:4px 0 8px;font-size:13px">Includes {{ rec.bf_count }} item{{ '' if rec.bf_count==1 else 's' }} brought forward from earlier periods, still not cleared by the bank.</div>{% endif %}
 <details {% if rec.status=='incomplete' %}open{% endif %} style="margin:10px 0 20px">
 <summary style="cursor:pointer;color:var(--accent);font-size:13px;font-weight:600">Edit balances</summary>
+{% if focus %}<div class="recnote warn" style="margin:8px 0">These are the whole statement's balances ({{ p_start.strftime('%d/%m/%Y') }} – {{ p_end.strftime('%d/%m/%Y') }}), not the dates you're focused on: the balances at {{ focus[1].strftime('%d/%m/%Y') }} are worked out above. The period can't be changed while focused; choose Whole statement first.</div>{% endif %}
 <form method=post action="{{ url_for('balances', name=name) }}" class=balform>
-<div><label>Period start</label><input type=date name=period_start value="{{ p_start }}"></div>
-<div><label>Period end</label><input type=date name=period_end value="{{ p_end }}"></div>
-<div><label>Opening balance</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening|money }}"></div>
-<div><label>Closing balance (statement)</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing|money }}"></div>
+<div><label>Period start</label><input type=date name=period_start value="{{ p_start }}"{% if focus %} readonly title="Choose Whole statement to change the period"{% endif %}></div>
+<div><label>Period end</label><input type=date name=period_end value="{{ p_end }}"{% if focus %} readonly title="Choose Whole statement to change the period"{% endif %}></div>
+<div><label>Opening balance{{ ' (whole statement)' if focus else '' }}</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening|money }}"></div>
+<div><label>Closing balance ({{ 'whole statement' if focus else 'statement' }})</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing|money }}"></div>
 <div><label>Book balance at {{ p_end }}</label><input name=book inputmode=decimal value="{{ '' if rec.book is none else rec.book|money }}"></div>
 <button type=submit class=btn-sm>Save balances</button>
 </form>
@@ -5958,6 +5999,62 @@ def focus_choices(ps, pe):
     return {"weeks": weeks, "months": months}
 
 
+def focus_balance(cur, acct_uuid, sid, pe, rec, f1):
+    """The balance proof as at `f1` (a date inside the statement), worked out from what's there:
+        bank at f1 = opening + statement lines dated up to f1 (or closing - the lines after f1)
+        book at f1 = book balance at period end - book entries dated after f1
+    A confirmed match counts as cleared at f1 only when every item in it is dated up to f1; otherwise
+    its items dated up to f1 are outstanding, each on its own side. At f1 = period end this is the
+    statement's own reconciliation."""
+    Z = Decimal(0)
+    cur.execute("""SELECT m.match_id, sl.line_id, sl.posted_date, sl.amount, 'l' FROM match m
+                     JOIN match_statement_line msl ON msl.match_id=m.match_id JOIN statement_line sl ON sl.line_id=msl.line_id
+                   WHERE m.statement_id=%s AND m.status='confirmed'
+                   UNION ALL
+                   SELECT m.match_id, bt.txn_id, bt.posted_date, bt.amount, 'b' FROM match m
+                     JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                   WHERE m.statement_id=%s AND m.status='confirmed';""", (sid, sid))
+    groups = {}
+    for mid, iid, d, a, side in cur.fetchall():
+        groups.setdefault(mid, []).append((iid, d, a, side))
+    cleared, delta, d_n, matched_books = set(), Z, 0, {}
+    for items in groups.values():
+        for iid, d, a, side in items:
+            if side == "b":
+                matched_books[iid] = (iid, d, a, "")
+        if all(d <= f1 for _, d, _, _ in items):
+            cleared |= {iid for iid, _, _, _ in items}
+            dd = sum((a for _, _, a, sd in items if sd == "l"), Z) - sum((a for _, _, a, sd in items if sd == "b"), Z)
+            if dd:
+                delta += dd; d_n += 1
+    lines = rec["lines"]
+    un_lines = [l for l in lines if l[1] <= f1 and l[0] not in cleared]
+    pool_ids = {t[0] for t in rec["pool"]}
+    books = list(rec["pool"]) + [t for k, t in matched_books.items() if k not in pool_ids]
+    un_books = [t for t in books if t[1] <= f1 and t[0] not in cleared]
+    to_f1 = sum((l[2] for l in lines if l[1] <= f1), Z)
+    after = sum((l[2] for l in lines if l[1] > f1), Z)
+    bank = (rec["opening"] + to_f1 if rec["opening"] is not None else
+            rec["closing"] - after if rec["closing"] is not None else None)
+    book = None
+    if rec["book"] is not None:
+        cur.execute("""SELECT coalesce(sum(amount),0), count(*) FROM book_txn WHERE account_id=%s
+                       AND posted_date > %s AND posted_date <= %s
+                       AND coalesce(is_void,false)=false AND coalesce(is_deleted,false)=false;""", (acct_uuid, f1, pe))
+        later, n_later = cur.fetchone()
+        book = rec["book"] - later
+    r = {"date": f1, "bank": bank, "book": book,
+         "bank_how": "opening" if rec["opening"] is not None else "closing",
+         "out_in": sum((t[2] for t in un_books if t[2] > 0), Z), "n_out_in": sum(1 for t in un_books if t[2] > 0),
+         "out_out": sum((t[2] for t in un_books if t[2] < 0), Z), "n_out_out": sum(1 for t in un_books if t[2] < 0),
+         "unrec": sum((l[2] for l in un_lines), Z), "n_unrec": len(un_lines), "match_adj": delta, "n_match_adj": d_n}
+    r["adj_bank"] = bank + r["out_in"] + r["out_out"] if bank is not None else None
+    r["adj_book"] = book + r["unrec"] + r["match_adj"] if book is not None else None
+    r["diff"] = r["adj_bank"] - r["adj_book"] if bank is not None and book is not None else None
+    r["missing"] = " and ".join(w for w, v in (("opening (or closing) balance", bank), ("book balance", book)) if v is None)
+    return r
+
+
 def apply_focus(d, f0, f1):
     """Narrow the account page's lists to items dated f0..f1. The balances, difference and sign-off
     still cover the whole statement (n_pending_all keeps the sign-off's count)."""
@@ -6037,8 +6134,12 @@ def detail(name):
                    "Balance the reconciliation first" if rec.get("status") != "balanced" else
                    "You prepared it: a second person (or an admin) signs off" if self_prepared else "")
     d["n_pending_all"] = d.get("n_pending")
+    d["fbal"] = None
     if focus:
         apply_focus(d, *focus)
+        conn = get_conn(); cur = conn.cursor()
+        d["fbal"] = focus_balance(cur, acct_uuid, st[0], st[2], d["rec"], focus[1])
+        cur.close(); conn.close()
     open_upload = bool(request.args.get("upload") or request.args.get("pdfpw")) and can("upload")
     # The upload's result stays while the QuickBooks refresh it started is running (the page reloads
     # when that finishes), so it isn't lost; otherwise each message is shown once.

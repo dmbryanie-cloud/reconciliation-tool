@@ -10,7 +10,8 @@ import io, json, os, re, shutil, subprocess, sys, tempfile
 import harness as H
 
 STB = "00000000-0000-0000-0000-0000000000a1"
-A, c = H.setup(H.account_sql((STB, "35", "Stanbic UGX", "bank")))
+CEN = "00000000-0000-0000-0000-0000000000c1"
+A, c = H.setup(H.account_sql((STB, "35", "Stanbic UGX", "bank"), (CEN, "39", "Centenary UGX", "bank")))
 cur = c.cursor()
 T = H.Checker()
 check = T.check
@@ -100,6 +101,51 @@ check("a long statement also offers each month", 'label="Months"' in p
 p = page("?from=2026-02-01&to=2026-02-28")
 check("focusing on one month of a year's statement lists just that month",
       "FEB FEES" in p and "OCT FEES" not in p and "JUN FEES" not in p and "of 1 lines these days" in p)
+
+# ---- the balance as at the focus end date ---------------------------------------------------------------------------
+for i, (d, amt, who) in enumerate([("2026-06-02", 300000, "Fees A"), ("2026-06-10", -50000, "Cheque 101"),
+                                    ("2026-06-25", -30000, "Rent"), ("2026-06-20", 100000, "Fees B")]):
+    q("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount, currency,
+         description, counterparty, last_modified) VALUES (%s,%s,%s,'Deposit',%s,%s,'UGX',%s,%s,now()) RETURNING 1""",
+      (A.ORG_ID, CEN, f"cb{i}", d, amt, who, who))
+body = "Date,Description,Amount\n" + "".join(f"{d},{x},{a}\n" for d, x, a in [
+    ("2026-06-02", "FEES A", 300000), ("2026-06-05", "LEDGER FEES", -2000), ("2026-06-15", "CHEQUE 101", -50000),
+    ("2026-06-20", "FEES B", 100000)])
+cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "c.csv"), "opening_balance": "1,000,000",
+        "closing_balance": "1,348,000", "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
+def cpage(qs=""):
+    return cl.get("/account/Centenary UGX" + qs).data.decode()
+p = cpage("?from=2026-06-08&to=2026-06-12")
+check("before a book balance is entered, the as-at panel says what it needs",
+      "As at 12/06/2026" in p and "Enter the book balance under Edit balances" in p)
+cl.post("/account/Centenary UGX/balances", data={"opening": "1,000,000", "closing": "1,348,000", "book": "1,320,000",
+        "period_start": "2026-06-01", "period_end": "2026-06-30"})
+p = cpage()
+fb = re.search(r"<div class=fbal id=fbal>.*?</div>\s*</div>", p, re.S)
+fb = fb.group(0) if fb else ""
+# bank at 12/06 = 1,000,000 + 300,000 - 2,000; books at 12/06 = 1,320,000 less Rent (25/06) and Fees B (20/06);
+# the cheque booked 10/06 clears the bank on 15/06, so it's outstanding at 12/06; the ledger fee isn't in the books.
+check("bank balance at the focus end: opening + the lines up to it", "1,298,000.00" in fb)
+check("book balance at the focus end: the balance at period end less later entries", "1,250,000.00" in fb)
+check("a match whose bank side clears after the date is outstanding at it", "payments in books by then, not yet on statement (1)" in fb
+      and "-50,000.00" in fb and "on statement by then, not in books (1)" in fb and "-2,000.00" in fb)
+check("…and the week balances", "Balanced at 12/06/2026" in fb and "1,248,000.00" in fb)
+check("the Difference tile shows the focus date's difference", "Difference at 12/06</span><span class=\"t-val \">0.00" in p)
+check("the whole statement's reconciliation is still shown below", "Balanced — adjusted bank and book balances agree" in p)
+check("Edit balances says it's the whole statement, and the period can't be changed while focused",
+      "These are the whole statement's balances (01/06/2026 – 30/06/2026)" in p
+      and re.search(r'name=period_end value="2026-06-30" readonly', p) is not None and "Opening balance (whole statement)" in p)
+cl.post("/account/Centenary UGX/balances", data={"opening": "1,000,000", "closing": "1,348,000", "book": "1,321,000",
+        "period_start": "2026-06-01", "period_end": "2026-06-30"})
+p = cpage()
+check("saving balances while focused keeps the focus and saves them", "Balances saved." in p and "Showing only" in p
+      and q("SELECT book_balance FROM statement WHERE account_id=%s", (CEN,))[0][0] == 1321000)
+check("…a wrong book balance shows out of balance at the date", "Out of balance at 12/06/2026" in p and "-1,000.00" in p)
+p = cpage("?from=2026-06-03&to=2026-06-30")
+fb = re.search(r"<div class=fbal id=fbal>.*?</div>\s*</div>", p, re.S).group(0)
+check("at the statement's last day the as-at figures are the statement's own",
+      "Out of balance at 30/06/2026" in fb and "1,348,000.00" in fb and "-1,000.00" in fb)
+cpage("?focus=off")
 
 # ---- in the browser: picking a week fills the dates and shows it -------------------------------------------------------
 node = shutil.which("node")
