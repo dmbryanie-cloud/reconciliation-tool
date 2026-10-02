@@ -105,7 +105,10 @@ st = st_of()
 check("Reject selected rejects the one still to review, leaving confirmed ones alone",
       st[L[2]] == "rejected" and st[L[0]] == "confirmed" and "Rejected 1 suggested match." in flash(page()))
 cl.post("/account/Stanbic UGX/review_bulk", data={"status": "confirmed"})
-check("nothing ticked: nothing changes, and it says so", "Nothing changed" in flash(page()))
+check("nothing ticked: nothing changes, and it says so", "Nothing changed: tick the suggestions" in flash(page()))
+cl.post("/account/Stanbic UGX/review_bulk", data={"status": "confirmed", "mid": ["00000000-0000-0000-0000-000000000000"]})
+check("ticked ones that were reviewed or refreshed meanwhile: it says why, not 'tick first'",
+      "already reviewed, or a QuickBooks sync refreshed them" in flash(page()))
 cl.post("/account/Stanbic UGX/review/" + q("SELECT match_id::text FROM match WHERE status='rejected'")[0][0], data={"status": "proposed"})     # back to review (Undo)
 P = proposed()
 cl.post("/account/DFCU UGX/review_bulk", data={"status": "confirmed", "mid": P})
@@ -163,6 +166,7 @@ if not node or not os.path.isdir(os.path.join(H.HERE, "node_modules", "jsdom")):
     print("SKIP browser checks (no node/jsdom)")
 else:
     q("UPDATE match SET status='proposed' WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s) RETURNING 1", (STB,))
+    cl.post("/account/Stanbic UGX/review_bulk", data={"status": "confirmed"})    # a "nothing ticked" hint on the page
     html = page()
     JS = r"""
 const { JSDOM, VirtualConsole } = require("jsdom");
@@ -181,6 +185,7 @@ all.click(); out.offAgain = conf.disabled;
 const up = d.getElementById("dr-upload"); d.querySelector("[data-drawer=upload]").click(); out.upOpen = !up.hidden;
 const uf = up.querySelector("form");
 uf.dispatchEvent(new w.SubmitEvent("submit", { cancelable: true, bubbles: true }));
+const fl = d.getElementById("flash"); out.flashCls = fl ? fl.className : null;
 setTimeout(() => { out.upClosed = up.hidden; out.errors = errors; console.log(JSON.stringify(out)); }, 50);
 """
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
@@ -202,6 +207,7 @@ setTimeout(() => { out.upClosed = up.hidden; out.errors = errors; console.log(JS
           and o.get("yes") == "Reject")
     check("browser: unticking all switches the buttons off again", o.get("offAgain") is True)
     check("browser: sending the upload closes its panel", o.get("upOpen") and o.get("upClosed") is True)
+    check("browser: a 'nothing ticked' hint is shown quietly, not as an error", o.get("flashCls") == "note")
     check("browser: no script errors", o.get("errors") == [])
 
 sys.exit(T.summary())

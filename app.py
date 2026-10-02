@@ -1937,6 +1937,8 @@ details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6p
 #flash.ok{background:#1f6b4a}#flash.ok b{display:block;margin-bottom:2px}
 #flash{position:fixed;right:16px;bottom:16px;z-index:80;background:var(--navy);color:#fff;border-radius:8px;padding:10px 38px 10px 14px;box-shadow:0 10px 26px rgba(19,33,59,.28);max-width:min(420px,calc(100% - 32px));font-size:13px;line-height:1.45;animation:tin .2s ease}
 #flash.err{background:#7a1a12}
+#flash.note{background:var(--gold-soft);color:#4a3b12;border:1px solid #e6d29a;border-left:4px solid var(--gold);box-shadow:0 6px 18px rgba(19,33,59,.12)}
+#flash.note .x{color:#8a7432}
 #flash .x{position:absolute;right:6px;top:6px;background:none;border:0;color:#cfd7e6;cursor:pointer;font-size:16px;line-height:1;padding:3px 6px}
 #flash a{color:var(--gold);font-weight:600}
 @keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
@@ -2140,9 +2142,11 @@ document.querySelectorAll('form.bulkbar').forEach(function(bf){
 });
 // The result of the last action: a message in the corner that fades (problems stay until closed).
 var fl=document.getElementById('flash');
-if(fl){var bad=!fl.classList.contains('ok')&&/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
+if(fl){var note=!fl.classList.contains('ok')&&/^\\s*(nothing (changed|hidden|to save|to record)|pick at least)/i.test(fl.textContent);if(note)fl.classList.add('note');
+  var bad=!note&&!fl.classList.contains('ok')&&/(^|\\s)(not |nothing |couldn|can't|failed|refused|error|expired|isn't|wasn't)/i.test(fl.textContent);if(bad)fl.classList.add('err');
+  else if(!note&&/^\\s*(confirmed|rejected|recorded|saved|matched|signed off|restored)\\b/i.test(fl.textContent))fl.classList.add('ok');
   var x=document.createElement('button');x.type='button';x.className='x';x.setAttribute('aria-label','Close');x.textContent='\\u00d7';
-  x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad&&!fl.hasAttribute('data-stay'))setTimeout(function(){fl.hidden=true},6000)}
+  x.addEventListener('click',function(){fl.hidden=true});fl.appendChild(x);if(!bad&&!fl.hasAttribute('data-stay'))setTimeout(function(){fl.hidden=true},note||fl.classList.contains('ok')?10000:6000)}
 })();</script>
 """
 
@@ -4494,18 +4498,37 @@ setTimeout(tick,3000)})();</script>{% endif %}
 .drop b{color:var(--ink)}.drop a{color:var(--accent)}.drop input{font-size:12.5px;margin-top:6px;max-width:100%}
 .ccyf{display:flex;gap:6px;align-items:center;padding:4px 10px}.ccyf label{font-size:12px;color:var(--muted)}.ccyf input{width:64px;padding:3px 6px;border:1px solid var(--line);border-radius:5px;text-transform:uppercase;font-size:12.5px}
 .ccyf .btn-sm{width:auto;display:inline-flex;padding:3px 9px}
+.focusbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:0 0 8px;font-size:12.5px;color:var(--muted)}
+.focusbar input[type=date],.focusbar select{padding:3px 6px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;background:var(--panel);color:var(--ink)}
+.focusbar select{max-width:200px}.focusbar .btn-sm{width:auto;display:inline-flex;padding:3px 10px}
+.focusbar.on{background:var(--gold-soft);border:1px solid #e6d29a;border-left:4px solid var(--gold);border-radius:8px;padding:7px 10px;color:#4a3b12}
+.focusbar .fb-note{flex-basis:100%;font-size:12px}
 @media (max-width:1100px){.sumstrip{grid-template-columns:repeat(3,minmax(0,1fr))}.sumstrip .tile,.sumstrip .so{border-bottom:1px solid var(--line-soft)}}
 @media (max-width:600px){.sumstrip{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 {% if has_results %}
+<form method=get action="{{ url_for('detail', name=name) }}" class="focusbar{{ ' on' if focus else '' }}" id=focusbar>
+<b>{{ 'Showing only' if focus else 'Focus on dates' }}</b>
+<input type=date name=from value="{{ (focus[0] if focus else p_start) }}" min="{{ p_start }}" max="{{ p_end }}" aria-label="From">
+<span>to</span><input type=date name=to value="{{ (focus[1] if focus else p_end) }}" min="{{ p_start }}" max="{{ p_end }}" aria-label="To">
+{% if focus_picks and focus_picks.weeks|length > 1 %}<select data-pick aria-label="Pick a week or month"><option value="">Pick a week{{ ' or month' if focus_picks.months else '' }}…</option>
+{% if focus_picks.months %}<optgroup label="Months">{% for a, b, lab in focus_picks.months %}<option value="{{ a }}|{{ b }}">{{ lab }}</option>{% endfor %}</optgroup>{% endif %}
+<optgroup label="Weeks">{% for a, b in focus_picks.weeks %}<option value="{{ a }}|{{ b }}">{{ a.strftime('%d/%m') }}–{{ b.strftime('%d/%m/%Y') }}</option>{% endfor %}</optgroup></select>{% endif %}
+<button type=submit class=btn-sm data-busy="Narrowing to those dates...">Show</button>
+{% if focus %}<a class=btn-sm href="{{ url_for('detail', name=name, focus='off') }}" data-busy="Loading the whole statement...">Whole statement</a>
+<span class=fb-note>Lists, suggestions, things to record and transfers are narrowed to {{ focus[0].strftime('%d/%m/%Y') }} – {{ focus[1].strftime('%d/%m/%Y') }}. The balances, the difference and sign-off still cover the whole statement ({{ p_start.strftime('%d/%m/%Y') }} – {{ p_end.strftime('%d/%m/%Y') }}){% if n_pending_all != n_pending %}; {{ n_pending_all }} suggested match{{ '' if n_pending_all == 1 else 'es' }} to review in all{% endif %}.</span>{% endif %}
+</form>
+<script>(function(){var f=document.getElementById('focusbar'),p=f&&f.querySelector('[data-pick]');if(!p)return;
+p.addEventListener('change',function(){if(!p.value)return;var v=p.value.split('|');f.elements['from'].value=v[0];f.elements['to'].value=v[1];p.disabled=true;
+f.querySelector('button[type=submit]').click()})})();</script>
 <div class=sumstrip id=dtiles>
-<button type=button class="tile prog" data-target="sec-matched"><span class=t-label>Matched</span><span class=t-val>{{ n_matched_lines }} <small>of {{ n_lines }} lines</small></span><span class="bar{{ '' if n_matched_lines == n_lines else ' attn' }}"><i style="width:{{ (n_matched_lines * 100 / n_lines)|int if n_lines else 100 }}%"></i></span></button>
+<button type=button class="tile prog" data-target="sec-matched"><span class=t-label>Matched</span><span class=t-val>{{ n_matched_lines }} <small>of {{ n_lines }} lines{{ ' these days' if focus else '' }}</small></span><span class="bar{{ '' if n_matched_lines == n_lines else ' attn' }}"><i style="width:{{ (n_matched_lines * 100 / n_lines)|int if n_lines else 100 }}%"></i></span></button>
 <button type=button class=tile data-target="sec-review" data-fallback="sec-matched"><span class=t-label>To review</span><span class="t-val {{ 'warn' if n_pending else '' }}">{{ n_pending }}</span></button>
 <button type=button class=tile data-target="sec-record" data-fallback="sec-exceptions"><span class=t-label>To record</span><span class="t-val {{ 'warn' if n_to_record else '' }}">{{ n_to_record }}</span></button>
 <button type=button class=tile data-target="sec-transfers" data-fallback="sec-record"><span class=t-label>Transfers</span><span class="t-val {{ 'warn' if n_xfer else '' }}">{{ n_xfer }}</span></button>
 <button type=button class=tile data-target="sec-balance"><span class=t-label>Difference</span><span class="t-val {{ 'bad' if rec.status=='out' else '' }}">{% if rec.rec_diff is none %}—{% else %}{{ rec.rec_diff|money }}{% endif %}</span></button>
 <div class=so>{% if signed_off %}<span class="pill ok">Signed off {{ signed_off }}</span>{% if can('reopen') %}<form method=post action="{{ url_for('reopen', name=name) }}" data-confirm="Reopen this reconciliation? You can sign it off again afterwards."><button type=submit class=btn-sm>Undo sign-off</button></form>{% endif %}
-{% elif rec.status=='balanced' and not n_pending and can('signoff') and not self_prepared %}<form method=post action="{{ url_for('signoff', name=name) }}" data-confirm="Sign off this reconciliation? It is locked as reconciled for {{ p_start }} to {{ p_end }}."><button type=submit class=btn-go>Sign off</button></form><small>Balanced and reviewed</small>
+{% elif rec.status=='balanced' and not n_pending_all and can('signoff') and not self_prepared %}<form method=post action="{{ url_for('signoff', name=name) }}" data-confirm="Sign off this reconciliation? It is locked as reconciled for {{ p_start }} to {{ p_end }}."><button type=submit class=btn-go>Sign off</button></form><small>Balanced and reviewed</small>
 {% else %}<button type=button class=btn-go disabled title="{{ signoff_why }}">Sign off</button><small>{{ signoff_why }}</small>{% endif %}</div>
 </div>
 <h2 id=sec-balance style="font-size:15px" data-sec data-state="{{ 'done' if signed_off else ('ready' if rec.status=='balanced' else 'attn') }}" data-note="{{ ('Signed off ' ~ signed_off) if signed_off else ('Balanced' if rec.status=='balanced' else ('Out of balance' if rec.status=='out' else 'Balances needed')) }}">Balance reconciliation</h2>
@@ -4550,7 +4573,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=muted style="font-size:12px;margin-top:8px;line-height:1.5">Book balance is the account's register (or Balance Sheet) balance in QuickBooks as at the statement end date{{ ' — enter what you owe as a positive number' if cc else '' }}. Blank opening falls back to the last signed-off closing balance.</div>
 </details>
 <div style="margin-bottom:8px">
-{% if session.is_admin and not signed_off and (rec.status!='balanced' or n_pending) %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
+{% if session.is_admin and not signed_off and (rec.status!='balanced' or n_pending_all) %}<details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">Admin: sign off anyway</summary>
 <form method=post action="{{ url_for('signoff', name=name) }}" class=balform><input type=hidden name=override value=1>
 <div><label>Reason (recorded with the sign-off)</label><input name=note required style="width:340px;max-width:100%"></div>
 <button type=submit class=btn-sm style="color:var(--bad);border-color:var(--bad-soft)">Sign off unbalanced</button></form></details>{% endif %}
@@ -5833,6 +5856,70 @@ def switch_account():
     return redirect(url_for("detail", name=request.args.get("name", "")))
 
 
+def focus_window(name, sid, ps, pe):
+    """The dates the account page is narrowed to, or None for the whole statement. Set with
+    ?from=&to= (kept for this account and statement while you work), cleared with ?focus=off."""
+    key = "focus:" + name
+    if request.args.get("focus") == "off":
+        session.pop(key, None)
+        return None
+    f, t = request.args.get("from"), request.args.get("to")
+    if f or t:
+        try:
+            f = date.fromisoformat(f) if f else ps
+            t = date.fromisoformat(t) if t else pe
+        except ValueError:
+            f = t = None
+        if f and t:
+            f, t = sorted((max(min(f, pe), ps), max(min(t, pe), ps)))
+            if (f, t) == (ps, pe):
+                session.pop(key, None)
+            else:
+                session[key] = {"sid": str(sid), "f": f.isoformat(), "t": t.isoformat()}
+    v = session.get(key)
+    if v and v.get("sid") == str(sid):
+        return date.fromisoformat(v["f"]), date.fromisoformat(v["t"])
+    return None
+
+
+def focus_choices(ps, pe):
+    """Quick picks for the focus: each week (Monday to Sunday) of the statement, and each month of a long one."""
+    weeks, months, d = [], [], ps
+    while d <= pe:
+        end = min(d + timedelta(days=6 - d.weekday()), pe)
+        weeks.append((d, end)); d = end + timedelta(days=1)
+    if (pe - ps).days > 35:
+        d = ps
+        while d <= pe:
+            end = min((d.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1), pe)
+            full = d.day == 1 and (end + timedelta(days=1)).day == 1
+            months.append((d, end, d.strftime("%B %Y") + ("" if full else f" ({d:%d/%m}–{end:%d/%m})"))); d = end + timedelta(days=1)
+    return {"weeks": weeks, "months": months}
+
+
+def apply_focus(d, f0, f1):
+    """Narrow the account page's lists to items dated f0..f1. The balances, difference and sign-off
+    still cover the whole statement (n_pending_all keeps the sign-off's count)."""
+    inw = lambda x: x is not None and f0 <= x <= f1
+    side_in = lambda r: any(inw(x[0]) for x in r["sls"]) or (not r["sls"] and any(inw(x[0]) for x in r["bts"]))
+    d["matched"] = [m for m in d["matched"] if inw(m[2])]
+    d["reviewable"] = [r for r in d["reviewable"] if side_in(r)]
+    d["user_matches"] = [u for u in d["user_matches"] if side_in(u)]
+    for k in ("writebacks", "deposits", "record_rows"):
+        d[k] = [w for w in d[k] if inw(w["date"])]
+    d["on_stmt"] = [l for l in d["on_stmt"] if inw(l[1])]
+    d["in_books"] = [t for t in d["in_books"] if inw(t[1])]
+    d["all_unmatched"] = [l for l in d["all_unmatched"] if inw(l[1])]
+    ids = {l[0] for l in d["all_unmatched"]}
+    d["xfers"] = {k: v for k, v in d["xfers"].items() if k in ids}
+    d["n_xfer"] = sum(len(v) for v in d["xfers"].values())
+    d["xfer_dismissed"] = [x for x in d["xfer_dismissed"] if inw(x["date"])]
+    d["xfer_recorded"] = [t for t in d["xfer_recorded"] if inw(t["date"])]
+    d["n_pending"] = sum(1 for r in d["reviewable"] if r["status"] == "proposed")
+    d["n_to_record"] = sum(1 for w in d["record_rows"] if w["wb"] != "done")
+    return d
+
+
 @app.route("/account/<name>")
 def detail(name):
     conn = get_conn(); cur = conn.cursor()
@@ -5869,6 +5956,7 @@ def detail(name):
     prep = signed_by = saved_at = saved_by = clr = None
     rec_to = reconciled_to(cur, acct_uuid)
     n_lines = n_matched_lines = 0
+    focus = focus_window(name, st[0], st[1], st[2]) if st and d.get("has_results") else None
     if st:
         cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (st[0],))
         prep, signed_by, saved_at, saved_by = cur.fetchone() or (None, None, None, None)
@@ -5877,7 +5965,8 @@ def detail(name):
                               count(*) FILTER (WHERE sl.amount <> 0 AND EXISTS (
                                   SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
                                   WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
-                       FROM statement_line sl WHERE sl.statement_id = %s;""", (st[0],))
+                       FROM statement_line sl WHERE sl.statement_id = %s
+                         AND sl.posted_date BETWEEN %s AND %s;""", (st[0], *(focus or (st[1], st[2]))))
         n_lines, n_matched_lines = cur.fetchone()
     cur.close(); conn.close()
     self_prepared = bool(rule("two_person") and prep and prep == session.get("name") and not session.get("is_admin"))
@@ -5886,6 +5975,9 @@ def detail(name):
                    f"Review the {d.get('n_pending')} suggested match{'' if d.get('n_pending') == 1 else 'es'} first" if d.get("n_pending") else
                    "Balance the reconciliation first" if rec.get("status") != "balanced" else
                    "You prepared it: a second person (or an admin) signs off" if self_prepared else "")
+    d["n_pending_all"] = d.get("n_pending")
+    if focus:
+        apply_focus(d, *focus)
     open_upload = bool(request.args.get("upload") or request.args.get("pdfpw")) and can("upload")
     # The upload's result stays while the QuickBooks refresh it started is running (the page reloads
     # when that finishes), so it isn't lost; otherwise each message is shown once.
@@ -5902,7 +5994,8 @@ def detail(name):
                                   rec_to=rec_to, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
-                                  mm_edit=session.pop("mm_edit", None), switch=switch, **d)
+                                  mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
+                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None, **d)
 
 
 def _form_amount(field):
@@ -6152,6 +6245,9 @@ def review_bulk(name):
         verb = "Confirmed" if status == "confirmed" else "Rejected"
         session["detail_msg"] = f"{verb} {n} suggested match{'' if n == 1 else 'es'}."
         log_activity(f"{verb.lower()} {n} suggested match{'' if n == 1 else 'es'}", name)
+    elif ids:
+        session["detail_msg"] = ("Nothing changed: the ticked suggestions were already reviewed, or a QuickBooks sync "
+                                 "refreshed them since the page loaded. The current ones are below; tick them again.")
     else:
         session["detail_msg"] = "Nothing changed: tick the suggestions to confirm or reject first."
     return redirect(url_for("detail", name=name) + "#sec-review")
