@@ -51,28 +51,35 @@ const { JSDOM, VirtualConsole } = require("jsdom");
 const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => errors.push(String(e.message || e)));
 const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
 const w = dom.window, d = w.document, out = {};
-const ts = d.querySelector('.tsearch[data-table=rectbl]'), inp = ts.querySelector("input"), n = ts.querySelector(".ts-n");
+const ts = d.querySelector('.tsearch[data-table=rectbl]'), inp = ts.querySelector("input"), tbar = ts.closest("section").querySelector(".tsbar"), n = tbar.querySelector(".ts-n");
 const sec = ts.closest("section.dsec");
 out.inHead = ts.parentNode.classList.contains("dsec-h") && ts.nextElementSibling && ts.nextElementSibling.classList.contains("dsec-badge");
+out.headOnlyBox = ts.querySelectorAll("button").length === 0 && !ts.querySelector(".ts-n");
+const bar = sec.querySelector(".tsbar"); out.barHiddenAtFirst = !!bar && bar.hidden;
+out.barBeforeTable = !!bar && bar.compareDocumentPosition(d.getElementById("rectbl")) === 4;
 inp.click(); inp.dispatchEvent(new w.KeyboardEvent("keydown", { key: " ", bubbles: true })); out.stillOpen = !sec.classList.contains("closed");
 const find = v => { inp.value = v; inp.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Enter", bubbles: true })); };
 const shown = () => [...d.querySelectorAll("#rectbl tr[data-amt]")].filter(r => !r.classList.contains("tsx"))
                       .map(r => r.querySelector(".desc").firstChild.nodeValue.trim());
 const ticked = () => [...d.querySelectorAll(".rsel:checked")].length;
-find("excise"); out.excise = shown(); out.exciseN = n.textContent;
-ts.querySelector("[data-only]").click(); out.onlyTicked = ticked(); out.onlyN = n.textContent;
+find("excise"); out.excise = shown(); out.exciseN = n.textContent; out.barShown = !bar.hidden;
+out.barHas = [...bar.querySelectorAll("button")].map(b => b.textContent);
+tbar.querySelector("[data-only]").click(); out.onlyTicked = ticked(); out.onlyN = n.textContent;
 out.onlyRight = [...d.querySelectorAll(".rsel:checked")].every(c => c.closest("tr").textContent.includes("EXCISE"));
 out.selcount = d.getElementById("selcount").textContent;
 find("1,500"); out.commas = shown(); find("1500"); out.plain = shown();
 find("10/06/2026"); out.dmy = shown(); find("2026-06-10 excise"); out.both = shown();
 find("student"); d.getElementById("selall").click(); out.allShown = ticked(); out.allN = n.textContent;
-ts.querySelector("[data-none]").click(); out.none = ticked();
+tbar.querySelector("[data-none]").click(); out.none = ticked();
 inp.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); out.cleared = shown().length; out.clearedN = n.textContent;
+out.barHiddenAfter = bar.hidden;
+find("ledger"); [...bar.querySelectorAll("button")].find(b => b.textContent === "Clear search").click();
+out.clearBtn = shown().length === 12 && inp.value === "" && bar.hidden;
 // suggested matches: the same search, and the bulk bar counts the ticks
 const rs = d.querySelector('.tsearch[data-table=revtbl]'), ri = rs.querySelector("input");
 ri.value = "student 4"; ri.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-rs.querySelector("[data-only]").click();
-out.revBtn = d.querySelector("#revbulk button").textContent; out.revN = rs.querySelector(".ts-n").textContent;
+const rbar = rs.closest("section").querySelector(".tsbar"); rbar.querySelector("[data-only]").click();
+out.revBtn = d.querySelector("#revbulk button").textContent; out.revN = rbar.querySelector(".ts-n").textContent;
 out.errors = errors; console.log(JSON.stringify(out));
 """
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
@@ -88,6 +95,12 @@ out.errors = errors; console.log(JSON.stringify(out));
     check("browser: the search sits in its section's heading, on the right before the status",
           o.get("inHead") is True)
     check("browser: clicking or typing a space in it doesn't fold the section", o.get("stillOpen") is True)
+    check("browser: only the box is in the heading; the results bar waits above the list, hidden until you search",
+          o.get("headOnlyBox") is True and o.get("barHiddenAtFirst") is True and o.get("barBeforeTable") is True)
+    check("browser: searching shows the bar with the count and Tick only these / Untick all / Clear search",
+          o.get("barShown") is True and o.get("barHas") == ["Tick only these", "Untick all", "Clear search"])
+    check("browser: clearing the search hides the bar again (Escape or Clear search)",
+          o.get("barHiddenAfter") is True and o.get("clearBtn") is True)
     check("browser: searching a word shows just those lines", o.get("excise") == ["EXCISE DUTY"] * 3
           and o.get("exciseN", "").startswith("Showing 3 of 12"))
     check("browser: Tick only these ticks the lines found and unticks every other",
