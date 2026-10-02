@@ -156,4 +156,5 @@ check("garbage id refused", cl.get("/account/Stanbic UGX/report?s=nope").status_
 check("unknown account", cl.get("/account/Nope/report").status_code == 404)
 fresh = A.app.test_client()
 check("login required", fresh.get("/account/Stanbic UGX/report").status_code == 302)
+check("the report footer names the app ReconBook", "EAT · ReconBook</span></footer>" in cl.get("/account/Stanbic UGX/report").data.decode() and "Reconciliation Tool" not in cl.get("/account/Stanbic UGX/report").data.decode())
 sys.exit(T.summary())

@@ -6141,7 +6141,7 @@ footer{margin-top:22px;padding-top:8px;border-top:1px solid var(--line);font-siz
 <div><div class=who>{% if r.signed_at %}{{ r.signed_by }}, {{ r.signed_at.strftime('%d %b %Y') }}{% endif %}</div><div class=line>Prepared and signed off by · date</div></div>
 <div><div class=who></div><div class=line>Reviewed by · signature · date</div></div>
 </div>
-<footer><span>Amounts in {{ ccy or 'account currency' }}. Brackets are negative.</span><span>Generated {{ now }} EAT · Reconciliation Tool</span></footer>
+<footer><span>Amounts in {{ ccy or 'account currency' }}. Brackets are negative.</span><span>Generated {{ now }} EAT · ReconBook</span></footer>
 </div></body></html>"""
 
 
