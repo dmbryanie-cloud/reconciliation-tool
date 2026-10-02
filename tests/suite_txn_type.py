@@ -62,7 +62,7 @@ upload("Stanbic UGX", [("2026-07-01", "TO DFCU", -500000), ("2026-07-04", "SCHOO
 TR, FE, RE_, CH, RS = (lid(x) for x in ("TO DFCU", "SCHOOL FEES AMY", "RENT AUG", "EXCISE DUTY", "RANDOM SHOP"))
 html = cl.get("/account/Stanbic UGX").data.decode()
 def row(l):
-    m = re.search(rf'<tr data-amt="[^"]*">\s*<td><input type=checkbox name=sel value="{l}".*?</tr>', html, re.S)
+    m = re.search(rf'<tr data-amt="[^"]*"[^>]*>\s*<td><input type=checkbox name=sel value="{l}".*?</tr>', html, re.S)
     return m.group(0) if m else ""
 check("each line has a Type box", html.count("<select class=ttype") >= 5 and "<th>Type and account</th>" in html)
 check("the transfer pair is guessed Transfer, with why", 'data-guess="xfer"' in row(TR) and "moves the other way on DFCU UGX" in row(TR))

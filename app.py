@@ -1734,6 +1734,41 @@ def guess_type(who, out, amount, sug_kind=None, conf=None, pair=None):
     return ("gl", "Most money out is an expense") if out else ("cust", "Most money in is a student or customer payment")
 
 
+CHIP_ACCOUNTS = 8    # account shortcuts above the list to record (the most used first)
+
+
+def line_categories(item, xt_ids):
+    """The shortcuts a line to record answers to: 'charge' (a bank charge), 'xfer' (money moved between
+    your own accounts), 'cust' (a student or customer payment) and 'a:<id>' -- the account suggested for
+    it from how the same payee was recorded in QuickBooks before (or chosen and saved)."""
+    aid = item.get("acct_id") or ""
+    cats = []
+    if is_bank_charge(item["who"], item["amount"]):
+        cats.append("charge")
+    if item.get("ttype") == "xfer" or item.get("xfer_only") or aid in xt_ids:
+        cats.append("xfer")
+    if aid.startswith("cust:") or item.get("ttype") == "cust":
+        cats.append("cust")
+    if aid and not aid.startswith("cust:"):
+        cats.append("a:" + aid)
+    return cats
+
+
+def record_chips(rows, names):
+    """Shortcuts for the list to record, each with how many lines it shows: bank charges, own transfers,
+    student payments, then the accounts most lines are suggested for. Only those with lines."""
+    count = {}
+    for w in rows:
+        for c in w.get("cats") or []:
+            count[c] = count.get(c, 0) + 1
+    fixed = [("charge", "Bank charges"), ("xfer", "Own transfers"), ("cust", "Student payments")]
+    chips = [{"key": k, "label": lab, "n": count[k]} for k, lab in fixed if count.get(k)]
+    accts = sorted(((k, n) for k, n in count.items() if k.startswith("a:") and names.get(k[2:])),
+                   key=lambda kn: (-kn[1], names[kn[0][2:]].lower()))
+    chips += [{"key": k, "label": names[k[2:]], "n": n, "acct": True} for k, n in accts[:CHIP_ACCOUNTS]]
+    return chips
+
+
 def is_bank_charge(text, amount):
     """A bank charge (fee, commission, excise duty...). The bank takes the same small amounts again and
     again, so a charge only ever pairs with a QuickBooks entry on exactly the same date."""
@@ -1889,6 +1924,10 @@ html{color-scheme:light}
 .tsbar .ts-n{font-size:12.5px;font-weight:600;color:var(--ink);margin-right:auto}.tsbar .btn-sm{width:auto;display:inline-flex;padding:3px 10px}
 @media (max-width:760px){.dsec>h2.dsec-h{flex-wrap:wrap}.tsearch.in-h{flex-wrap:wrap;margin-left:0;flex-basis:100%;order:5}.tsearch.in-h input{flex:1 1 200px;width:auto}}
 .tsearch .btn-sm{width:auto;display:inline-flex;padding:3px 10px}.tsearch .ts-n{font-size:12px;color:var(--muted)}
+.tschips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:4px 0 8px}.tschips .tc-l{font-size:12px;color:var(--muted)}
+.tschips .chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:999px;padding:2px 10px;font-size:12px;line-height:1.5;color:var(--ink);background:var(--panel);cursor:pointer}
+.tschips .chip:hover{border-color:var(--accent)}.tschips .chip .n{font-variant-numeric:tabular-nums;color:var(--muted)}
+.tschips .chip[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}.tschips .chip[aria-pressed=true] .n{color:#fff;opacity:.85}
 tr.tsx{display:none!important}
 details.ignlist{margin:12px 0 4px}details.ignlist summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
 .bulkbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px;padding:5px 8px;font-size:13px;color:var(--muted);border:1px dashed transparent;border-radius:8px}
@@ -2335,6 +2374,11 @@ document.querySelectorAll('.tsearch').forEach(function(ts){
   var tb=document.getElementById(ts.getAttribute('data-table'));if(!tb)return;
   var inp=ts.querySelector('input'),out=ts.querySelector('.ts-n'),sel=ts.getAttribute('data-pick'),gs=null,tm=null;
   var only=ts.querySelector('[data-only]'),none=ts.querySelector('[data-none]'),bar=null;
+  // Shortcuts (Bank charges, Own transfers, an account): one at a time, together with any words typed.
+  var chips=document.querySelector('.tschips[data-table="'+tb.id+'"]'),cat='';
+  function setCat(c){cat=c;if(chips)[].forEach.call(chips.querySelectorAll('.chip'),function(b){b.setAttribute('aria-pressed',String(b.getAttribute('data-cat')===cat))})}
+  if(chips)chips.addEventListener('click',function(e){var b=e.target.closest('.chip');if(!b)return;
+    setCat(cat===b.getAttribute('data-cat')?'':b.getAttribute('data-cat'));run()});
   // Just the box goes in its section's heading (right side, before the status), seen even with the section
   // folded; what was found and the tick buttons show on a bar above the list, only while searching.
   var body=ts.closest('.dsec-body'),sec=body&&!ts.closest('details')&&body.parentNode,hd=sec&&sec.querySelector('h2.dsec-h');
@@ -2342,7 +2386,7 @@ document.querySelectorAll('.tsearch').forEach(function(ts){
     bar=document.createElement('div');bar.className='tsbar';bar.hidden=true;
     [out,only,none].forEach(function(x){if(x)bar.appendChild(x)});
     var clr=document.createElement('button');clr.type='button';clr.className='btn-sm';clr.textContent='Clear search';
-    clr.addEventListener('click',function(){inp.value='';run();inp.focus()});bar.appendChild(clr);
+    clr.addEventListener('click',function(){inp.value='';setCat('');run();inp.focus()});bar.appendChild(clr);
     ts.parentNode.insertBefore(bar,ts);
     ts.classList.add('in-h');hd.insertBefore(ts,hd.querySelector('.dsec-badge'));
     ['click','keydown','keyup','mousedown'].forEach(function(t){ts.addEventListener(t,function(e){e.stopPropagation()})});
@@ -2361,15 +2405,16 @@ document.querySelectorAll('.tsearch').forEach(function(ts){
     return norm(t+' '+t.replace(/(\\d{4})-(\\d{2})-(\\d{2})/g,'$3/$2/$1'))}
   function picks(){return sel?[].slice.call(tb.querySelectorAll(sel)).filter(function(p){return !p.disabled}):[]}
   function say(){var ps=picks(),n=0,off=0;ps.forEach(function(p){if(p.checked){n++;if(p.closest('tr.tsx'))off++}});
-    var shown=gs?gs.filter(function(g){return !g[0].classList.contains('tsx')}).length:0,q=inp.value.trim();
+    var shown=gs?gs.filter(function(g){return !g[0].classList.contains('tsx')}).length:0,q=inp.value.trim()||cat;
     out.textContent=(q?'Showing '+shown+' of '+(gs?gs.length:0):'')+(sel&&(q||n)?(q?' · ':'')+n+' ticked'+(off?' ('+off+' not shown)':''):'');
     if(bar)bar.hidden=!q}
   function run(){gs=gs||groups();var words=norm(inp.value).split(' ').filter(Boolean);
-    gs.forEach(function(g){var ok=!words.length||(function(t){return words.every(function(w){return t.indexOf(w)>=0})})(textOf(g[0]));
+    gs.forEach(function(g){var ok=(!cat||(' '+(g[0].getAttribute('data-cats')||'')+' ').indexOf(' '+cat+' ')>=0)
+        &&(!words.length||(function(t){return words.every(function(w){return t.indexOf(w)>=0})})(textOf(g[0])));
       g.forEach(function(r){r.classList.toggle('tsx',!ok)})});say()}
   inp.addEventListener('input',function(){clearTimeout(tm);tm=setTimeout(run,120)});
   inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();clearTimeout(tm);run()}
-    if(e.key==='Escape'&&inp.value){e.preventDefault();inp.value='';run()}});
+    if(e.key==='Escape'&&(inp.value||cat)){e.preventDefault();inp.value='';setCat('');run()}});
   inp.addEventListener('search',function(){clearTimeout(tm);run()});
   function setAll(fn){var ps=picks(),last=null;ps.forEach(function(p){var v=fn(p);if(p.checked!==v){p.checked=v;last=p}});
     if(last)last.dispatchEvent(new Event('change',{bubbles:true}));say()}
@@ -4963,9 +5008,10 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
 setTimeout(tick,3000)})();</script>{% endif %}
 <form method=post action="{{ url_for('record', name=name) }}" id=recform data-ccy="{{ acct_ccy or '' }}">
 {% if draft_meta %}<div class=savedsel>Showing the selection saved by {{ draft_meta.by or 'a user' }} on {{ draft_meta.at.strftime('%Y-%m-%d %H:%M') }}. <button type=submit formaction="{{ url_for('record_discard', name=name) }}" class=btn-sm data-busy="Discarding the saved selection...">Discard it</button></div>{% endif %}
-{% if record_rows|length > 5 %}<div class=tsearch data-table=rectbl data-pick=".rsel"><input type=search placeholder="Search payee, amount, date…" title="Every word must appear: payee or description, amount (commas optional), date, or the account chosen" aria-label="Search the lines to record" autocomplete=off><span class=ts-n></span><button type=button class=btn-sm data-only title="Tick the lines found, and untick every other">Tick only these</button><button type=button class=btn-sm data-none>Untick all</button></div>{% endif %}
+{% if record_rows|length > 5 %}<div class=tsearch data-table=rectbl data-pick=".rsel"><input type=search placeholder="Search payee, amount, date…" title="Every word must appear: payee or description, amount (commas optional), date, or the account chosen" aria-label="Search the lines to record" autocomplete=off><span class=ts-n></span><button type=button class=btn-sm data-only title="Tick the lines found, and untick every other">Tick only these</button><button type=button class=btn-sm data-none>Untick all</button></div>
+{% if rec_chips %}<div class=tschips data-table=rectbl role=group aria-label="Show one kind of line"><span class=tc-l>Show:</span>{% for c in rec_chips %}<button type=button class=chip data-cat="{{ c.key }}" aria-pressed=false title="{{ 'Lines suggested for ' ~ c.label ~ ', from how they were recorded in QuickBooks before' if c.acct else 'Every ' ~ c.label|lower ~ ' line' }}">{{ c.label }} <span class=n>{{ c.n }}</span></button>{% endfor %}</div>{% endif %}{% endif %}
 <table class=rectbl id=rectbl><tr><th><input type=checkbox id=selall title="Select all"></th><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Type and account</th><th>Payee</th><th></th></tr>
-{% for w in record_rows %}<tr data-amt="{{ w.amount }}">
+{% for w in record_rows %}<tr data-amt="{{ w.amount }}" data-cats="{{ (w.cats or [])|join(' ') }}">
 <td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.sel %}checked{% endif %}><input type=hidden name=rowid value="{{ w.line_id }}">{% endif %}</td>
 <td>{{ w.date }}</td>
 <td class=desc>{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
@@ -6047,6 +6093,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         # A clear transfer pair with no account chosen yet: suggest the other account (not ticked).
         if pair and not aid and not item["xfer_only"] and pair.get("other_qbo") in xt_ids:
             item["acct_id"] = pair["other_qbo"]
+        item["cats"] = line_categories(item, xt_ids)
+    acct_names = {a["id"]: a["fqn"] for a in coa + xt}
     return {"xfers": xfers, "n_xfer": sum(len(v) for v in xfers.values()), "all_unmatched": _all_unmatched,
             "xfer_choices": choices, "xfer_dismissed": xfer_dismissed, "xfer_recorded": xrec,
             "xfer_rec_choices": xrec_choices,
@@ -6060,6 +6108,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
             "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored"], key=_record_rank),
             "ignored": sorted([w for w in writebacks + deposits if w["wb"] == "ignored"], key=lambda w: w["date"]),
+            "rec_chips": record_chips([w for w in writebacks + deposits if w["wb"] != "ignored"], acct_names),
             "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored")),
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
