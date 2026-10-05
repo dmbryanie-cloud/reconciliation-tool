@@ -82,7 +82,7 @@ def upload(text, **kw):
 
 # ---- books straight from QBO -------------------------------------------------
 page = cl.get("/account/Stanbic").data.decode()
-check("books: QuickBooks refresh in the account menu, CSV import tucked away", "Refresh books from QuickBooks" in page and "Import books from a CSV" in page)
+check("books: QuickBooks refresh in the account menu, no CSV import on a linked account", "Refresh books from QuickBooks" in page and "Import books from a CSV" not in page)
 r = cl.post("/sync", data={"back": "Stanbic"})
 check("refresh from account page returns to that page", r.status_code == 302 and r.headers["Location"].endswith("/account/Stanbic"))
 check("chart of accounts cached (postable only)", {a["fqn"] for a in A.load_coa(c.cursor())} ==

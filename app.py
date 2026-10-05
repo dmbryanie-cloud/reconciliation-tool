@@ -4445,11 +4445,17 @@ def ingest_books(text, account_name):
         raise ValueError("No transactions found in the books CSV.")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS category text;")
-    cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
+    cur.execute("SELECT account_id, currency, source_account_id FROM account WHERE name=%s LIMIT 1;", (account_name,))
     arow = cur.fetchone()
     if not arow:
         cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
-    acct_uuid, currency = arow
+    acct_uuid, currency, linked = arow
+    if linked:
+        # Its books come from QuickBooks: a CSV on top would count the same money twice (or, if it's
+        # the bank statement by mistake, pair every bank line with a copy of itself).
+        cur.close(); conn.close()
+        raise ValueError(f"Not imported: {account_name} is linked to QuickBooks, so its books come from QuickBooks. "
+                         f"To load a bank statement, use Upload statement.")
     # Replace any prior CSV-imported books for this account (idempotent); never touches API-synced rows.
     cur.execute("DELETE FROM book_txn WHERE account_id=%s AND source_txn_type='CSV';", (acct_uuid,))
     seen = {}
@@ -5069,7 +5075,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <span class=kebab><button type=button class=icon-btn data-dd aria-label="More for this account" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
 {% if has_results %}<a href="{{ url_for('exceptions_csv', name=name) }}">Download exceptions (CSV)</a><a href="{{ url_for('qbo_import_csv', name=name) }}">Download for QuickBooks (CSV)</a><div class=sep></div>{% endif %}
 {% if qbo_connected and qbo_linked %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=back value="{{ name }}"><button type=submit>Refresh books from QuickBooks</button></form>{% endif %}
-{% if can('upload') %}<button type=button data-drawer=books>Import books from a CSV</button>{% endif %}
+{% if can('upload') and not qbo_linked %}<button type=button data-drawer=books>Import books from a CSV</button>{% endif %}
 {% if can('settings') %}<div class=sep></div><div class=dh>Admin</div>
 {% if qbo_connected and qbo_linked %}<button type=button data-drawer=qbostart>QuickBooks starting point</button>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" class=ccyf><label for=ccy-in>Currency</label><input id=ccy-in name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX"><button type=submit class=btn-sm>Set</button></form>
@@ -5116,11 +5122,11 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=qs-bal>Statement ending balance (optional)</label><input id=qs-bal name=balance inputmode=decimal placeholder="from that statement"><small>If typed, QuickBooks' reconciled total must equal it, or nothing is saved.</small></div>
 </div>
 <div class=drawer-f>{% if qbo_base %}<button type=submit name=remove value=1 class="btn-sm danger" formnovalidate data-confirm="Remove the starting point taken from QuickBooks? Its reconciled entries count as outstanding again.">Remove</button>{% endif %}<button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Reading QuickBooks' reconciliation...">{{ 'Read again' if qbo_base else 'Read from QuickBooks' }}</button></div></form></aside>{% endif %}
-<aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
+{% if not qbo_linked %}<aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
 <div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b><div class=help style="margin:0">For working offline: a QuickBooks register exported as CSV. When QuickBooks is connected the books are read directly, with no export needed.</div>
 <label class=drop for=bk-file><b>Choose the QuickBooks CSV export</b><span><a href="{{ url_for('template', kind='books') }}">CSV template</a></span><input id=bk-file type=file name=books accept=.csv required></label></div>
-<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Import books</button></div></form></aside>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Import books</button></div></form></aside>{% endif %}
 <style>
 .sumstrip{display:grid;grid-template-columns:minmax(0,1.3fr) repeat(3,minmax(0,.5fr)) minmax(0,1.3fr) minmax(0,1fr);background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin:0 0 6px}
 .sumstrip .tile{border-right:1px solid var(--line-soft);display:flex;flex-direction:column;gap:3px;justify-content:center;padding:10px 14px;border-radius:0}
@@ -6122,6 +6128,8 @@ def book_pool(cur, acct_uuid, sid, p_start, p_end):
                    FROM book_txn bt
                    WHERE bt.account_id=%s AND bt.posted_date BETWEEN %s AND %s
                      AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false
+                     AND (bt.source_txn_type <> 'CSV' OR NOT EXISTS (SELECT 1 FROM account a WHERE a.account_id=bt.account_id
+                                                                     AND coalesce(a.source_account_id, '') <> ''))
                      AND NOT EXISTS (SELECT 1 FROM qbo_reconciled r WHERE r.account_id=bt.account_id
                                        AND r.source_txn_id=bt.source_txn_id AND r.posted_date=bt.posted_date)
                      AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
@@ -7067,6 +7075,8 @@ def import_books(name):
             cu2.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
             c2.commit(); cu2.close(); c2.close()
         session["detail_msg"] = f"Imported {n} book transactions." + _skipped_note(skipped) + (f" {note}" if note else "")
+    except ValueError as e:
+        session["detail_msg"] = str(e)
     except Exception as e:
         return f"Could not import books: {escape(str(e))} <br><a href='{url_for('detail', name=name)}'>Back</a>"
     return redirect(url_for("detail", name=name))
