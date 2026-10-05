@@ -88,13 +88,20 @@ r = cl.get("/account/Stanbic UGX/report")
 t = text(r.data.decode())
 check("report renders", r.status_code == 200 and "Bank reconciliation statement" in t)
 check("letterhead + account + currency + period", "Northgreen Test Co" in t and "Stanbic UGX" in t and "UGX" in t
-      and "2026-01-01 to 2026-01-31" in t)
+      and "Period 01/01/2026 – 31/01/2026" in t and "Statement date 31/01/2026" in t)
 check("draft watermark before sign-off", "DRAFT" in t and "Draft — not signed off" in t)
-check("statement balance", "Balance per bank statement at 2026-01-31" in t and "1,295,000.00" in t)
-check("deposit in transit listed individually", re.search(r"Customer B 2026-01-30 80,000\.00", t) is not None)
-check("outstanding cheque listed, in brackets", re.search(r"Supplier cheque 2 2026-01-28 \(150,000\.00\)", t) is not None)
+check("statement balance, dated", "31/01/2026 Balance per bank statement 1,295,000.00" in t)
+check("summary at the top: statement, books, adjusted, difference", re.search(
+      r"Per bank statement 1,295,000\.00 Per books 1,230,000\.00 Adjusted bank 1,225,000\.00 Adjusted books 1,225,000\.00 Difference 0\.00", t) is not None)
+check("deposit in transit listed individually, date first", re.search(r"30/01/2026 Customer B 80,000\.00", t) is not None)
+check("outstanding cheque listed under Less as a positive amount", re.search(r"28/01/2026 Supplier cheque 2 150,000\.00", t) is not None)
+check("…and its total deducted, in brackets, with the count", re.search(r"Total outstanding payments \(\d+\) \([\d,]+\.00\)", t) is not None)
+html = r.data.decode()
+check("fixed columns so every amount lines up", "table-layout:fixed" in html and "<colgroup>" in html
+      and "<thead><tr><th>Date</th><th>Description</th>" in html)
 check("adjusted bank balance", re.search(r"Adjusted bank balance 1,225,000\.00", t) is not None)
-check("book balance + both unrecorded bank charges", "1,230,000.00" in t and len(re.findall(r"Bank charge 2026-01-05 \(2,500\.00\)", t)) == 2)
+check("book balance + both unrecorded bank charges", "31/01/2026 Balance per books 1,230,000.00" in t
+      and len(re.findall(r"05/01/2026 Bank charge \(2,500\.00\)", t)) == 2)
 check("adjusted book balance", re.search(r"Adjusted book balance 1,225,000\.00", t) is not None)
 check("reconciled result", "Reconciled — adjusted bank and book balances agree" in t and "Difference 0.00" in t)
 check("statement check line", "opening balance 1,000,000.00 + movements 295,000.00 = closing balance 1,295,000.00" in t)
@@ -103,7 +110,8 @@ check("print button + print styles", "window.print()" in r.data.decode() and "@m
 
 cl.post("/account/Stanbic UGX/signoff")
 t = text(cl.get("/account/Stanbic UGX/report").data.decode())
-check("signed-off report: no watermark, signer named", "DRAFT" not in t and re.search(r"Admin, \d\d \w{3} 2026", t) is not None)
+check("signed-off report: no watermark, signer named and dated", "DRAFT" not in t and "Signed off" in t
+      and re.search(r"Admin Prepared and signed off by \d\d/\d\d/2026", t) is not None)
 
 page = cl.get("/account/Stanbic UGX").data.decode()
 check("account page links to the report", "/account/Stanbic%20UGX/report" in page and "Print reconciliation report" in page)
@@ -114,7 +122,7 @@ upload("Stanbic UGX", "Date,Description,Amount\n02/02/2026,Customer B,80000\n04/
 cl.post("/account/Stanbic UGX/review_all")
 cl.post("/account/Stanbic UGX/balances", data={"opening": "", "closing": "1195000", "book": "1200000"})
 t = text(cl.get("/account/Stanbic UGX/report").data.decode())
-check("current report is February, out of balance", "2026-02-01 to 2026-02-28" in t and "Not reconciled — out of balance" in t
+check("current report is February, out of balance", "01/02/2026 – 28/02/2026" in t and "Not reconciled — out of balance" in t
       and "Difference (5,000.00)" in t)
 check("confirmed suggestion counted", "1 confirmed suggestion" in t)
 cl.post("/account/Stanbic UGX/signoff", data={"override": "1", "note": "charges booked in March"})
@@ -124,7 +132,7 @@ check("override reason printed", "Signed off while not reconciled. Reason given:
 # ---- past period still shows what was outstanding at ITS end -------------------------------
 t = text(cl.get(f"/account/Stanbic UGX/report?s={jan_id}").data.decode())
 check("January report after February cleared its items: still lists them",
-      "2026-01-01 to 2026-01-31" in t and "Customer B 2026-01-30" in t and "Supplier cheque 2 2026-01-28" in t)
+      "01/01/2026 – 31/01/2026" in t and "30/01/2026 Customer B" in t and "28/01/2026 Supplier cheque 2" in t)
 check("…and still reconciles", re.search(r"Adjusted bank balance 1,225,000\.00", t) is not None and "Difference 0.00" in t)
 k = c.cursor(); s_feb = A._latest_statement(k, UGX); r_feb = A.reconcile(k, UGX, s_feb); c.rollback()
 check("February's pool unaffected (Jan-cleared items excluded, Jan outstanding items included)",
@@ -147,7 +155,7 @@ lid = str(q1("SELECT line_id FROM statement_line sl JOIN statement s USING (stat
 cl.post("/account/Stanbic USD/match", data={"ml": [lid], "mb": [tid]})
 t = text(cl.get("/account/Stanbic USD/report").data.decode())
 check("USD report in USD with the match difference itemised", "Amounts in USD" in t
-      and re.search(r"BANK CHARGES MONTHLY JAN — books: Fee \(24\.00\) 2026-01-31 \(1\.00\)", t) is not None
+      and re.search(r"31/01/2026 BANK CHARGES MONTHLY JAN — books: Fee \(24\.00\) \(1\.00\)", t) is not None
       and "1 matched by hand" in t)
 
 # ---- access ----------------------------------------------------------------------------------

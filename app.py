@@ -1783,6 +1783,12 @@ def rematch_open(cur, account_uuids):
 DUP_WINDOW_DAYS = 45   # how far apart a bank line and its QuickBooks twin can plausibly be dated
 CHARGE_RE = re.compile(r"\b(charges?|chgs?|fees?|excise|duty|commission|levy)\b", re.I)
 NOT_CHARGE_RE = re.compile(r"^\s*chq|\beft:", re.I)   # a cheque or payment to someone, not the bank's charge
+CHARGE_ACCT_RE = re.compile(r"bank\s*charge", re.I)    # a QuickBooks entry posted to Bank charges is one
+CHARGE_GROUP_CONF = 0.7    # confidence that marks a suggestion as a group of bank charges (dates differ)
+CHARGE_GROUP_DAYS = 10     # ...spanning at most this many days, inside one month
+REVERSAL_RE = re.compile(r"\b(revers\w*|rvsl|failed|returned|unpaid|rejected)\b", re.I)
+REVERSAL_CONF = 0.65       # confidence that marks a suggestion as a payment and its reversal
+REVERSAL_DAYS = 7
 
 
 TYPE_XFER_RE = re.compile(r"\b(transfer|trf|tfr|xfer|sweep|own\s*a/?c|inter[- ]?account|funds?\s*trans)", re.I)
@@ -2669,6 +2675,19 @@ def _acct(x):
     except Exception:
         return str(x)
     return f"({abs(v):,.2f})" if v < 0 else f"{v:,.2f}"
+
+
+@app.template_filter("acctc")
+def _acct_col(x):
+    """Accounting style for a column of figures: positives keep room for the closing bracket."""
+    v = _acct(x)
+    return Markup(escape(v) + ("" if not v or v.endswith(")") else Markup('<span class=rp>)</span>')))
+
+
+@app.template_filter("dmy")
+def _dmy(d):
+    """A date as the reports print it: 31/07/2026."""
+    return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else (d or "")
 
 
 @app.template_filter("money")
@@ -4557,9 +4576,10 @@ def run_matcher(statement_id):
         if best:
             add([l_id], [best[1]], "exact", 0.9, 0); used.add(best[1]); matched_lines.add(l_id)
 
-    # pass 2: fuzzy (same payee, amount differs)
+    # pass 2: fuzzy (same payee, amount differs). Not for a bank charge: one booked at another amount
+    # is the fee and its excise duty added up, which pass 3 pairs whole.
     for l_id, ld, la, lw in lines:
-        if l_id in matched_lines:
+        if l_id in matched_lines or l_id in charges:
             continue
         for t_id, td, ta, tw in txns:
             if t_id in used:
@@ -4640,6 +4660,45 @@ def run_matcher(statement_id):
                 for lid in lids:
                     matched_lines.add(lid)
 
+    # pass 3c: bank charges booked as totals on other dates. The bank takes each fee and its excise
+    # duty as its own line; QuickBooks often has them added up per batch, a day or two out. From each
+    # day with charges, add both sides day by day for up to CHARGE_GROUP_DAYS (never into the next
+    # month) and close a group at the first day the totals agree: the smallest groups that tie. A day
+    # that never ties is left alone, so one stray charge doesn't hold up the rest of the month.
+    # Suggested only, for review.
+    ch_lines = [(l, d, a) for (l, d, a, w) in lines if l in charges and l not in matched_lines]
+    if ch_lines:
+        cur.execute("SELECT txn_id::text, coalesce(category, '') FROM book_txn WHERE txn_id = ANY(%s::uuid[]);",
+                    ([t for (t, d, a, w) in txns if t not in used],))
+        acct_of = dict(cur.fetchall())
+        ch_txns = [(t, d, a) for (t, d, a, w) in txns if t not in used and a < 0
+                   and (CHARGE_ACCT_RE.search(acct_of.get(t, "")) or is_bank_charge(w, a))]
+        days = {}
+        for side, items in ((0, ch_lines), (1, ch_txns)):
+            for i, d, a in items:
+                days.setdefault(d, ([], []))[side].append((i, a))
+        order = sorted(days)
+        k = 0
+        while k < len(order):
+            d0 = order[k]
+            gl, gt, sl, st, closed = [], [], Decimal(0), Decimal(0), None
+            for j in range(k, len(order)):
+                d = order[j]
+                if (d - d0).days > CHARGE_GROUP_DAYS or (d.year, d.month) != (d0.year, d0.month):
+                    break
+                ls_, ts_ = days[d]
+                gl += [i for i, _ in ls_]; gt += [i for i, _ in ts_]
+                sl += sum((a for _, a in ls_), Decimal(0)); st += sum((a for _, a in ts_), Decimal(0))
+                if gl and gt and sl == st:
+                    closed = j
+                    break
+            if closed is not None and ok("many_to_one", gl, gt):
+                add(list(gl), list(gt), "many_to_one", CHARGE_GROUP_CONF, 0)
+                used.update(gt); matched_lines.update(gl)
+                k = closed + 1
+            else:
+                k += 1
+
     # pass 4: opposite-sign proposals (reviewable) — e.g. transfers signed the other way in QBO.
     # Stored as 'manual' (an allowed match_type) so the user confirms or rejects each.
     for l_id, ld, la, lw in lines:
@@ -4651,6 +4710,18 @@ def run_matcher(statement_id):
             if la == -ta and abs((ld - td).days) <= tol(l_id) and ok("manual", [l_id], [t_id]):
                 add([l_id], [t_id], "manual", 0.5, 0)
                 used.add(t_id); matched_lines.add(l_id); break
+
+    # pass 5: a payment and the bank's reversal of it (failed, returned): equal and opposite, a few
+    # days apart, one saying so. The money never left, so there's no book entry: the two lines are
+    # matched to each other. Suggested only, for review.
+    for l_id, ld, la, lw in lines:
+        if l_id in matched_lines or not REVERSAL_RE.search(lw or ""):
+            continue
+        other = min((x for x in lines if x[0] not in matched_lines and x[0] != l_id and x[2] == -la
+                     and abs((x[1] - ld).days) <= REVERSAL_DAYS), key=lambda x: abs((x[1] - ld).days), default=None)
+        if other and la and ok("many_to_one", [other[0], l_id], []):
+            add([other[0], l_id], [], "many_to_one", REVERSAL_CONF, 0)
+            matched_lines.update((l_id, other[0]))
 
     # Rejected pairings stay on record (so they can be restored) but claim nothing.
     for mt, conf, delta, ls, ts, by, at, origin in rejected.values():
@@ -5260,7 +5331,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <table id=revtbl><tr><th class=bk>{% if n_pending %}<input type=checkbox class=bk-all data-for=revbulk title="Select all to review" aria-label="Select all suggestions to review">{% endif %}</th><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td class=bk>{% if r.status=='proposed' %}<input type=checkbox name=mid value="{{ r.id }}" form=revbulk class=bk-pick aria-label="Select this suggestion">{% endif %}</td>
-<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else 'batched total')) }}</span></td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else ('bank charges, dates differ' if r.charges else ('payment and its reversal' if r.reversal else 'batched total')))) }}</span></td>
 <td class=desc>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
@@ -5641,7 +5712,8 @@ function update(rank){
   L.forEach(function(r){sl+=num(r.getAttribute('data-amt'))});B.forEach(function(r){sb+=num(r.getAttribute('data-amt'))});
   diff=Math.round((sl-sb)*100)/100;
   var s=document.getElementById('mmsum'),go=document.getElementById('mmgo');
-  if(!L.length||!B.length){s.textContent='Tick at least one item on each side.';s.className='';go.disabled=true}
+  if(L.length>1&&!B.length&&Math.round(sl*100)===0){s.textContent='Bank lines that cancel out (a payment and its reversal): '+L.length+' lines, net 0.00';s.className='ok';go.disabled=false}
+  else if(!L.length||!B.length){s.textContent='Tick at least one item on each side, or bank lines that cancel out.';s.className='';go.disabled=true}
   else{s.textContent='Bank '+fmt(sl)+'  ·  QuickBooks '+fmt(sb)+'  ·  Difference '+fmt(diff)+'  ·  selected '+L.length+' of '+rowsOf('mml').length+' bank lines, '+B.length+' of '+rowsOf('mmb').length+' QuickBooks entries';s.className=diff===0?'ok':'warn';go.disabled=false}
   if(rank&&L.length){   // closest remaining amount first, then closest date
     var target=sl-sb,d0=new Date(L[0].getAttribute('data-date')).getTime(),box=document.getElementById('mmb');
@@ -6231,7 +6303,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     cur.execute("SELECT count(*) FROM match WHERE statement_id=%s AND match_type='manual' AND status='proposed';", (sid,))
     n_signflip = cur.fetchone()[0]
     reviewable = []
-    cur.execute("""SELECT match_id, match_type, status, amount_delta FROM match WHERE statement_id=%s
+    cur.execute("""SELECT match_id, match_type, status, amount_delta, confidence FROM match WHERE statement_id=%s
                    AND (match_type IN ('fuzzy','many_to_one','manual') OR (match_type='exact' AND confidence < 1))
                    AND created_by <> 'user'
                    ORDER BY status<>'proposed', match_type='exact', match_type;""", (sid,))
@@ -6241,9 +6313,11 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     umatches = cur.fetchall()
     sls_by, bts_by = match_sides(cur, [r[0] for r in rmatches] + [r[0] for r in umatches])
     items = match_items(cur, [r[0] for r in rmatches])
-    for mid, mtype, status, delta in rmatches:
+    for mid, mtype, status, delta, conf in rmatches:
         lids, tids = items.get(str(mid), ([], []))
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
+                           "charges": mtype == "many_to_one" and conf is not None and float(conf) == CHARGE_GROUP_CONF,
+                           "reversal": mtype == "many_to_one" and conf is not None and float(conf) == REVERSAL_CONF,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), []),
                            "lids": lids, "tids": tids})
     user_matches = [{"id": mid, "delta": delta, "by": by, "at": at,
@@ -6439,90 +6513,173 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
 
 
 REPORT_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Bank reconciliation · {{ name }} · {{ r.p_end }}</title>
+<title>Bank reconciliation · {{ name }} · {{ r.p_end|dmy }}</title>
+<link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link rel=stylesheet href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600&display=swap">
 <style>
-:root{--ink:#16202e;--muted:#667085;--line:#d0d5dd;--soft:#f2f4f7;--ok:#047857;--bad:#b42318;--warn:#92400e}
+:root{--ink:#13213b;--body:#2b3445;--muted:#667085;--faint:#98a2b3;--rule:#c9cfd9;--hair:#e4e7ec;--band:#f3f5f8;
+  --ok:#05603a;--ok-bg:#e3f4ea;--bad:#b42318;--bad-bg:#fbe9e6;--warn:#93370d;--warn-bg:#fff6e5;--gold:#c9a227}
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:#e9edf2;margin:0;font-size:13px;line-height:1.45}
-.toolbar{max-width:210mm;margin:16px auto 0;display:flex;gap:10px;justify-content:space-between;align-items:center;padding:0 16px;flex-wrap:wrap}
+html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{margin:0;background:#e6e9ef;color:var(--body);font:12.5px/1.45 'IBM Plex Sans',-apple-system,'Segoe UI',Roboto,Arial,sans-serif}
+.num,td.am,td.tt,.sum b{font-variant-numeric:tabular-nums lining-nums}
+.toolbar{max-width:210mm;margin:16px auto 0;padding:0 16px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .toolbar a{color:var(--muted);text-decoration:none;font-size:14px}
-.toolbar button{background:#16202e;color:#fff;border:0;border-radius:9px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer}
-.sheet{background:#fff;max-width:210mm;margin:12px auto 32px;padding:15mm 14mm;box-shadow:0 2px 10px rgba(16,24,40,.12);position:relative;overflow:hidden}
-.draft{position:absolute;top:38%;left:0;right:0;text-align:center;font-size:110px;font-weight:800;letter-spacing:.1em;color:rgba(180,35,24,.07);transform:rotate(-22deg);pointer-events:none}
-.co{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
-h1{font-size:21px;margin:2px 0 0;letter-spacing:-.01em}
-.meta{display:grid;grid-template-columns:repeat(4,auto);justify-content:start;gap:3px 26px;margin:14px 0 18px;padding:10px 12px;background:var(--soft);border-radius:6px}
-.meta dt{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}.meta dd{margin:0 0 4px;font-weight:600}
-table{width:100%;border-collapse:collapse}
+.toolbar button{background:var(--ink);color:#fff;border:0;border-radius:7px;padding:9px 16px;font:600 14px 'IBM Plex Sans',sans-serif;cursor:pointer}
+.sheet{position:relative;overflow:hidden;background:#fff;max-width:210mm;margin:12px auto 32px;padding:16mm 15mm 12mm;box-shadow:0 2px 12px rgba(16,24,40,.14)}
+.draft{position:absolute;top:40%;left:0;right:0;text-align:center;font:800 104px/1 'IBM Plex Sans',sans-serif;letter-spacing:.12em;color:rgba(180,35,24,.06);transform:rotate(-22deg);pointer-events:none}
+
+/* Letterhead */
+.lh{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;padding-bottom:10px;border-bottom:2px solid var(--ink)}
+.co{font-size:10.5px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+h1{margin:3px 0 0;font:600 20px/1.2 'IBM Plex Serif',Georgia,serif;color:var(--ink)}
+.acct{margin-top:3px;font-size:13px;color:var(--ink);font-weight:600}
+.acct span{color:var(--muted);font-weight:400}
+.stamp{text-align:right;font-size:11px;color:var(--muted);line-height:1.6;white-space:nowrap}
+.stamp b{color:var(--ink);font-weight:600}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:10.5px;font-weight:600;letter-spacing:.02em}
+.pill.signed{background:var(--ok-bg);color:var(--ok)}.pill.draftp{background:var(--warn-bg);color:var(--warn)}
+
+/* Summary */
+.sum{display:grid;grid-template-columns:repeat(5,1fr);margin:14px 0 18px;border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+.sum div{padding:8px 11px;border-right:1px solid var(--hair)}.sum div:last-child{border-right:0}
+.sum span{display:block;font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.sum b{display:block;margin-top:2px;font-size:14px;color:var(--ink);font-weight:600;text-align:right}
+.sum .diff.ok{background:var(--ok-bg)}.sum .diff.ok b{color:var(--ok)}
+.sum .diff.bad{background:var(--bad-bg)}.sum .diff.bad b{color:var(--bad)}
+
+/* The statement */
+table.st{width:100%;border-collapse:collapse;table-layout:fixed}
+col.c-dt{width:23mm}col.c-am{width:31mm}col.c-tt{width:33mm}
+thead th{font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600;text-align:left;padding:0 6px 5px;border-bottom:1px solid var(--ink)}
+thead th.r{text-align:right}
 td{padding:3px 6px;vertical-align:top}
-td.a{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;width:110px}
-td.d{white-space:nowrap;width:78px;color:var(--muted)}
-tr.head td{font-weight:700;padding-top:12px}
-tr.item td{font-size:12px;color:#344054}
-tr.item td:first-child{padding-left:22px}
-tr.none td{font-size:12px;color:var(--muted);font-style:italic;padding-left:22px}
-tr.sub td.a{border-top:1px solid var(--line)}
-tr.tot td{font-weight:700;border-top:1px solid var(--ink);border-bottom:3px double var(--ink);padding:6px}
-tr.gap td{height:10px}
-.bf{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:3px;padding:0 3px;margin-left:4px}
-.result{margin:18px 0 6px;padding:10px 12px;border-radius:6px;font-weight:700;display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}
-.result.balanced{background:#d7f3e3;color:var(--ok)}.result.out{background:#fbe2de;color:var(--bad)}.result.incomplete{background:var(--soft);color:var(--muted)}
-.note{font-size:12px;margin:6px 0;padding:7px 10px;border-radius:6px;background:#fffbeb;color:var(--warn);border:1px solid #fde68a}
-.note.bad{background:#fbe2de;color:var(--bad);border-color:#f5c2bb}
-.facts{font-size:12px;color:var(--muted);margin:10px 0 0}
-.sign{display:grid;grid-template-columns:1fr 1fr;gap:34px;margin-top:30px;page-break-inside:avoid}
-.sign .who{font-weight:600;min-height:18px}
-.sign .line{border-top:1px solid var(--ink);padding-top:4px;margin-top:4px;font-size:11px;color:var(--muted)}
-footer{margin-top:22px;padding-top:8px;border-top:1px solid var(--line);font-size:10.5px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
-@media print{body{background:#fff}.toolbar{display:none}.sheet{margin:0;box-shadow:none;padding:0;max-width:none}tr{page-break-inside:avoid}@page{size:A4;margin:14mm}}
-@media (max-width:640px){.sheet{padding:18px 14px}.meta{grid-template-columns:repeat(2,auto)}td.d{display:none}}
+td.dt{color:var(--muted);white-space:nowrap}
+td.ds{overflow-wrap:anywhere}
+td.am,td.tt{text-align:right;white-space:nowrap}
+tr.part td{padding:14px 6px 4px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink)}
+tr.part.first td{padding-top:9px}
+tr.bal td{font-weight:600;color:var(--ink);padding-top:5px;padding-bottom:5px}
+tr.sec td{padding-top:8px;font-weight:600;color:var(--ink)}
+tr.sec td .why{font-weight:400;color:var(--muted)}
+tr.it td{font-size:11.5px;padding-top:2px;padding-bottom:2px}
+tr.it td.ds{padding-left:18px;color:var(--body)}
+tr.it:nth-child(even) td{background:#fafbfc}
+tr.none td{font-size:11.5px;color:var(--faint);font-style:italic;padding-left:18px}
+tr.sub td{padding-top:3px;padding-bottom:6px}
+tr.sub td.ds{padding-left:18px;color:var(--muted);font-size:11.5px}
+tr.sub td.am{border-top:1px solid var(--rule)}tr.sub.empty td.am{border-top:0}
+tr.sub td.tt{color:var(--ink);font-weight:600}
+tr.tot td{padding-top:7px;padding-bottom:7px;font-weight:700;color:var(--ink);background:var(--band)}
+tr.tot td.tt{border-top:1px solid var(--ink);border-bottom:3px double var(--ink)}
+tr.sp td{height:6px;padding:0}
+.rp{visibility:hidden}
+.bf{display:inline-block;margin-left:5px;padding:0 4px;border:1px solid var(--rule);border-radius:3px;font-size:9px;color:var(--muted);vertical-align:1px}
+
+.result{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:16px 0 8px;padding:10px 12px;border-radius:6px;font-weight:600;font-variant-numeric:tabular-nums}
+.result.balanced{background:var(--ok-bg);color:var(--ok)}.result.out{background:var(--bad-bg);color:var(--bad)}.result.incomplete{background:var(--band);color:var(--muted)}
+.note{font-size:11.5px;margin:6px 0;padding:7px 10px;border-radius:5px;background:var(--warn-bg);color:var(--warn);border-left:3px solid #f5b544}
+.note.bad{background:var(--bad-bg);color:var(--bad);border-left-color:var(--bad)}
+.facts{font-size:11.5px;color:var(--muted);margin:8px 0 0}
+.facts p{margin:3px 0}
+
+.sign{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:30px;break-inside:avoid;page-break-inside:avoid}
+.sign .who{min-height:20px;font-weight:600;color:var(--ink)}
+.sign .ln{border-top:1px solid var(--ink);margin-top:4px;padding-top:4px;display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted)}
+footer{margin-top:22px;padding-top:7px;border-top:1px solid var(--hair);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:10px;color:var(--muted)}
+
+@media print{
+  body{background:#fff}.toolbar{display:none}
+  .sheet{margin:0;padding:0;max-width:none;box-shadow:none;overflow:visible}
+  thead{display:table-header-group}tr{break-inside:avoid;page-break-inside:avoid}
+  tr.tot,tr.sub{break-before:avoid;page-break-before:avoid}
+  @page{size:A4;margin:13mm 12mm}
+}
+@media (max-width:640px){
+  .sheet{padding:18px 14px}.lh{flex-direction:column;align-items:flex-start}.stamp{text-align:left}
+  .sum{grid-template-columns:1fr 1fr}.sum div{border-bottom:1px solid var(--hair)}.sum div:nth-child(2n){border-right:0}.sum div.diff{grid-column:1/-1;border-bottom:0}
+  col.c-dt{width:17mm}col.c-am{width:23mm}col.c-tt{width:25mm}td,thead th{padding-left:3px;padding-right:3px}tr.it td{font-size:11px}
+}
 </style></head><body>
+{% set cc = atype=='credit_card' %}{% set side = 'card' if cc else 'bank' %}
 <div class=toolbar><a href="{{ url_for('detail', name=name) }}">&larr; Back to {{ name }}</a><button type=button onclick="window.print()">Print / Save as PDF</button></div>
 <div class=sheet>
 {% if not r.signed_at %}<div class=draft>DRAFT</div>{% endif %}
-<div class=co>{{ company or 'Bank reconciliation' }}</div>
-<h1>Bank reconciliation statement</h1>
-<dl class=meta>
-<div><dt>Account</dt><dd>{{ name }}</dd></div>
-<div><dt>Currency</dt><dd>{{ ccy or '—' }}</dd></div>
-<div><dt>Period</dt><dd>{{ r.p_start }} to {{ r.p_end }}</dd></div>
-<div><dt>Status</dt><dd>{% if r.signed_at %}Signed off{% else %}Draft — not signed off{% endif %}</dd></div>
-</dl>
-{% set cc = atype=='credit_card' %}
-<table>
-<tr class=head><td colspan=2>Balance per {{ 'card' if cc else 'bank' }} statement at {{ r.p_end }}</td><td class=a></td><td class=a>{% if r.closing is none %}not entered{% else %}{{ r.closing|acct }}{% endif %}</td></tr>
-<tr class=head><td colspan=4>Add: {{ 'charges in the books, not yet on the statement' if cc else 'deposits in transit (in the books, not yet on the statement)' }}</td></tr>
-{% for t in r.in_items %}<tr class=item><td>{{ t[3] }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=d>{{ t[1] }}</td><td class=a>{{ t[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
-<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.out_in|acct }}</td></tr>
-<tr class=head><td colspan=4>Less: {{ 'payments and refunds in the books, not yet on the statement' if cc else 'outstanding payments (in the books, not yet presented)' }}</td></tr>
-{% for t in r.out_items %}<tr class=item><td>{{ t[3] }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=d>{{ t[1] }}</td><td class=a>{{ t[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
-<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.out_out|acct }}</td></tr>
-<tr class=tot><td colspan=3>Adjusted {{ 'card' if cc else 'bank' }} balance</td><td class=a>{% if r.adj_bank is none %}—{% else %}{{ r.adj_bank|acct }}{% endif %}</td></tr>
-<tr class=gap><td colspan=4></td></tr>
-<tr class=head><td colspan=2>Balance per books (QuickBooks) at {{ r.p_end }}</td><td class=a></td><td class=a>{% if r.book is none %}not entered{% else %}{{ r.book|acct }}{% endif %}</td></tr>
-<tr class=head><td colspan=4>Add / (less): on the statement, not yet in the books</td></tr>
-{% for l in r.unrec_items %}<tr class=item><td>{{ l[3] }}</td><td class=d>{{ l[1] }}</td><td class=a>{{ l[2]|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
-<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.unrec|acct }}</td></tr>
-<tr class=head><td colspan=4>Add / (less): amount differences on matched items</td></tr>
-{% for m in r.delta_items %}<tr class=item><td>{{ m.desc }}</td><td class=d>{{ m.date }}</td><td class=a>{{ m.delta|acct }}</td><td class=a></td></tr>{% else %}<tr class=none><td colspan=4>None</td></tr>{% endfor %}
-<tr class=sub><td colspan=2></td><td class=a></td><td class=a>{{ r.match_adj|acct }}</td></tr>
-<tr class=tot><td colspan=3>Adjusted book balance</td><td class=a>{% if r.adj_book is none %}—{% else %}{{ r.adj_book|acct }}{% endif %}</td></tr>
-</table>
+
+<div class=lh>
+  <div>
+    <div class=co>{{ company or 'Bank reconciliation' }}</div>
+    <h1>Bank reconciliation statement</h1>
+    <div class=acct>{{ name }}{% if ccy %} <span>· {{ ccy }}</span>{% endif %}</div>
+  </div>
+  <div class=stamp>
+    <div>Statement date <b>{{ r.p_end|dmy }}</b></div>
+    <div>Period <b>{{ r.p_start|dmy }} – {{ r.p_end|dmy }}</b></div>
+    <div>{% if r.signed_at %}<span class="pill signed">Signed off</span>{% else %}<span class="pill draftp">Draft — not signed off</span>{% endif %}</div>
+  </div>
+</div>
+
+<div class=sum>
+  <div><span>Per {{ side }} statement</span><b>{% if r.closing is none %}—{% else %}{{ r.closing|acct }}{% endif %}</b></div>
+  <div><span>Per books</span><b>{% if r.book is none %}—{% else %}{{ r.book|acct }}{% endif %}</b></div>
+  <div><span>Adjusted {{ side }}</span><b>{% if r.adj_bank is none %}—{% else %}{{ r.adj_bank|acct }}{% endif %}</b></div>
+  <div><span>Adjusted books</span><b>{% if r.adj_book is none %}—{% else %}{{ r.adj_book|acct }}{% endif %}</b></div>
+  <div class="diff {{ 'ok' if r.status=='balanced' else ('bad' if r.status=='out' else '') }}"><span>Difference</span><b>{% if r.rec_diff is none %}—{% else %}{{ r.rec_diff|acct }}{% endif %}</b></div>
+</div>
+
+<table class=st>
+<colgroup><col class=c-dt><col><col class=c-am><col class=c-tt></colgroup>
+<thead><tr><th>Date</th><th>Description</th><th class="r am">Amount</th><th class=r>Balance</th></tr></thead>
+<tbody>
+<tr class="part first"><td colspan=4>{{ 'Card' if cc else 'Bank' }} side</td></tr>
+<tr class=bal><td class=dt>{{ r.p_end|dmy }}</td><td class=ds>Balance per {{ side }} statement</td><td class=am></td><td class=tt>{% if r.closing is none %}not entered{% else %}{{ r.closing|acctc }}{% endif %}</td></tr>
+
+<tr class=sec><td></td><td class=ds colspan=3>Add: {{ 'charges' if cc else 'deposits in transit' }} <span class=why>— in the books, not yet on the statement</span></td></tr>
+{% for t in r.in_items %}<tr class=it><td class=dt>{{ t[1]|dmy }}</td><td class=ds>{{ t[3] or '—' }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=am>{{ t[2]|acctc }}</td><td class=tt></td></tr>
+{% else %}<tr class=none><td></td><td colspan=3>None</td></tr>{% endfor %}
+<tr class="sub{{ ' empty' if not r.in_items }}"><td></td><td class=ds>Total {{ 'charges' if cc else 'deposits in transit' }} ({{ r.in_items|length }})</td><td class=am></td><td class=tt>{{ r.out_in|acctc }}</td></tr>
+
+<tr class=sec><td></td><td class=ds colspan=3>Less: {{ 'payments and refunds' if cc else 'outstanding payments' }} <span class=why>— in the books, not yet {{ 'on the statement' if cc else 'presented' }}</span></td></tr>
+{% for t in r.out_items %}<tr class=it><td class=dt>{{ t[1]|dmy }}</td><td class=ds>{{ t[3] or '—' }}{% if t[1] < r.p_start %}<span class=bf>b/f</span>{% endif %}</td><td class=am>{{ (-t[2])|acctc }}</td><td class=tt></td></tr>
+{% else %}<tr class=none><td></td><td colspan=3>None</td></tr>{% endfor %}
+<tr class="sub{{ ' empty' if not r.out_items }}"><td></td><td class=ds>Total {{ 'payments and refunds' if cc else 'outstanding payments' }} ({{ r.out_items|length }})</td><td class=am></td><td class=tt>{{ r.out_out|acctc }}</td></tr>
+
+<tr class=tot><td></td><td class=ds colspan=2>Adjusted {{ side }} balance</td><td class=tt>{% if r.adj_bank is none %}—{% else %}{{ r.adj_bank|acctc }}{% endif %}</td></tr>
+
+<tr class=part><td colspan=4>Book side (QuickBooks)</td></tr>
+<tr class=bal><td class=dt>{{ r.p_end|dmy }}</td><td class=ds>Balance per books</td><td class=am></td><td class=tt>{% if r.book is none %}not entered{% else %}{{ r.book|acctc }}{% endif %}</td></tr>
+
+<tr class=sec><td></td><td class=ds colspan=3>Add / (less): on the statement, not yet in the books</td></tr>
+{% for l in r.unrec_items %}<tr class=it><td class=dt>{{ l[1]|dmy }}</td><td class=ds>{{ l[3] or '—' }}</td><td class=am>{{ l[2]|acctc }}</td><td class=tt></td></tr>
+{% else %}<tr class=none><td></td><td colspan=3>None</td></tr>{% endfor %}
+<tr class="sub{{ ' empty' if not r.unrec_items }}"><td></td><td class=ds>Total not yet in the books ({{ r.unrec_items|length }})</td><td class=am></td><td class=tt>{{ r.unrec|acctc }}</td></tr>
+
+<tr class=sec><td></td><td class=ds colspan=3>Add / (less): amount differences on matched items</td></tr>
+{% for m in r.delta_items %}<tr class=it><td class=dt>{{ m.date|dmy }}</td><td class=ds>{{ m.desc }}</td><td class=am>{{ m.delta|acctc }}</td><td class=tt></td></tr>
+{% else %}<tr class=none><td></td><td colspan=3>None</td></tr>{% endfor %}
+<tr class="sub{{ ' empty' if not r.delta_items }}"><td></td><td class=ds>Total differences ({{ r.delta_items|length }})</td><td class=am></td><td class=tt>{{ r.match_adj|acctc }}</td></tr>
+
+<tr class=tot><td></td><td class=ds colspan=2>Adjusted book balance</td><td class=tt>{% if r.adj_book is none %}—{% else %}{{ r.adj_book|acctc }}{% endif %}</td></tr>
+</tbody></table>
+
 <div class="result {{ r.status }}">
-{% if r.status=='balanced' %}<span>&#10003; Reconciled — adjusted {{ 'card' if cc else 'bank' }} and book balances agree</span><span>Difference 0.00</span>
+{% if r.status=='balanced' %}<span>&#10003; Reconciled — adjusted {{ side }} and book balances agree</span><span>Difference 0.00</span>
 {% elif r.status=='out' %}<span>Not reconciled — out of balance</span><span>Difference {{ r.rec_diff|acct }}</span>
 {% else %}<span>Incomplete — the {{ r.missing }} {{ 'is' if ' and ' not in r.missing else 'are' }} not entered</span><span>—</span>{% endif %}
 </div>
-{% if r.foot_diff %}<div class="note bad">The statement doesn't add up: opening {{ r.opening|acct }} + movements {{ r.moves|acct }} = {{ (r.opening + r.moves)|acct }}, but the closing balance is {{ r.closing|acct }}.</div>
-{% elif r.foot_diff is not none and r.opening_src != 'derived' %}<div class=facts>Statement check: opening balance {{ r.opening|acct }} + movements {{ r.moves|acct }} = closing balance {{ r.closing|acct }} &#10003;</div>{% endif %}
+{% if r.foot_diff %}<div class="note bad">The statement doesn't add up: opening {{ r.opening|acct }} + movements {{ r.moves|acct }} = {{ (r.opening + r.moves)|acct }}, but the closing balance is {{ r.closing|acct }}.</div>{% endif %}
 {% if r.n_pending %}<div class=note>{{ r.n_pending }} suggested match{{ '' if r.n_pending==1 else 'es' }} not yet reviewed; {{ 'it is' if r.n_pending==1 else 'they are' }} treated as unmatched above.</div>{% endif %}
 {% if r.n_gone %}<div class="note bad">{{ r.n_gone }} matched book transaction{{ '' if r.n_gone==1 else 's' }} {{ 'has' if r.n_gone==1 else 'have' }} since been deleted, voided or moved in QuickBooks.</div>{% endif %}
-{% if r.snap_diff is not none and r.rec_diff is not none and r.snap_diff != r.rec_diff %}<div class=note>Recalculated from current data. When signed off on {{ r.signed_at.strftime('%Y-%m-%d') }} the difference was {{ r.snap_diff|acct }}; the books or matches have changed since.</div>{% endif %}
+{% if r.snap_diff is not none and r.rec_diff is not none and r.snap_diff != r.rec_diff %}<div class=note>Recalculated from current data. When signed off on {{ r.signed_at|dmy }} the difference was {{ r.snap_diff|acct }}; the books or matches have changed since.</div>{% endif %}
 {% if r.signoff_note %}<div class="note bad">Signed off while not reconciled. Reason given: {{ r.signoff_note }}</div>{% endif %}
-<div class=facts>{{ r.n_lines }} statement line{{ '' if r.n_lines==1 else 's' }}: {{ r.n_auto }} matched automatically, {{ r.n_confirmed }} confirmed suggestion{{ '' if r.n_confirmed==1 else 's' }}, {{ r.n_manual }} matched by hand, {{ r.unrec_items|length }} not in the books.{% if r.bf_count %} {{ r.bf_count }} outstanding item{{ '' if r.bf_count==1 else 's' }} brought forward (b/f) from earlier periods.{% endif %}</div>
+<div class=facts>
+{% if r.foot_diff is not none and not r.foot_diff and r.opening_src != 'derived' %}<p>Statement check: opening balance {{ r.opening|acct }} + movements {{ r.moves|acct }} = closing balance {{ r.closing|acct }} &#10003;</p>{% endif %}
+<p>{{ r.n_lines }} statement line{{ '' if r.n_lines==1 else 's' }}: {{ r.n_auto }} matched automatically, {{ r.n_confirmed }} confirmed suggestion{{ '' if r.n_confirmed==1 else 's' }}, {{ r.n_manual }} matched by hand, {{ r.unrec_items|length }} not in the books.{% if r.bf_count %} {{ r.bf_count }} outstanding item{{ '' if r.bf_count==1 else 's' }} brought forward (b/f) from earlier periods.{% endif %}</p>
+</div>
+
 <div class=sign>
-<div><div class=who>{% if r.signed_at %}{{ r.signed_by }}, {{ r.signed_at.strftime('%d %b %Y') }}{% endif %}</div><div class=line>Prepared and signed off by · date</div></div>
-<div><div class=who></div><div class=line>Reviewed by · signature · date</div></div>
+  <div><div class=who>{% if r.signed_at %}{{ r.signed_by }}{% endif %}</div><div class=ln><span>Prepared and signed off by</span><span>{% if r.signed_at %}{{ r.signed_at|dmy }}{% else %}Date{% endif %}</span></div></div>
+  <div><div class=who></div><div class=ln><span>Reviewed by (name and signature)</span><span>Date</span></div></div>
 </div>
 <footer><span>Amounts in {{ ccy or 'account currency' }}. Brackets are negative.</span><span>Generated {{ now }} EAT · ReconBook</span></footer>
 </div></body></html>"""
@@ -7165,8 +7322,9 @@ def manual_match(name):
     lids = list(dict.fromkeys(request.form.getlist("ml")))
     tids = list(dict.fromkeys(request.form.getlist("mb")))
     back = redirect(url_for("detail", name=name) + "#sec-manual")
-    if not lids or not tids:
-        session["detail_msg"] = "Pick at least one bank line and one QuickBooks transaction."
+    if not lids or (not tids and len(lids) < 2):
+        session["detail_msg"] = ("Pick at least one bank line and one QuickBooks transaction (or, for a payment "
+                                 "and its reversal, the bank lines that cancel out).")
         return back
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
@@ -7190,6 +7348,11 @@ def manual_match(name):
         session["detail_msg"] = "Some of those items were already matched or can't be matched to this statement. Reload and try again."
         return back
     delta = sum((l[1] for l in lines), Decimal(0)) - sum((t[2] for t in txns), Decimal(0))
+    if not txns and delta:
+        cur.close(); conn.close()
+        session["detail_msg"] = (f"Bank lines matched on their own must cancel out (a payment and its reversal); "
+                                 f"these add up to {_money(delta)}. Pick the QuickBooks entry too.")
+        return back
     replaced = False
     orig = request.form.get("orig") or ""
     if "|" in orig:
@@ -7209,7 +7372,8 @@ def manual_match(name):
                    VALUES (%s,%s,%s,'confirmed','manual',1,%s,'user',%s,now());""",
                 (mid, ORG_ID, sid, delta, session.get("name") or "user"))
     execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", [(mid, str(l[0])) for l in lines])
-    execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, str(t[0])) for t in txns])
+    if txns:
+        execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, str(t[0])) for t in txns])
     conn.commit(); cur.close(); conn.close()
     _after_review(sid)   # re-match the rest around it; suggestions that used these items are replaced
     session["detail_msg"] = (f"Matched {len(lines)} bank line{'' if len(lines) == 1 else 's'} to {len(txns)} "

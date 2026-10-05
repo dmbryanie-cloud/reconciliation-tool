@@ -160,8 +160,9 @@ book("n0", "2026-09-26", -333, "Textbooks")            # an ordinary payment, a 
 upload([("2026-09-27", "GOVERNMENT EXCISE DUTY CHARGE", -300), ("2026-09-27", "TEXTBOOKS", -333),
         ("2026-09-28", "CASH WITHDRAWAL FEE", -3500), ("2026-09-29", "INWARD EFT FEE", -2300)])
 C1, N1, C2, C3 = lid("GOVERNMENT EXCISE DUTY CHARGE"), lid("TEXTBOOKS"), lid("CASH WITHDRAWAL FEE"), lid("INWARD EFT FEE")
-check("a charge isn't paired with the same amount a day earlier", not matched(C1) and not q(
-      "SELECT 1 FROM match_statement_line msl JOIN match m USING (match_id) WHERE msl.line_id=%s", (C1,)))
+check("a charge isn't matched to the same amount a day earlier: only suggested, as charges with different dates",
+      not matched(C1) and q("""SELECT m.status, m.confidence FROM match_statement_line msl JOIN match m USING (match_id)
+      WHERE msl.line_id=%s""", (C1,)) == [("proposed", A.Decimal(str(A.CHARGE_GROUP_CONF)))])
 check("…an ordinary payment still is", matched(N1) == [("exact", "engine")])
 check("is_bank_charge: fees and duty going out; not school fees coming in, cheques or EFT payments",
       A.is_bank_charge("FEE  ACH INWD CR", -4000) and A.is_bank_charge("MONTHLY MANAGEMENT FEE", -36000)
