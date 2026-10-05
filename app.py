@@ -14,7 +14,8 @@ from difflib import SequenceMatcher
 from psycopg2.extras import execute_values
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta, date
-from flask import Flask, g, has_request_context, render_template_string, request, redirect, session, url_for, Response
+import flask
+from flask import Flask, g, has_request_context, request, redirect, session, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import escape, Markup
 import json, base64, urllib.request, urllib.parse, urllib.error
@@ -62,8 +63,19 @@ CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "dmbryanie@gmail.com")  # shown 
 
 QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
 QBO_BASE = os.environ.get("QBO_BASE", "https://sandbox-quickbooks.api.intuit.com")
-QBO_REDIRECT_URI = os.environ.get("QBO_REDIRECT_URI", "https://reconciliation-tool-l2nk.onrender.com/callback")
+QBO_REDIRECT_URI = os.environ.get("QBO_REDIRECT_URI", "https://reconbook.onrender.com/callback")
 QBO_SCOPE = "com.intuit.quickbooks.accounting"
+
+# Flask compiles a template string afresh on every call -- on a big page that was half the server's own
+# time. Compile each page's template once and reuse it.
+_TEMPLATES = {}
+def render_template_string(source, **context):
+    t = _TEMPLATES.get(source)
+    if t is None:
+        t = app.jinja_env.from_string(source)
+        if len(_TEMPLATES) < 200:
+            _TEMPLATES[source] = t
+    return flask.render_template(t, **context)
 
 
 # ---------------- database connections ----------------
