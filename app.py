@@ -3553,7 +3553,7 @@ PERM_BY_ENDPOINT = {
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
     "transfer_change": "record", "record_reset": "record", "record_ignore": "record",
-    "transfer_undo": "undo", "recorded_twice_fix": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
+    "transfer_undo": "undo", "recorded_twice_fix": "undo", "period_copies_fix": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
     "signoff": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
     "set_token": "users", "disconnect": "users", "check_connection": "users", "connect": "users",
@@ -4790,6 +4790,59 @@ def recorded_twice(cur, sid, un_books):
     return groups
 
 
+def period_copies(cur, sid, upto):
+    """Entries recorded from here for this statement's lines dated on or before `upto` -- a period
+    QuickBooks had already reconciled, so it had them all: {"rows": [...], "transfers": [...]}.
+    Transfers are listed apart: Undo removes both their sides."""
+    cur.execute("""SELECT sl.line_id::text, sl.posted_date, sl.amount, coalesce(sl.description,''), w.qbo_type, w.qbo_id,
+                          coalesce(w.account_fqn,'')
+                   FROM writeback_log w JOIN statement_line sl ON sl.line_id=w.line_id
+                   WHERE sl.statement_id=%s AND w.status='done' AND sl.posted_date <= %s AND w.qbo_id IS NOT NULL
+                   ORDER BY sl.posted_date, sl.amount;""", (sid, upto))
+    out = {"rows": [], "transfers": []}
+    for lid, d, a, desc, ty, qid, fqn in cur.fetchall():
+        r = {"line_id": lid, "date": d, "amount": a, "desc": desc, "type": ty, "qbo_id": qid, "fqn": fqn}
+        if ty in TWICE_TYPES and "," not in qid:
+            out["rows"].append(r)
+        else:
+            out["transfers"].append(r)
+    out["total"] = sum((r["amount"] for r in out["rows"]), Decimal(0))
+    return out
+
+
+def match_charges_by_month(cur, acct_uuid, stmt, upto, who):
+    """In a period QuickBooks had reconciled: each month's unmatched bank charge lines against its
+    unmatched bank-charge entries in QuickBooks. Where the two totals are equal, they're matched as one
+    (QuickBooks books them added up, on other days). Returns the months matched."""
+    sid = stmt[0]
+    r = reconcile(cur, acct_uuid, stmt)
+    lines = [(str(l[0]), l[1], l[2]) for l in r["un_lines"] if l[1] <= upto]
+    cur.execute("SELECT line_id::text, coalesce(description,'') || ' ' || coalesce(counterparty,'') FROM statement_line WHERE statement_id=%s;", (sid,))
+    text = dict(cur.fetchall())
+    lines = [l for l in lines if is_bank_charge(text.get(l[0], ""), l[2])]
+    books = [t for t in r["un_books"] if t[1] <= upto and t[2] < 0]
+    if not lines or not books:
+        return []
+    cur.execute("SELECT txn_id::text, coalesce(category,'') FROM book_txn WHERE txn_id = ANY(%s::uuid[]);", ([str(t[0]) for t in books],))
+    cat = dict(cur.fetchall())
+    books = [(str(t[0]), t[1], t[2]) for t in books if CHARGE_ACCT_RE.search(cat.get(str(t[0]), "")) or is_bank_charge(t[3], t[2])]
+    months = {}
+    for side, items in ((0, lines), (1, books)):
+        for i, d, a in items:
+            months.setdefault((d.year, d.month), ([], []))[side].append((i, a))
+    done = []
+    for (y, m), (ls, bs) in sorted(months.items()):
+        if ls and bs and sum((a for _, a in ls), Decimal(0)) == sum((a for _, a in bs), Decimal(0)):
+            mid = str(uuid.uuid4())
+            cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
+                                              created_by, confirmed_by, confirmed_at)
+                           VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, sid, who))
+            execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s", [(mid, i) for i, _ in ls])
+            execute_values(cur, "INSERT INTO match_book_txn (match_id, txn_id) VALUES %s", [(mid, i) for i, _ in bs])
+            done.append(f"{m:02d}/{y}")
+    return done
+
+
 def reconciled_to(cur, acct_uuid):
     """The date an account is reconciled up to: the end of its latest signed-off reconciliation, or
     QuickBooks' reconciliation it started from if that's later (or None)."""
@@ -5190,6 +5243,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if has_results %}<a href="{{ url_for('exceptions_csv', name=name) }}">Download exceptions (CSV)</a><a href="{{ url_for('qbo_import_csv', name=name) }}">Download for QuickBooks (CSV)</a><div class=sep></div>{% endif %}
 {% if qbo_connected and qbo_linked %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=back value="{{ name }}"><button type=submit>Refresh books from QuickBooks</button></form>{% endif %}
 {% if can('upload') and not qbo_linked %}<button type=button data-drawer=books>Import books from a CSV</button>{% endif %}
+{% if can('undo') and has_results and not signed_off %}<button type=button data-drawer=qrec>Copies in a period QuickBooks reconciled…</button>{% endif %}
 {% if can('settings') %}<div class=sep></div><div class=dh>Admin</div>
 {% if qbo_connected and qbo_linked %}<button type=button data-drawer=qbostart>QuickBooks starting point</button>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" class=ccyf><label for=ccy-in>Currency</label><input id=ccy-in name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX"><button type=submit class=btn-sm>Set</button></form>
@@ -5236,6 +5290,11 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=qs-bal>Statement ending balance (optional)</label><input id=qs-bal name=balance inputmode=decimal placeholder="from that statement"><small>If typed, QuickBooks' reconciled total must equal it, or nothing is saved.</small></div>
 </div>
 <div class=drawer-f>{% if qbo_base %}<button type=submit name=remove value=1 class="btn-sm danger" formnovalidate data-confirm="Remove the starting point taken from QuickBooks? Its reconciled entries count as outstanding again.">Remove</button>{% endif %}<button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Reading QuickBooks' reconciliation...">{{ 'Read again' if qbo_base else 'Read from QuickBooks' }}</button></div></form></aside>{% endif %}
+{% if can('undo') and has_results and not signed_off %}<aside class=drawer id=dr-qrec hidden aria-label="Copies in a period QuickBooks reconciled"><form action="{{ url_for('detail', name=name) }}" method=get style="display:contents">
+<div class=drawer-h><h2>Copies in a period QuickBooks reconciled</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b><div class=help style="margin:0 0 12px">If QuickBooks was already reconciled up to a date, it had every bank transaction to that date — so whatever was recorded from here for those dates is in QuickBooks twice. Give the date to list them; nothing changes until you confirm on the next screen.</div>
+<div class=fld><label for=qr-date>QuickBooks reconciled up to</label><input id=qr-date type=date name=qrec required min="{{ p_start }}" max="{{ p_end }}" value="{{ qrec.isoformat() if qrec else '' }}"></div></div>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Check</button></div></form></aside>{% endif %}
 {% if not qbo_linked %}<aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
 <div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b><div class=help style="margin:0">For working offline: a QuickBooks register exported as CSV. When QuickBooks is connected the books are read directly, with no export needed.</div>
@@ -5395,6 +5454,16 @@ f.querySelector('button[type=submit]').click()})})();</script>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
+{% if pcopies is not none %}<h2 id=sec-qrec style="font-size:15px" data-sec data-state="{{ 'attn' if pcopies.rows else 'done' }}" data-note="{{ (pcopies.rows|length ~ ' to delete') if pcopies.rows else 'None' }}">Recorded from here on or before {{ qrec.strftime('%d/%m/%Y') }} ({{ pcopies.rows|length }})</h2>
+<div class=help>QuickBooks was already reconciled up to {{ qrec.strftime('%d/%m/%Y') }}, so it had these: each is in QuickBooks twice. Deleting them leaves QuickBooks' own entries; then each month's bank charges are matched to QuickBooks' combined charge entries where the totals agree, and you match the rest by hand. <a href="{{ url_for('detail', name=name) }}">Close this check</a></div>
+{% if pcopies.rows %}<table class=rectbl><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Recorded as</th></tr>
+{% for r in pcopies.rows %}<tr><td>{{ r.date }}</td><td class=desc>{{ r.desc }}</td><td class=a>{{ r.amount|money }}</td><td class=desc>{{ r.type }} #{{ r.qbo_id }}<div class=hint>{{ r.fqn }}</div></td></tr>{% endfor %}
+<tr><td></td><td><b>{{ pcopies.rows|length }} entries</b></td><td class=a><b>{{ pcopies.total|money }}</b></td><td></td></tr></table>
+<form method=post action="{{ url_for('period_copies_fix', name=name) }}" class=btnrow style="margin:10px 0" data-confirm="Delete these {{ pcopies.rows|length }} entries recorded from here in QuickBooks? QuickBooks keeps its own entries for these dates. This changes QuickBooks.">
+<input type=hidden name=upto value="{{ qrec.isoformat() }}">{% for r in pcopies.rows %}<input type=hidden name=line value="{{ r.line_id }}">{% endfor %}
+<button type=submit class="btn-sm pri" data-busy="Deleting the copies in QuickBooks...">Delete these {{ pcopies.rows|length }} copies</button></form>{% else %}<div class=muted style="margin:6px 0 14px">Nothing recorded from here on or before that date.</div>{% endif %}
+{% if pcopies.transfers %}<div class="recnote warn">{{ pcopies.transfers|length }} transfer{{ '' if pcopies.transfers|length == 1 else 's' }} recorded for those dates ({% for r in pcopies.transfers %}{{ r.date }} {{ r.amount|money }} #{{ r.qbo_id }}{{ ', ' if not loop.last }}{% endfor %}): use Undo under Recorded transfers — it removes both sides.</div>{% endif %}
+{% endif %}
 {% if twice %}<h2 id=sec-twice style="font-size:15px" data-sec data-state=attn data-note="{{ twice|length }} to put right">Recorded twice? — {{ twice|length }} to check</h2>
 <div class=help>These bank lines were recorded in QuickBooks from here, but QuickBooks already had an entry for the same money (for example a fee and its excise duty booked together). Each pair is now in QuickBooks twice. <details class=how><summary>How this works</summary><div>An earlier QuickBooks entry that nothing is matched to, whose amount is exactly that of one to {{ 4 }} lines recorded from here within 3 days. Putting it right deletes the entries recorded from here in QuickBooks and matches the bank lines to the earlier entry, so each amount is in the books once. Check each one: if the earlier entry is really something else, leave it.</div></details></div>
 {% if can('undo') %}<form method=post action="{{ url_for('recorded_twice_fix', name=name) }}" id=twicebulk class=bulkbar data-one=group data-many=groups>
@@ -5411,7 +5480,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 {% if n_waiting %}<div class="recnote warn">{{ n_waiting }} more line{{ " isn't" if n_waiting == 1 else "s aren't" }} listed here: a suggested match is waiting for {{ 'it' if n_waiting == 1 else 'them' }} under <a href="#sec-review">Suggested matches</a>. If the suggestion is right, the money is already in QuickBooks — confirm it. Reject it to record the line instead.</div>{% endif %}
 <div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer; to or from a bank in another currency it's in the foreign currency, at the rate you type (or QuickBooks' rate for the date); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
 {% if rec_job %}{% set rj_pct = ((rec_job.n or 0) * 100 // (rec_job.total or 1)) if rec_job.total else 0 %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">
-<div class=rj-top><span>Recording in QuickBooks…</span><b class=rj-pct>{{ rj_pct }}%</b></div>
+<div class=rj-top><span>{{ 'Deleting copies recorded twice…' if rec_job.kind == 'twice' else 'Recording in QuickBooks…' }}</span><b class=rj-pct>{{ rj_pct }}%</b></div>
 <div class="bar rj-bar" role=progressbar aria-label="Recording in QuickBooks" aria-valuemin=0 aria-valuemax=100 aria-valuenow="{{ rj_pct }}"><i style="width:{{ rj_pct }}%"></i></div>
 <div class=hint>{% if rec_job.resumes %}Carried on after the server restarted. {% endif %}The list updates when it finishes.</div></div>
 <script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
@@ -6966,6 +7035,8 @@ def detail(name):
     if rec_job and rec_job.get("state") in ("done", "failed", "stalled") and \
             rec_job.get("started") != session.get("rec_seen:" + name):   # each job's result shown once
         extra = rec_job.get("msg") if rec_job["state"] != "stalled" else (
+            f"Putting right the copies stopped before finishing ({rec_job.get('n')} of {rec_job.get('total')} groups). "
+            f"Groups done show as matched; tick the rest again." if rec_job.get("kind") == "twice" else
             f"Recording stopped before finishing ({rec_job.get('n')} of {rec_job.get('total')} lines done). "
             f"Lines already recorded show as recorded; record the rest again.")
         session["detail_msg"] = " ".join(x for x in (extra, session.get("detail_msg")) if x)
@@ -6989,6 +7060,13 @@ def detail(name):
     prep = signed_by = saved_at = saved_by = clr = None
     rec_to = reconciled_to(cur, acct_uuid)
     qbo_base = qbo_baseline(cur, acct_uuid)
+    qrec = pcopies = None
+    try:
+        qrec = date.fromisoformat(request.args.get("qrec") or "")
+    except ValueError:
+        pass
+    if qrec and st and not st[3]:
+        pcopies = period_copies(cur, st[0], qrec)
     n_lines = n_matched_lines = 0
     focus = focus_window(name, st[0], st[1], st[2]) if st and d.get("has_results") else None
     if st:
@@ -7032,7 +7110,7 @@ def detail(name):
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   prep=prep, signed_by=signed_by, n_lines=n_lines, n_matched_lines=n_matched_lines,
                                   self_prepared=self_prepared, signoff_why=signoff_why, open_upload=open_upload,
-                                  rec_to=rec_to, qbo_base=qbo_base, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
+                                  rec_to=rec_to, qbo_base=qbo_base, qrec=qrec, pcopies=pcopies, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
@@ -8449,13 +8527,22 @@ def _undo_transfer(name, qid):
     return True, (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
                              f"{'s are' if len(lines) > 1 else ' is'} back in the list to record again.")
 
+TWICE_BG_MIN = 3     # this many groups or more are put right in the background (each takes several QuickBooks calls)
+
+
 @app.route("/account/<name>/recorded_twice", methods=["POST"])
 def recorded_twice_fix(name):
     """For each ticked group: delete the entries recorded from here in QuickBooks and match their bank
-    lines to the entry QuickBooks already had. Only groups the page still finds, on an open statement."""
+    lines to the entry QuickBooks already had. Only groups the page still finds, on an open statement.
+    Several groups run in the background, with progress on the page, so the server's time limit
+    doesn't cut a long batch off."""
     back = redirect(url_for("detail", name=name) + "#sec-twice")
-    user = session.get("name") or "user"
+    user = {k: session.get(k) for k in ("name", "username", "is_admin", "perms")}
     picks = set(request.form.getlist("grp"))
+    job = record_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = "Wait for the work in progress on this account (shown at the top) to finish."
+        return back
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
@@ -8470,13 +8557,43 @@ def recorded_twice_fix(name):
     if not groups:
         session["detail_msg"] = "Nothing ticked (or it has changed since the page loaded — reload and try again)."
         return back
+    if not (SYNC_IN_BACKGROUND and len(groups) >= TWICE_BG_MIN):
+        session["detail_msg"] = _twice_run(name, row[0], s[0], groups, user)
+        return back
+    job = {"state": "running", "kind": "twice", "by": user.get("name"), "started": time.time(), "beat": time.time(),
+           "total": len(groups), "n": 0, "done": 0, "msg": ""}
+    set_config(_record_key(name), json.dumps(job))
+
+    def progress(n, done):
+        job.update(n=n, done=done, beat=time.time())
+        set_config(_record_key(name), json.dumps(job))
+
+    def run():
+        try:
+            with app.test_request_context():
+                session.update({k: v for k, v in user.items() if v is not None})
+                msg = _twice_run(name, row[0], s[0], groups, user, progress)
+            job.update(state="done", msg=msg, n=job["total"], finished=time.time())
+        except Exception as e:
+            job.update(state="failed", finished=time.time(),
+                       msg=f"Stopped: {e}. Groups already put right show as matched; the rest stay listed.")
+        set_config(_record_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="qbo-twice").start()
+    return back
+
+
+def _twice_run(name, acct_uuid, sid, groups, user, progress=None):
+    """Put right these recorded-twice groups, one at a time (each saved as it's done). Returns the message."""
+    who = (user or {}).get("name") or "user"
     fixed, removed, problems = 0, 0, []
     try:
         token = qbo_token()
     except Exception as e:
-        session["detail_msg"] = f"Nothing changed: couldn't reach QuickBooks ({e})."
-        return back
-    for g_ in groups:
+        return f"Nothing changed: couldn't reach QuickBooks ({e})."
+    for n_g, g_ in enumerate(groups):
+        if progress:
+            progress(n_g, fixed)
         gone = []
         for l in g_["lines"]:
             try:
@@ -8491,33 +8608,131 @@ def recorded_twice_fix(name):
         conn = get_conn(); cur = conn.cursor()
         for l in gone:
             cur.execute("""UPDATE book_txn SET is_deleted=true, updated_at=now()
-                           WHERE account_id=%s AND source_txn_type=%s AND source_txn_id=%s;""", (row[0], l["type"], l["qbo_id"]))
+                           WHERE account_id=%s AND source_txn_type=%s AND source_txn_id=%s;""", (acct_uuid, l["type"], l["qbo_id"]))
             cur.execute("""UPDATE writeback_log SET status='failed', error=%s WHERE line_id=%s;""",
-                        (f"deleted by {user}: QuickBooks already had it as {g_['qbo']}", l["line_id"]))
+                        (f"deleted by {who}: QuickBooks already had it as {g_['qbo']}", l["line_id"]))
             cur.execute("""DELETE FROM match WHERE statement_id=%s AND match_id IN
-                             (SELECT match_id FROM match_statement_line WHERE line_id=%s);""", (s[0], l["line_id"]))
+                             (SELECT match_id FROM match_statement_line WHERE line_id=%s);""", (sid, l["line_id"]))
         removed += len(gone)
         if len(gone) == len(g_["lines"]):
             mid = str(uuid.uuid4())
             cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
                                               created_by, confirmed_by, confirmed_at)
-                           VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, s[0], user))
+                           VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, sid, who))
             execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s",
                            [(mid, l["line_id"]) for l in g_["lines"]])
             cur.execute("INSERT INTO match_book_txn (match_id, txn_id) VALUES (%s,%s);", (mid, g_["txn_id"]))
             fixed += 1
         conn.commit(); cur.close(); conn.close()
+        if removed:     # logged as it goes, so a cut-off run still leaves a record
+            log_activity(f"removed {len(gone)} entr{'y' if len(gone) == 1 else 'ies'} recorded twice "
+                         f"(duplicate of {g_['qbo']})", name)
         if problems:
             break           # QuickBooks refused one: stop rather than carry on half-blind
-    _after_review(s[0])
-    if removed:
-        log_activity(f"removed {removed} entries recorded twice ({fixed} groups matched to the earlier entry)", name)
-    session["detail_msg"] = ((f"Put right {fixed} recorded-twice group{'' if fixed == 1 else 's'}: deleted {removed} "
-                              f"entr{'y' if removed == 1 else 'ies'} recorded from here in QuickBooks and matched the bank "
-                              f"lines to the entries QuickBooks already had." if fixed else "Nothing put right.")
-                             + (f" Stopped: {problems[0]}. Lines whose entry was deleted are back in the list to record."
-                                if problems else ""))
+    _after_review(sid)
+    return ((f"Put right {fixed} recorded-twice group{'' if fixed == 1 else 's'}: deleted {removed} "
+             f"entr{'y' if removed == 1 else 'ies'} recorded from here in QuickBooks and matched the bank "
+             f"lines to the entries QuickBooks already had." if fixed else "Nothing put right.")
+            + (f" Stopped: {problems[0]}. Lines whose entry was deleted are back in the list to record."
+               if problems else ""))
+
+
+@app.route("/account/<name>/period_copies", methods=["POST"])
+def period_copies_fix(name):
+    """Delete in QuickBooks the entries recorded from here on or before the date QuickBooks was already
+    reconciled to (only those the check listed), then match each month's bank charges to QuickBooks'
+    combined charge entries where the totals agree. Several run in the background."""
+    try:
+        upto = date.fromisoformat(request.form.get("upto") or "")
+    except ValueError:
+        upto = None
+    back = redirect(url_for("detail", name=name, qrec=upto.isoformat() if upto else None) + "#sec-qrec")
+    user = {k: session.get(k) for k in ("name", "username", "is_admin", "perms")}
+    wanted = set(request.form.getlist("line"))
+    job = record_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = "Wait for the work in progress on this account (shown at the top) to finish."
+        return back
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    if not upto or not s or s[3]:
+        cur.close(); conn.close()
+        session["detail_msg"] = "Nothing changed: give the date, on an open (not signed-off) reconciliation."
+        return back
+    rows = [r for r in period_copies(cur, s[0], upto)["rows"] if r["line_id"] in wanted]
+    cur.close(); conn.close()
+    if not rows:
+        session["detail_msg"] = "Nothing to delete (or it has changed since the check — check again)."
+        return back
+    if not (SYNC_IN_BACKGROUND and len(rows) >= TWICE_BG_MIN):
+        session["detail_msg"] = _period_copies_run(name, row[0], upto, rows, user)
+        return back
+    job = {"state": "running", "kind": "twice", "by": user.get("name"), "started": time.time(), "beat": time.time(),
+           "total": len(rows), "n": 0, "done": 0, "msg": ""}
+    set_config(_record_key(name), json.dumps(job))
+
+    def progress(n, done):
+        job.update(n=n, done=done, beat=time.time())
+        set_config(_record_key(name), json.dumps(job))
+
+    def run():
+        try:
+            with app.test_request_context():
+                session.update({k: v for k, v in user.items() if v is not None})
+                msg = _period_copies_run(name, row[0], upto, rows, user, progress)
+            job.update(state="done", msg=msg, n=job["total"], finished=time.time())
+        except Exception as e:
+            job.update(state="failed", finished=time.time(), msg=f"Stopped: {e}. Copies already deleted show as such; check again.")
+        set_config(_record_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="qbo-twice").start()
     return back
+
+
+def _period_copies_run(name, acct_uuid, upto, rows, user, progress=None):
+    who = (user or {}).get("name") or "user"
+    removed, problem = 0, None
+    try:
+        token = qbo_token()
+    except Exception as e:
+        return f"Nothing changed: couldn't reach QuickBooks ({e})."
+    for n_r, r in enumerate(rows):
+        if progress:
+            progress(n_r, removed)
+        try:
+            ent = qbo_read(token, r["type"], r["qbo_id"])
+            if ent is not None:
+                qbo_delete(token, r["type"], r["qbo_id"], ent.get("SyncToken", "0"))
+        except Exception as e:
+            problem = f"{r['type']} #{r['qbo_id']}: QuickBooks said " + (f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else str(e))
+            break
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""UPDATE book_txn SET is_deleted=true, updated_at=now()
+                       WHERE account_id=%s AND source_txn_type=%s AND source_txn_id=%s;""", (acct_uuid, r["type"], r["qbo_id"]))
+        cur.execute("UPDATE writeback_log SET status='failed', error=%s WHERE line_id=%s;",
+                    (f"deleted by {who}: QuickBooks was already reconciled to {upto:%d/%m/%Y}", r["line_id"]))
+        cur.execute("""DELETE FROM match WHERE match_id IN (SELECT match_id FROM match_statement_line WHERE line_id=%s)
+                         AND match_id IN (SELECT m.match_id FROM match m JOIN statement s ON s.statement_id=m.statement_id
+                                          WHERE s.signed_off_at IS NULL);""", (r["line_id"],))
+        conn.commit(); cur.close(); conn.close()
+        removed += 1
+    conn = get_conn(); cur = conn.cursor()
+    s = _latest_statement(cur, acct_uuid)
+    months = match_charges_by_month(cur, acct_uuid, s, upto, who) if s and removed else []
+    conn.commit(); cur.close(); conn.close()
+    if s:
+        _after_review(s[0])
+    if removed:
+        log_activity(f"deleted {removed} entries recorded from here on or before {upto:%d/%m/%Y} (QuickBooks already reconciled)"
+                     + (f"; bank charges matched by month for {', '.join(months)}" if months else ""), name)
+    return ((f"Deleted {removed} entr{'y' if removed == 1 else 'ies'} recorded from here on or before {upto:%d/%m/%Y} in "
+             f"QuickBooks." if removed else "Nothing deleted.")
+            + (f" Bank charges matched to QuickBooks' combined charge entries for {', '.join(months)}." if months else "")
+            + (" Their other bank lines are unmatched now: match them by hand to the entries QuickBooks already has."
+               if removed else "")
+            + (f" Stopped: {problem}." if problem else ""))
 
 
 @app.route("/account/<name>/transfer_change", methods=["POST"])
