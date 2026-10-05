@@ -121,6 +121,12 @@ sg = mem.suggest("TRANSFER TO SAVINGS ACCT", True)
 check("hand-made matches teach the suggestions", sg and sg["cat"] == "Office Supplies" and sg["tier"] == 2)
 
 # ---- duplicate guard -------------------------------------------------------------------------
+# SUPPLIER Y cleared 21 days after its entry: a suggestion, so it waits there rather than in the list to record.
+check("a line in a suggestion isn't offered for recording", L4 not in {str(w["line_id"]) for w in detail()["record_rows"]}
+      and detail()["n_waiting"] == 1)
+mid = q1("""SELECT m.match_id FROM match m JOIN match_statement_line x USING (match_id)
+            WHERE x.line_id=%s AND m.status='proposed'""", (L4,))[0]
+cl.post(f"/account/Stanbic/review/{mid}", data={"status": "rejected"})     # rejected: now it's listed, with the warning
 d = detail()
 items = {str(w["line_id"]): w for w in d["writebacks"] + d["deposits"]}
 check("line with a later-dated twin is flagged, not matchable", items[L3]["dups"] and items[L3]["dups"][0]["txn_id"] == B4

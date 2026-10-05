@@ -3552,7 +3552,7 @@ PERM_BY_ENDPOINT = {
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
     "transfer_change": "record", "record_reset": "record", "record_ignore": "record",
-    "transfer_undo": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
+    "transfer_undo": "undo", "recorded_twice_fix": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
     "signoff": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
     "set_token": "users", "disconnect": "users", "check_connection": "users", "connect": "users",
@@ -4747,6 +4747,48 @@ def run_matcher(statement_id):
     return None
 
 
+TWICE_DAYS = 3        # an earlier QuickBooks entry this close to lines recorded here may be the same money
+TWICE_MAX = 4         # ...made up of at most this many of them
+TWICE_TYPES = ("Purchase", "Deposit", "JournalEntry")
+
+
+def recorded_twice(cur, sid, un_books):
+    """Entries recorded from here that QuickBooks already had: an earlier entry still unmatched whose
+    amount is that of one to TWICE_MAX bank lines recorded here, dated within TWICE_DAYS (a fee and its
+    excise duty booked together, say). Returns groups {old, lines}, smallest first, each line once."""
+    if not un_books:
+        return []
+    cur.execute("""SELECT sl.line_id::text, sl.posted_date, sl.amount, coalesce(sl.description,''), w.qbo_type, w.qbo_id
+                   FROM writeback_log w JOIN statement_line sl ON sl.line_id=w.line_id
+                   WHERE sl.statement_id=%s AND w.status='done' AND w.qbo_type = ANY(%s)
+                     AND w.qbo_id IS NOT NULL AND position(',' in w.qbo_id) = 0
+                   ORDER BY sl.posted_date;""", (sid, list(TWICE_TYPES)))
+    recs = cur.fetchall()
+    if not recs:
+        return []
+    cur.execute("""SELECT txn_id::text, source_txn_type, source_txn_id FROM book_txn WHERE txn_id = ANY(%s::uuid[]);""",
+                ([str(t[0]) for t in un_books],))
+    src = {t: (ty, i) for t, ty, i in cur.fetchall()}
+    mine = {(ty, str(i)) for *_, ty, i in recs}
+    olds = [t for t in un_books if src.get(str(t[0])) and src[str(t[0])] not in mine and src[str(t[0])][0] != "CSV"]
+    used, groups = set(), []
+    for tid, td, ta, tw in sorted(olds, key=lambda t: t[1]):
+        cands = sorted([r for r in recs if r[0] not in used and (r[2] < 0) == (ta < 0) and abs((r[1] - td).days) <= TWICE_DAYS],
+                       key=lambda r: abs((r[1] - td).days))[:8]
+        found = None
+        for k in range(1, min(TWICE_MAX, len(cands)) + 1):
+            found = next((c for c in itertools.combinations(cands, k) if sum((x[2] for x in c), Decimal(0)) == ta), None)
+            if found:
+                break
+        if found:
+            used.update(x[0] for x in found)
+            ty, qid = src[str(tid)]
+            groups.append({"txn_id": str(tid), "date": td, "amount": ta, "who": tw, "qbo": f"{ty} #{qid}",
+                           "lines": [{"line_id": x[0], "date": x[1], "amount": x[2], "desc": x[3], "type": x[4], "qbo_id": x[5]}
+                                     for x in sorted(found, key=lambda x: (x[1], x[2]))]})
+    return groups
+
+
 def reconciled_to(cur, acct_uuid):
     """The date an account is reconciled up to: the end of its latest signed-off reconciliation, or
     QuickBooks' reconciliation it started from if that's later (or None)."""
@@ -5352,13 +5394,25 @@ f.querySelector('button[type=submit]').click()})})();</script>
 {% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
 <td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
+{% if twice %}<h2 id=sec-twice style="font-size:15px" data-sec data-state=attn data-note="{{ twice|length }} to put right">Recorded twice? — {{ twice|length }} to check</h2>
+<div class=help>These bank lines were recorded in QuickBooks from here, but QuickBooks already had an entry for the same money (for example a fee and its excise duty booked together). Each pair is now in QuickBooks twice. <details class=how><summary>How this works</summary><div>An earlier QuickBooks entry that nothing is matched to, whose amount is exactly that of one to {{ 4 }} lines recorded from here within 3 days. Putting it right deletes the entries recorded from here in QuickBooks and matches the bank lines to the earlier entry, so each amount is in the books once. Check each one: if the earlier entry is really something else, leave it.</div></details></div>
+{% if can('undo') %}<form method=post action="{{ url_for('recorded_twice_fix', name=name) }}" id=twicebulk class=bulkbar data-one=group data-many=groups>
+<span class=bk-n>Tick the ones that are the same money</span>
+<button type=submit class="btn-sm pri" data-label="Delete the copies and match" data-yes="Delete and match" data-busy="Deleting the copies in QuickBooks..." data-ask="Delete the entries recorded from here for {n} {noun} in QuickBooks, and match their bank lines to the entries QuickBooks already had? This changes QuickBooks.">Delete the copies and match</button></form>{% endif %}
+<table class=rectbl id=twicetbl><tr><th class=bk>{% if can('undo') %}<input type=checkbox class=bk-all data-for=twicebulk title="Select all" aria-label="Select all">{% endif %}</th><th>Already in QuickBooks</th><th class=a>Amount</th><th>Recorded from here (to delete)</th><th class=a>Amounts</th></tr>
+{% for g in twice %}<tr><td class=bk>{% if can('undo') %}<input type=checkbox name=grp value="{{ g.txn_id }}|{% for l in g.lines %}{{ l.line_id }}{{ ',' if not loop.last }}{% endfor %}" form=twicebulk class=bk-pick aria-label="Select this group">{% endif %}</td>
+<td class=desc>{{ g.date }} · {{ g.who or '—' }}<div class=hint>{{ g.qbo }}</div></td><td class=a>{{ g.amount|money }}</td>
+<td class=desc>{% for l in g.lines %}{{ l.date }} · {{ l.desc }} <span class=hint>{{ l.type }} #{{ l.qbo_id }}</span><br>{% endfor %}</td>
+<td class=a>{% for l in g.lines %}{{ l.amount|money }}<br>{% endfor %}</td></tr>{% endfor %}</table>
+{% endif %}
 {% if writebacks or deposits %}
 <h2 id=sec-record style="font-size:15px" data-sec data-state="{{ 'attn' if n_to_record else 'done' }}" data-note="{{ (n_to_record ~ ' to record') if n_to_record else ('Recorded \u2014 matches on the next refresh' if record_rows else 'Nothing to record') }}">Not in QuickBooks yet — record them ({{ record_rows|length }})</h2>
+{% if n_waiting %}<div class="recnote warn">{{ n_waiting }} more line{{ " isn't" if n_waiting == 1 else "s aren't" }} listed here: a suggested match is waiting for {{ 'it' if n_waiting == 1 else 'them' }} under <a href="#sec-review">Suggested matches</a>. If the suggestion is right, the money is already in QuickBooks — confirm it. Reject it to record the line instead.</div>{% endif %}
 <div class=help>Type and account are guessed from the description and how similar lines were posted. Check them, then record one line or tick several. <details class=how><summary>How this works</summary><div>The account and payee are suggested from how similar bank lines were posted before. Check them, then record one line, or tick several and record them together. Each becomes {{ 'a credit-card expense' if atype=='credit_card' else 'an expense (money out) or a deposit (money in)' }} in QuickBooks, dated as on the statement. <em>Type</em> narrows the accounts to one kind: an expense or deposit, a customer or student payment, a supplier payment, or a transfer. A transfer between your own accounts is recorded as one QuickBooks Transfer; to or from a bank in another currency it's in the foreign currency, at the rate you type (or QuickBooks' rate for the date); a student payment is recorded against the student. <em>Split</em> records one bank line across several accounts, such as an FX hedge and its gain or loss.{% if fx_ccy %} Amounts are in {{ fx_ccy }}; each line uses QuickBooks' {{ fx_ccy }} rate for its date unless you type one ({{ home_ccy }} per {{ fx_ccy }}).{% endif %}</div></details></div>
 {% if rec_job %}{% set rj_pct = ((rec_job.n or 0) * 100 // (rec_job.total or 1)) if rec_job.total else 0 %}<div id=recjob class=savedsel data-url="{{ url_for('record_status', name=name) }}">
 <div class=rj-top><span>Recording in QuickBooks…</span><b class=rj-pct>{{ rj_pct }}%</b></div>
 <div class="bar rj-bar" role=progressbar aria-label="Recording in QuickBooks" aria-valuemin=0 aria-valuemax=100 aria-valuenow="{{ rj_pct }}"><i style="width:{{ rj_pct }}%"></i></div>
-<div class=hint>The list updates when it finishes.</div></div>
+<div class=hint>{% if rec_job.resumes %}Carried on after the server restarted. {% endif %}The list updates when it finishes.</div></div>
 <script>(function(){var b=document.getElementById('recjob');if(!b||!window.fetch)return;
 function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
   if(j.state==='running'){var p=j.total?Math.min(100,Math.floor((j.n||0)*100/j.total)):0;
@@ -6371,6 +6425,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
     pool_ids = {str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
+    # A line in a suggested match still to review is already in QuickBooks if the suggestion is right:
+    # it isn't offered for recording until the suggestion is rejected.
+    waiting = {str(x) for r_ in reviewable if r_["status"] == "proposed" for x in r_["lids"]}
     for (lid, dd, a, who) in unmatched_lines:
         if a == 0:
             on_stmt_in.append((lid, dd, a, who)); continue
@@ -6392,6 +6449,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                 "is_xfer": bool(acct and acct.get("xfer")),
                 "dups": dups.get(str(lid), [])[:3]}
         item["dup_matchable"] = next((x["txn_id"] for x in item["dups"] if x["txn_id"] in pool_ids), None)
+        item["waiting"] = str(lid) in waiting and not item["wb"]
         item["sel"] = bool(item["acct_id"] and not item["dups"])
         pref = item["payee_ref"] or ""
         item["cust"] = pref.split(":", 1)[1] if pref.startswith("Customer:") and pref.split(":", 1)[1] in cust_names else ""
@@ -6494,10 +6552,14 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
-            "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored"], key=_record_rank),
+            "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]],
+                                  key=_record_rank),
+            "n_waiting": sum(1 for w in writebacks + deposits if w["waiting"]),
+            "twice": recorded_twice(cur, sid, rec["un_books"]),
             "ignored": sorted([w for w in writebacks + deposits if w["wb"] == "ignored"], key=lambda w: w["date"]),
-            "rec_chips": record_chips([w for w in writebacks + deposits if w["wb"] != "ignored"], acct_names),
-            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored")),
+            "rec_chips": record_chips([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]],
+                                      acct_names),
+            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored") and not w["waiting"]),
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "acct_linked": bool(acct_qbo),
@@ -7403,6 +7465,10 @@ def unmatch(name, match_id):
 
 RECORD_BG_MIN = 4          # this many lines or more are recorded in the background
 RECORD_STALE_SECS = 600    # a recording job silent this long was lost (a restart); say so
+RECORD_RESUME_SECS = 180   # ...silent this long, it lost its server (a restart or deploy): resume it
+RECORD_MAX_RESUMES = 3     # ...but not over and over
+RESUME_CHECK_SECS = 60     # how often each server looks for one to resume
+RESUME_WATCH = True        # the tests turn it off (they share one database connection)
 TWIN_DAYS = 3              # an entry QuickBooks already has: same amount, dated this close
 
 
@@ -7421,26 +7487,107 @@ def record_job(name):
     return job
 
 
+def _record_args_key(name):
+    return f"record_args:{name}"
+
+
 def start_record_job(name, form, ids, user):
-    """Record these lines in a background thread; the page shows progress and then the result."""
+    """Record these lines in a background thread; the page shows progress and then the result. The
+    selection is kept with the job, so a server that restarts mid-way (a deploy) can carry on."""
+    wanted = set(ids)
+    keep = {k: v for k, v in form.items() if not _is_uuid(k.rsplit("_", 1)[-1]) or k.rsplit("_", 1)[-1] in wanted}
+    set_config(_record_args_key(name), json.dumps({"form": keep, "ids": ids, "user": user}))
     job = {"state": "running", "by": user, "started": time.time(), "beat": time.time(), "total": len(ids),
            "n": 0, "done": 0, "msg": ""}
     set_config(_record_key(name), json.dumps(job))
+    _record_thread(name, job, keep, ids, user)
 
+
+def _record_thread(name, job, form, ids, user, base_n=0, base_done=0):
+    """Run (or carry on with) a recording job. Resumed, its counts continue from where it stopped."""
     def progress(n, total, done):
-        job.update(n=n, total=total, done=done, beat=time.time())
+        job.update(n=min(base_n + n, job["total"]), done=base_done + done, beat=time.time())
         set_config(_record_key(name), json.dumps(job))
 
     def run():
         try:
             msg = _record_run(name, form, ids, user, progress)
+            if job.get("resumes"):
+                msg = (f"Recording carried on after the server restarted ({base_done} line"
+                       f"{'' if base_done == 1 else 's'} recorded before it). " + msg)
             job.update(state="done", msg=msg, n=job["total"], finished=time.time())
         except Exception as e:
             job.update(state="failed", finished=time.time(),
                        msg=f"Recording stopped: {e}. Lines already recorded show as recorded; check the rest.")
         set_config(_record_key(name), json.dumps(job))
+        set_config(_record_args_key(name), "")      # finished: the selection isn't needed any more
 
     threading.Thread(target=run, daemon=True, name="qbo-record").start()
+
+
+def resume_record_jobs():
+    """Carry on with recordings whose server stopped (a restart or deploy): still 'running', but
+    silent for RECORD_RESUME_SECS. The same selection is recorded again: lines already recorded are
+    matched, so they're skipped, and the one being sent when it stopped stays blocked until someone
+    checks QuickBooks (it may or may not have reached it). Each job is claimed by swapping its
+    stored value, so two servers can't both take it. Returns the accounts resumed."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT key, value FROM app_config WHERE key LIKE 'record_job:%%';")
+    found = []
+    for key, value in cur.fetchall():
+        try:
+            job = json.loads(value or "null")
+        except ValueError:
+            continue
+        if (not job or job.get("state") != "running" or time.time() - (job.get("beat") or 0) < RECORD_RESUME_SECS
+                or job.get("resumes", 0) >= RECORD_MAX_RESUMES):
+            continue
+        name = key.split(":", 1)[1]
+        cur.execute("SELECT value FROM app_config WHERE key=%s;", (_record_args_key(name),))
+        a = cur.fetchone()
+        try:
+            args = json.loads(a[0]) if a and a[0] else None
+        except ValueError:
+            args = None
+        if not args:
+            continue
+        new = dict(job, beat=time.time(), resumes=job.get("resumes", 0) + 1)
+        cur.execute("UPDATE app_config SET value=%s WHERE key=%s AND value=%s RETURNING 1;", (json.dumps(new), key, value))
+        if cur.fetchone():
+            conn.commit()
+            found.append((name, new, args))
+        else:
+            conn.rollback()
+    cur.close(); conn.close()
+    for name, job, args in found:
+        _record_thread(name, job, args["form"], args["ids"], args.get("user"),
+                       base_n=job.get("n") or 0, base_done=job.get("done") or 0)
+    return [n for n, _, _ in found]
+
+
+_resume_watch = {"on": False}
+
+
+def start_resume_watch():
+    """Once per server: look for cut-off recordings now and every RESUME_CHECK_SECS."""
+    if _resume_watch["on"] or not RESUME_WATCH:
+        return
+    _resume_watch["on"] = True
+
+    def loop():
+        while True:
+            try:
+                resume_record_jobs()
+            except Exception:
+                pass        # the database may be briefly unreachable; try again next time
+            time.sleep(RESUME_CHECK_SECS)
+
+    threading.Thread(target=loop, daemon=True, name="resume-watch").start()
+
+
+@app.before_request
+def _resume_watch_hook():
+    start_resume_watch()
 
 
 def _words(t):
@@ -7540,6 +7687,11 @@ def _record_run(name, form, ids, user, progress=None):
                                      WHERE msl.line_id=sl.line_id AND m.status='confirmed')
                    ORDER BY sl.posted_date;""", (s[0], ids))
     lines = cur.fetchall()
+    cur.execute("""SELECT DISTINCT msl.line_id::text FROM match m JOIN match_statement_line msl USING (match_id)
+                   WHERE m.statement_id=%s AND m.status='proposed' AND msl.line_id = ANY(%s::uuid[]);""", (s[0], ids))
+    waiting = {r[0] for r in cur.fetchall()}
+    n_waiting = sum(1 for l in lines if str(l[0]) in waiting)
+    lines = [l for l in lines if str(l[0]) not in waiting]
     dups = possible_duplicates(cur, acct_uuid, lines)
     pool = book_pool(cur, acct_uuid, s[0], s[1], s[2])
     cur.execute("""SELECT mbt.txn_id::text FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
@@ -7800,6 +7952,9 @@ def _record_run(name, form, ids, user, progress=None):
                 f"entr{'y' if twins == 1 else 'ies'} instead (nothing created or changed).")
     if skipped:
         msg += f" Skipped {skipped} already recorded or in progress."
+    if n_waiting:
+        msg += (f" {n_waiting} line{' was' if n_waiting == 1 else 's were'} left out: a suggested match is waiting for "
+                f"{'it' if n_waiting == 1 else 'them'} (Suggested matches) — if it's right, the money is already in QuickBooks.")
     if no_acct:
         msg += (f" {no_acct} line{' has' if no_acct == 1 else 's have'} no account, so "
                 f"{'it was' if no_acct == 1 else 'they were'} left for later.")
@@ -8290,6 +8445,77 @@ def _undo_transfer(name, qid):
         _after_review(sid)
     return True, (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
                              f"{'s are' if len(lines) > 1 else ' is'} back in the list to record again.")
+
+@app.route("/account/<name>/recorded_twice", methods=["POST"])
+def recorded_twice_fix(name):
+    """For each ticked group: delete the entries recorded from here in QuickBooks and match their bank
+    lines to the entry QuickBooks already had. Only groups the page still finds, on an open statement."""
+    back = redirect(url_for("detail", name=name) + "#sec-twice")
+    user = session.get("name") or "user"
+    picks = set(request.form.getlist("grp"))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+    row = cur.fetchone()
+    s = _latest_statement(cur, row[0]) if row else None
+    if not s or s[3]:
+        cur.close(); conn.close()
+        session["detail_msg"] = "Nothing changed: the statement is signed off (reopen it first) or missing."
+        return back
+    groups = [g_ for g_ in recorded_twice(cur, s[0], reconcile(cur, row[0], s)["un_books"])
+              if g_["txn_id"] + "|" + ",".join(l["line_id"] for l in g_["lines"]) in picks]
+    cur.close(); conn.close()
+    if not groups:
+        session["detail_msg"] = "Nothing ticked (or it has changed since the page loaded — reload and try again)."
+        return back
+    fixed, removed, problems = 0, 0, []
+    try:
+        token = qbo_token()
+    except Exception as e:
+        session["detail_msg"] = f"Nothing changed: couldn't reach QuickBooks ({e})."
+        return back
+    for g_ in groups:
+        gone = []
+        for l in g_["lines"]:
+            try:
+                ent = qbo_read(token, l["type"], l["qbo_id"])
+                if ent is not None:
+                    qbo_delete(token, l["type"], l["qbo_id"], ent.get("SyncToken", "0"))
+                gone.append(l)
+            except Exception as e:
+                err = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else str(e)
+                problems.append(f"{l['type']} #{l['qbo_id']}: QuickBooks said {err}")
+                break
+        conn = get_conn(); cur = conn.cursor()
+        for l in gone:
+            cur.execute("""UPDATE book_txn SET is_deleted=true, updated_at=now()
+                           WHERE account_id=%s AND source_txn_type=%s AND source_txn_id=%s;""", (row[0], l["type"], l["qbo_id"]))
+            cur.execute("""UPDATE writeback_log SET status='failed', error=%s WHERE line_id=%s;""",
+                        (f"deleted by {user}: QuickBooks already had it as {g_['qbo']}", l["line_id"]))
+            cur.execute("""DELETE FROM match WHERE statement_id=%s AND match_id IN
+                             (SELECT match_id FROM match_statement_line WHERE line_id=%s);""", (s[0], l["line_id"]))
+        removed += len(gone)
+        if len(gone) == len(g_["lines"]):
+            mid = str(uuid.uuid4())
+            cur.execute("""INSERT INTO match (match_id, org_id, statement_id, status, match_type, confidence, amount_delta,
+                                              created_by, confirmed_by, confirmed_at)
+                           VALUES (%s,%s,%s,'confirmed','manual',1,0,'user',%s,now());""", (mid, ORG_ID, s[0], user))
+            execute_values(cur, "INSERT INTO match_statement_line (match_id, line_id) VALUES %s",
+                           [(mid, l["line_id"]) for l in g_["lines"]])
+            cur.execute("INSERT INTO match_book_txn (match_id, txn_id) VALUES (%s,%s);", (mid, g_["txn_id"]))
+            fixed += 1
+        conn.commit(); cur.close(); conn.close()
+        if problems:
+            break           # QuickBooks refused one: stop rather than carry on half-blind
+    _after_review(s[0])
+    if removed:
+        log_activity(f"removed {removed} entries recorded twice ({fixed} groups matched to the earlier entry)", name)
+    session["detail_msg"] = ((f"Put right {fixed} recorded-twice group{'' if fixed == 1 else 's'}: deleted {removed} "
+                              f"entr{'y' if removed == 1 else 'ies'} recorded from here in QuickBooks and matched the bank "
+                              f"lines to the entries QuickBooks already had." if fixed else "Nothing put right.")
+                             + (f" Stopped: {problems[0]}. Lines whose entry was deleted are back in the list to record."
+                                if problems else ""))
+    return back
+
 
 @app.route("/account/<name>/transfer_change", methods=["POST"])
 def transfer_change(name):

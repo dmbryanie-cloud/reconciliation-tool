@@ -113,6 +113,7 @@ def share_connection(app_module, c):
         app_module._pooled_get_conn = app_module.get_conn   # the real one, for the connection-pool checks
     app_module.get_conn = lambda: _Shared(c)
     app_module.SYNC_IN_BACKGROUND = False   # a thread can't share the one connection; run syncs inline
+    app_module.RESUME_WATCH = False         # ...nor the watcher that resumes cut-off recordings
 
 
 def setup(accounts_sql):

@@ -61,7 +61,8 @@ rec = sec(p, "sec-record", "sec-")
 check("focused on a week: only that week's lines are listed to record",
       "WEEK TWO FEES" in p and "WEEK TWO CHARGES" in p and "WEEK ONE FEES" not in p and "WEEK FOUR FEES" not in p)
 check("…only that week's suggested match", "UMEME" in p.upper() and "KAMPALA STATIONERS" not in p)
-check("…the tiles count that week", tile(p, "To review") == "1" and tile(p, "To record") == "3"
+check("…the tiles count that week (Umeme waits in its suggestion, not to record)", tile(p, "To review") == "1"
+      and tile(p, "To record") == "2"
       and "of 3 lines these days" in p)
 check("…it says what's narrowed and that balances and sign-off cover the whole statement",
       "Showing only" in p and "narrowed to 08/06/2026 – 14/06/2026" in p

@@ -25,7 +25,8 @@ def q(sql, args=()):
 cl = H.login(A)
 rows = ([(f"2026-06-{d:02d}", "EXCISE DUTY", -150) for d in (3, 10, 17)]
         + [("2026-06-10", "LEDGER FEES", -1500)]
-        + [(f"2026-06-{d:02d}", f"SCHOOL FEES STUDENT {d}", 250000 + d) for d in (4, 5, 6, 7, 8, 11, 12, 13)])
+        + [(f"2026-06-{d:02d}", f"SCHOOL FEES STUDENT {d}", 250000 + d) for d in (4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19)])
+# (the six fees with a suggested match wait for review instead of being listed to record: 12 to record)
 body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
 # Book entries a little off two of the fees: suggested matches to review (and a long enough list with more)
 for i, d in enumerate((4, 5, 6, 7, 8, 11)):

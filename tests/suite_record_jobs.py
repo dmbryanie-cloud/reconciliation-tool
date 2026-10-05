@@ -58,7 +58,7 @@ Z, S, G = lid("SUPPLIER ZETA KAMPALA"), lid("STATIONERY"), lid("GENERATOR FUEL")
 # Booked in QuickBooks after the statement was matched (so the matcher hasn't paired them yet):
 book("z1", "2026-09-12", -12000, "Supplier Zeta")          # same money, 2 days apart, same payee
 book("s1", "2026-09-11", -5000, "Airtime top-up")          # same amount and day, different payee: a different transaction
-book("g1", "2026-09-05", -7000, "Generator fuel")          # same payee, 7 days apart: beyond 3 days
+book("g1", "2026-09-19", -7000, "Generator fuel")          # same payee, 7 days apart: beyond 3 days
 n = len(POSTS)
 cl.post("/account/Stanbic/record", data={"only": Z, f"acct_{Z}": "83"})
 check("already in QuickBooks (same amount, 2 days, same payee): matched, nothing created", len(POSTS) == n
@@ -73,7 +73,7 @@ check("same_text: bank wording vs QuickBooks payee", A.same_text("POS PURCHASE S
       and not A.same_text("STATIONERY", "Airtime top-up") and not A.same_text("", ""))
 
 # ---- the message counts what was recorded; recorded lines leave the list -------------------------------
-upload([("2026-09-15", "PAPER", -1000), ("2026-09-16", "INK", -2000), ("2026-09-17", "PENS", -3000)])
+upload([("2026-09-15", "PAPER", -1100), ("2026-09-16", "INK", -2200), ("2026-09-17", "PENS", -3300)])
 P1, P2, P3 = lid("PAPER"), lid("INK"), lid("PENS")
 n = len(POSTS)
 cl.post("/account/Stanbic/record", data={"bulk": "1", "sel": [P1, P2, P3], f"acct_{P1}": "83", f"acct_{P2}": "83", f"acct_{P3}": ""})

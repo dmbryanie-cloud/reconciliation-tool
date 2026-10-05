@@ -35,6 +35,12 @@ stmt = ("Date,Description,Amount\n2026-09-05,DEPOSIT CASH,300000\n2026-09-10,TRA
 r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 assert r.status_code == 302
+# SUPPLIER Y's suggestion (cleared 21 days later) is rejected, so the line is listed to record with its warning.
+cur.execute("""SELECT m.match_id FROM match m JOIN match_statement_line x USING (match_id) JOIN statement_line sl USING (line_id)
+               WHERE sl.description='SUPPLIER Y' AND m.status='proposed'""")
+for (mid,) in cur.fetchall():
+    cl.post(f"/account/Stanbic/review/{mid}", data={"status": "rejected"})
+c.commit()
 page = cl.get("/account/Stanbic")
 check("account page renders", page.status_code == 200 and b"id=mmform" in page.data)
 
