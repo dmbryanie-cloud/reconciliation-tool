@@ -215,4 +215,11 @@ out.errors = errors; console.log(JSON.stringify(out));
     check("browser: the upload side panel opens and closes", o.get("drOpen") and o.get("drClosed"))
     check("browser: a problem notice stays (styled as a problem)", o.get("flashErr") is True and "Not recorded" in (o.get("flash") or ""))
     check("browser: no script errors", o.get("errors") == [])
+# ---- one way to upload on each page ----------------------------------------------------------------
+c.cursor().execute(H.account_sql(("00000000-0000-0000-0000-0000000000e9", "99", "Empty Bank", "bank"))); c.commit()
+q_ = c.cursor(); q_.execute("SELECT a.name, count(s.statement_id) FROM account a LEFT JOIN statement s USING (account_id) GROUP BY 1"); c.rollback()
+for nm, n_st in q_.fetchall():
+    pg = admin.get(f"/account/{nm}").data.decode()
+    check(f"{nm} ({'a statement' if n_st else 'no statement yet'}): one Upload statement button, not two",
+          pg.count("data-drawer=upload") == 1)
 sys.exit(T.summary())
