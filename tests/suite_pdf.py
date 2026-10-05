@@ -260,4 +260,14 @@ r, page = upload(make_pdf([[(40, 70, "Statement Period: 01/06/2026 to 30/06/2026
                             (BC, 135, "100.00", "r"), *row(150, "15/06/2026", "X", "5.00", None, "999.00")]]))
 check("a refused PDF is never labelled as uploaded", "doesn" in page and "Statement uploaded." not in page)
 
+# ---- part of a PDF: the period chosen, balances from the PDF's own running balance ----------------
+r, page = upload(STANBIC, period_start="2026-01-04", period_end="2026-01-31", opening_balance="1,500,000")
+s = stmt()
+check("PDF, part of its period: only those lines kept", s[:2] == ("2026-01-04", "2026-01-31")
+      and not any(l[0] == "2026-01-03" for l in lines()) and "Loaded 5 statement lines" in page)
+check("…opening typed for the period kept; closing from the PDF", s[2] == D("1500000") and s[3] == D("1200000")
+      and "1 before 04/01/2026" in page)
+k = c.cursor(); rec = A.reconcile(k, ACCT, A._latest_statement(k, ACCT)); c.rollback()
+check("…and the period adds up", rec["foot_diff"] == 0)
+
 sys.exit(T.summary())

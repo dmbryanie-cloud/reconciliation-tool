@@ -1250,6 +1250,20 @@ try:
     # What the user ticked and chose in the record table, kept until recorded or discarded.
     _cur.execute("""CREATE TABLE IF NOT EXISTS record_draft (line_id uuid PRIMARY KEY, data text NOT NULL,
                     saved_by text, saved_at timestamptz NOT NULL DEFAULT now());""")
+    # The last split recorded for a payee (a loan instalment: principal + interest), offered again
+    # on the next similar line. parts is the split as the page sends it: [{"a": account, "v": amount}].
+    _cur.execute("""CREATE TABLE IF NOT EXISTS split_memory (id serial PRIMARY KEY, org_id uuid NOT NULL,
+                    description text NOT NULL, money_out boolean NOT NULL, currency text, parts text NOT NULL,
+                    total numeric NOT NULL, line_date date, created_by text,
+                    created_at timestamptz NOT NULL DEFAULT now());""")
+    # A starting point from QuickBooks' own reconciliation: the account was reconciled there up to
+    # as_of, at this balance (its reconciled entries added up). qbo_reconciled lists those entries:
+    # they're cleared, so they never show here as outstanding; the rest up to as_of are brought forward.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_baseline (account_id uuid PRIMARY KEY, as_of date NOT NULL,
+                    balance numeric NOT NULL, n_rec integer, n_missing integer, set_by text,
+                    set_at timestamptz NOT NULL DEFAULT now());""")
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_reconciled (account_id uuid NOT NULL, source_txn_id text NOT NULL,
+                    posted_date date NOT NULL, PRIMARY KEY (account_id, source_txn_id, posted_date));""")
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
     # from posting the same line twice to the company file.
     _cur.execute("""CREATE TABLE IF NOT EXISTS writeback_log (line_id uuid PRIMARY KEY, status text NOT NULL,
@@ -1401,6 +1415,73 @@ class PostingMemory:
             return {"cat": cat, "conf": round(v / sum(votes.values()) * sc, 2), "payee": payee, "payee_ref": ref,
                     "because": because, "tier": tier}
         return None
+
+
+class SplitMemory:
+    """The last split recorded for a payee (a loan instalment as principal + interest, say), offered
+    again on the next similar bank line: the same accounts, and the same amounts if the total is the
+    same, else scaled to the new total. Only one split is kept per payee: recording a similar line
+    again (split or not) replaces it."""
+    def __init__(self, cur, currency=None):
+        cur.execute("""SELECT description, money_out, parts, total, line_date FROM split_memory
+                       WHERE currency IS NOT DISTINCT FROM %s ORDER BY created_at DESC;""", (currency,))
+        self.entries = []
+        for desc, out, parts, total, d in cur.fetchall():
+            try:
+                parts = [(str(p["a"]), Decimal(str(p["v"]))) for p in json.loads(parts)]
+            except (ValueError, KeyError, TypeError, ArithmeticError):
+                continue
+            toks = _mtokens(desc)
+            if toks and parts:
+                self.entries.append((toks, out, parts, Decimal(total), d, desc))
+
+    def suggest(self, desc, money_out, amount, allowed):
+        """{"parts": [{"a", "v"}], "same": total unchanged, "date", "desc"} or None. Newest wins a tie."""
+        toks = _mtokens(desc)
+        best = None
+        if fx_deal(desc):
+            return None
+        for etoks, out, parts, total, d, edesc in self.entries:
+            if out != money_out or any(a not in allowed for a, _ in parts):
+                continue
+            sc = _similarity(toks, etoks)
+            if sc >= LEARN_MIN_SCORE and (not best or sc > best[0]):
+                best = (sc, parts, total, d, edesc)
+        if not best:
+            return None
+        _, parts, total, d, edesc = best
+        amt = abs(Decimal(amount))
+        if total == amt or not total:
+            vals = [v for _, v in parts]
+        else:
+            # A different total: each line in proportion, the largest taking what rounding leaves.
+            vals = [(v * amt / total).quantize(Decimal("0.01")) for _, v in parts]
+            big = max(range(len(vals)), key=lambda i: abs(vals[i]))
+            vals[big] += amt - sum(vals)
+        return {"parts": [{"a": a, "v": str(v)} for (a, _), v in zip(parts, vals)],
+                "same": total == amt, "date": d, "desc": edesc}
+
+
+def fx_deal(desc):
+    """A currency deal (spot or forward): each is a one-off at its own rate, so its split isn't remembered."""
+    return bool(re.search(r"\bFXPL[A-Z]*", desc or "", re.I) or HEDGE_RE.search((desc or "").replace("\n", " ")))
+
+
+def split_remember(cur, desc, out, ccy, parts, total, d, user):
+    """Keep this split for the payee, replacing any similar one. parts None: the line wasn't split,
+    so a split remembered for a similar line is forgotten (the last way it was recorded wins)."""
+    toks = _mtokens(desc)
+    if not toks or fx_deal(desc):
+        return
+    cur.execute("""SELECT id, description FROM split_memory
+                   WHERE money_out=%s AND currency IS NOT DISTINCT FROM %s;""", (out, ccy))
+    old = [i for i, t in cur.fetchall() if _similarity(toks, _mtokens(t)) >= LEARN_MIN_SCORE]
+    if old:
+        cur.execute("DELETE FROM split_memory WHERE id = ANY(%s);", (old,))
+    if parts:
+        cur.execute("""INSERT INTO split_memory (org_id, description, money_out, currency, parts, total, line_date, created_by)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s);""",
+                    (ORG_ID, desc, out, ccy, json.dumps([{"a": a, "v": str(v)} for a, v in parts]), total, d, user))
 
 
 POST_EXCLUDE = {"Bank", "Credit Card", "Accounts Receivable", "Accounts Payable"}
@@ -2051,6 +2132,7 @@ td.a{white-space:nowrap}
 .rectbl input.rate{width:118px;padding:3px 7px;border:1px solid var(--line);border-radius:5px;font-size:12px;background:#fff}
 .splitrow td{background:#f7f9fd;white-space:normal}
 .splithead{font-size:12px;color:var(--muted);margin:2px 0 6px}
+.splitfrom{margin:0 0 6px;color:var(--accent);font-weight:500}
 .splitline{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
 .splitamt{width:130px;padding:4px 8px;border:1px solid var(--line);border-radius:5px;font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
 .splitfoot{display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap}
@@ -2300,7 +2382,7 @@ window.addEventListener('scroll',function(e){if(e.target&&e.target.closest&&e.ta
 window.addEventListener('resize',function(){closeDD()});
 var mb=document.getElementById('menubtn'),side=document.getElementById('side');
 if(mb&&side)mb.addEventListener('click',function(){side.classList.toggle('open')});
-// Confirmations in a page dialog instead of the browser's box. A form with data-confirm asks first;
+// Confirmations in a page dialog instead of the browser's box. A form (or the button pressed) with data-confirm asks first;
 // scripts call rbAsk(message, onYes).
 var dlg=document.getElementById('rb-dlg'),scrim=document.getElementById('rb-scrim'),yes=document.getElementById('rb-yes'),
     no=document.getElementById('rb-no'),onYes=null,back=null;
@@ -2316,7 +2398,7 @@ window.rbResubmit=function(f,sb){f._rbok=true;if(f.requestSubmit){try{f.requestS
 yes.addEventListener('click',function(){var cb=onYes;closeAsk();if(cb)cb()});
 no.addEventListener('click',closeAsk);scrim.addEventListener('click',closeAsk);
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(!dlg.hidden)closeAsk();closeDD()}});
-document.addEventListener('submit',function(e){var f=e.target,q=f.getAttribute&&f.getAttribute('data-confirm');
+document.addEventListener('submit',function(e){var f=e.target,sbq=e.submitter&&e.submitter.getAttribute('data-confirm'),q=sbq||(f.getAttribute&&f.getAttribute('data-confirm'));
   if(!q)return;if(f._rbok){f._rbok=false;return}
   e.preventDefault();e.stopImmediatePropagation();var sb=e.submitter;rbAsk(q,function(){rbResubmit(f,sb)})},true);
 // Side panels: a button with data-drawer="x" opens #dr-x; data-close, the shade or Escape closes it.
@@ -2550,8 +2632,9 @@ def shell_data():
             d["synced"] = _ago(age) if age < 5400 else last_sync_label()
         conn = get_conn(); cur = conn.cursor()
         cur.execute("""SELECT a.name, s.statement_id IS NOT NULL, s.signed_off_at IS NOT NULL,
-                              (SELECT max(period_end) FROM statement x WHERE x.account_id = a.account_id
-                                 AND x.signed_off_at IS NOT NULL),
+                              greatest((SELECT max(period_end) FROM statement x WHERE x.account_id = a.account_id
+                                          AND x.signed_off_at IS NOT NULL),
+                                       (SELECT as_of FROM qbo_baseline b WHERE b.account_id = a.account_id)),
                               (SELECT count(*) FROM statement_line sl WHERE sl.statement_id = s.statement_id AND sl.amount <> 0
                                  AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id = msl.match_id
                                                  WHERE msl.line_id = sl.line_id AND m.status = 'confirmed'))
@@ -3202,7 +3285,8 @@ def users():
 
 
 BACKUP_TABLES = ["account", "statement", "statement_line", "book_txn", "match",
-                 "match_statement_line", "match_book_txn", "payee_correction",
+                 "match_statement_line", "match_book_txn", "payee_correction", "split_memory",
+                 "qbo_baseline", "qbo_reconciled",
                  "settings", "app_users", "app_config", "qbo_auth"]
 
 
@@ -3444,7 +3528,7 @@ def require_login():
 
 # Which tick each action needs (anything not listed: any signed-in user).
 PERM_BY_ENDPOINT = {
-    "upload": "upload", "upload_status": "upload", "import_books": "upload", "balances": "upload",
+    "upload": "upload", "upload_status": "upload", "qbo_start": "users", "import_books": "upload", "balances": "upload",
     "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
@@ -4195,10 +4279,15 @@ def ingest_pdf(data, account_name, password=None, opening=None, closing=None, p_
 
 def _prev_signed_closing(cur, acct_uuid, before, exclude_sid=None):
     """Closing balance of the latest signed-off statement ending before `before`, if it's known."""
-    cur.execute("""SELECT closing_balance, period_end FROM statement
-                   WHERE account_id=%s AND signed_off_at IS NOT NULL AND closing_source IS NOT NULL
-                     AND period_end < %s AND statement_id IS DISTINCT FROM %s
-                   ORDER BY period_end DESC LIMIT 1;""", (acct_uuid, before, exclude_sid))
+    # Started from QuickBooks' reconciliation: its balance is the closing balance on that day.
+    cur.execute("""SELECT bal, d FROM (
+                     (SELECT closing_balance AS bal, period_end AS d, 0 AS pri FROM statement
+                      WHERE account_id=%s AND signed_off_at IS NOT NULL AND closing_source IS NOT NULL
+                        AND period_end < %s AND statement_id IS DISTINCT FROM %s
+                      ORDER BY period_end DESC LIMIT 1)
+                     UNION ALL
+                     SELECT balance, as_of, 1 FROM qbo_baseline WHERE account_id=%s AND as_of < %s) x
+                   ORDER BY d DESC, pri LIMIT 1;""", (acct_uuid, before, exclude_sid, acct_uuid, before))
     return cur.fetchone()
 
 
@@ -4226,10 +4315,31 @@ def _resolve_period(cur, acct_uuid, rows, p_start=None, p_end=None):
     if not p_start:
         prev = _prev_signed_closing(cur, acct_uuid, first)
         p_start = prev[1] + timedelta(days=1) if prev else first
-    if p_start > first or p_end < last:
-        raise ValueError(f"The statement period {p_start} to {p_end} doesn't cover all its transactions "
-                         f"({first} to {last}).")
+    if p_start > p_end:
+        raise ValueError(f"The period starts ({p_start:%d/%m/%Y}) after it ends ({p_end:%d/%m/%Y}).")
     return p_start, p_end
+
+
+def _period_rows(rows, p_start, p_end):
+    """Only the statement lines inside the period, when it's narrower than the file (a year's PDF
+    reconciled one month at a time). The file's own balances move with it: the opening is the file's
+    opening plus the lines before the period, the closing the file's closing less the lines after it --
+    the bank's running balance on those days. Returns (rows, n left out before, n left out after)."""
+    pre = [r for r in rows if r["date"] < p_start]
+    post = [r for r in rows if r["date"] > p_end]
+    if not pre and not post:
+        return rows, 0, 0
+    inside = _Rows(r for r in rows if p_start <= r["date"] <= p_end)
+    if not inside:
+        first = min(r["date"] for r in rows); last = max(r["date"] for r in rows)
+        raise ValueError(f"Not uploaded: the file has no transactions from {p_start:%d/%m/%Y} to {p_end:%d/%m/%Y} "
+                         f"(it runs from {first:%d/%m/%Y} to {last:%d/%m/%Y}). Check the period dates.")
+    inside.__dict__.update(rows.__dict__)      # skipped rows, account number, PDF check
+    Z = Decimal(0)
+    inside.opening = rows.opening + sum((r["amount"] for r in pre), Z) if rows.opening is not None else None
+    inside.closing = rows.closing - sum((r["amount"] for r in post), Z) if rows.closing is not None else None
+    inside.period_start, inside.period_end = p_start, p_end
+    return inside, len(pre), len(post)
 
 
 def delete_statements(cur, ids):
@@ -4256,6 +4366,12 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
         cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
     acct_uuid, currency = arow
     p_start, p_end = _resolve_period(cur, acct_uuid, rows, p_start, p_end)
+    try:
+        rows, n_pre, n_post = _period_rows(rows, p_start, p_end)
+    except ValueError:
+        cur.close(); conn.close(); raise
+    if has_request_context():
+        g.kept, g.left_out = len(rows), (n_pre, n_post)
     moves = sum((r["amount"] for r in rows), Decimal(0))
     o_src = "user" if opening is not None else None
     c_src = "user" if closing is not None else None
@@ -4264,6 +4380,14 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     if closing is None and getattr(rows, "closing", None) is not None:
         closing, c_src = rows.closing, "file"
     opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src)
+    cur.execute("SELECT as_of FROM qbo_baseline WHERE account_id=%s AND as_of >= %s;", (acct_uuid, p_start))
+    base = cur.fetchone()
+    if base:
+        cur.close(); conn.close()
+        raise ValueError(f"Not uploaded: this account starts from QuickBooks' reconciliation to {base[0]:%d/%m/%Y}, so "
+                         f"ReconBook reconciles it only after that. Upload the statement from "
+                         f"{base[0] + timedelta(days=1):%d/%m/%Y} on, or remove the starting point (⋯ menu → "
+                         f"QuickBooks starting point) first. Nothing was changed.")
     # One reconciliation per account per period: a statement whose dates overlap this one is replaced,
     # unless it's signed off (then the upload is refused until it's reopened or deleted).
     cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at FROM statement
@@ -4547,9 +4671,148 @@ def run_matcher(statement_id):
 
 
 def reconciled_to(cur, acct_uuid):
-    """The date an account is reconciled up to: the end of its latest signed-off reconciliation (or None)."""
-    cur.execute("SELECT max(period_end) FROM statement WHERE account_id=%s AND signed_off_at IS NOT NULL;", (acct_uuid,))
+    """The date an account is reconciled up to: the end of its latest signed-off reconciliation, or
+    QuickBooks' reconciliation it started from if that's later (or None)."""
+    cur.execute("""SELECT greatest((SELECT max(period_end) FROM statement WHERE account_id=%s AND signed_off_at IS NOT NULL),
+                                   (SELECT as_of FROM qbo_baseline WHERE account_id=%s));""", (acct_uuid, acct_uuid))
     return cur.fetchone()[0]
+
+
+def qbo_baseline(cur, acct_uuid):
+    """The account's starting point from QuickBooks' reconciliation, or None:
+    {as_of, balance, n_rec, n_missing, by, at}."""
+    cur.execute("SELECT as_of, balance, n_rec, n_missing, set_by, set_at FROM qbo_baseline WHERE account_id=%s;",
+                (acct_uuid,))
+    r = cur.fetchone()
+    return dict(zip(("as_of", "balance", "n_rec", "n_missing", "by", "at"), r)) if r else None
+
+
+def qbo_report(token, report, params):
+    """A QuickBooks report (JSON)."""
+    req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/reports/{report}?" + urllib.parse.urlencode(params))
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read())
+
+
+def _report_rows(rows):
+    """Every data row (its ColData) of a QuickBooks report, out of its sections."""
+    for r in (rows or {}).get("Row", []):
+        if r.get("ColData"):
+            yield r["ColData"]
+        if r.get("Rows"):
+            yield from _report_rows(r["Rows"])
+
+
+QBO_REC_COLS = ("tx_date", "txn_type", "is_cleared")
+
+
+def qbo_reconciled_lines(token, acct_qbo, start, end, progress=None):
+    """{(transaction id, date)} of this account's entries QuickBooks marks reconciled (R), dated start
+    to end. From its General Ledger with the Cleared column, one year per call (a whole history in
+    one report is too big). Cleared status is per account, so each side of a transfer has its own."""
+    out = set()
+    y0 = start
+    while y0 <= end:
+        y1 = min(date(y0.year, 12, 31), end)
+        if progress:
+            progress(f"reading {y0.year} from QuickBooks")
+        rep = qbo_report(token, "GeneralLedger", {"account": acct_qbo, "start_date": y0.isoformat(),
+                                                  "end_date": y1.isoformat(), "columns": ",".join(QBO_REC_COLS),
+                                                  "minorversion": "75"})
+        idx = {}
+        for i, c in enumerate((rep.get("Columns") or {}).get("Column", [])):
+            key = next((m.get("Value") for m in c.get("MetaData") or [] if m.get("Name") == "ColKey"), None)
+            title = (c.get("ColTitle") or "").strip().lower()
+            key = key or {"date": "tx_date", "transaction type": "txn_type", "cleared": "is_cleared"}.get(title)
+            if key:
+                idx[key] = i
+        if not all(k in idx for k in QBO_REC_COLS):
+            raise ValueError("QuickBooks' General Ledger didn't include the Date, Transaction type and Cleared columns.")
+        for cd in _report_rows(rep.get("Rows")):
+            if len(cd) <= max(idx.values()):
+                continue
+            flag = (cd[idx["is_cleared"]].get("value") or "").strip().lower()
+            if flag not in ("r", "reconciled"):
+                continue
+            try:
+                d = datetime.strptime((cd[idx["tx_date"]].get("value") or "")[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue        # Beginning Balance, totals
+            tid = cd[idx["txn_type"]].get("id") or cd[idx["tx_date"]].get("id")
+            if tid:
+                out.add((str(tid), d))
+        y0 = y1 + timedelta(days=1)
+    return out
+
+
+def _qbo_start_run(name, as_of, stmt_bal, user, progress=None):
+    """Take the account's starting point from QuickBooks' reconciliation up to as_of: which entries
+    QuickBooks has reconciled, and their total (the reconciled balance). With stmt_bal (the bank
+    statement's balance on that day) the two must agree, or nothing is saved. Returns (ok, message)."""
+    dmy = lambda d: d.strftime("%d/%m/%Y")
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT account_id, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+        row = cur.fetchone()
+        if not row:
+            return False, "Unknown account."
+        acct_uuid, acct_qbo = row
+        if not acct_qbo:
+            return False, "This account isn't linked to QuickBooks."
+        cur.execute("""SELECT min(period_start) FROM statement WHERE account_id=%s AND period_start <= %s;""",
+                    (acct_uuid, as_of))
+        first_stmt = cur.fetchone()[0]
+        if first_stmt:
+            return False, (f"Not set: ReconBook already has a reconciliation for this account starting {dmy(first_stmt)}, "
+                           f"on or before {dmy(as_of)}. QuickBooks' starting point must come before every reconciliation "
+                           f"here: pick an earlier date, or delete those reconciliations under Reports first.")
+        if sync_full_due():
+            return False, "Not set: the books need a full refresh from QuickBooks first. Press Sync on the dashboard, then try again."
+        cur.execute("SELECT min(posted_date) FROM book_txn WHERE account_id=%s;", (acct_uuid,))
+        first = cur.fetchone()[0]
+        if not first or first > as_of:
+            return False, f"Not set: QuickBooks has no entries on {name} up to {dmy(as_of)}."
+        lines = qbo_reconciled_lines(qbo_token(), acct_qbo, first, as_of, progress)
+        if progress:
+            progress("adding up the reconciled entries")
+        cur.execute("""SELECT source_txn_id, posted_date, sum(amount) FROM book_txn
+                       WHERE account_id=%s AND posted_date <= %s
+                         AND NOT coalesce(is_deleted, false) AND NOT coalesce(is_void, false)
+                       GROUP BY 1, 2;""", (acct_uuid, as_of))
+        have = {(str(i), d): a for i, d, a in cur.fetchall()}
+        found = sorted(k for k in lines if k in have)
+        missing = len(lines) - len(found)
+        if not found:
+            return False, (f"Not set: QuickBooks has no reconciled entries on {name} up to {dmy(as_of)}. Reconcile it in "
+                           f"QuickBooks first, or start here by uploading statements from the account's beginning.")
+        bal = sum((have[k] for k in found), Decimal(0))
+        out_n = len(have) - len(found)
+        out_sum = sum((a for k, a in have.items() if k not in lines), Decimal(0))
+        miss = (f" {missing} entr{'y' if missing == 1 else 'ies'} QuickBooks reconciled aren't in ReconBook's copy of the "
+                f"books: refresh the books from QuickBooks and set it again." if missing else "")
+        if stmt_bal is not None and stmt_bal != bal:
+            return False, (f"Not set: QuickBooks' reconciled entries up to {dmy(as_of)} add up to {_money(bal)}, but the "
+                           f"statement balance typed is {_money(stmt_bal)} (a difference of {_money(stmt_bal - bal)}). "
+                           f"Check the date is the end of the statement QuickBooks was last reconciled to." + miss)
+        cur.execute("DELETE FROM qbo_reconciled WHERE account_id=%s;", (acct_uuid,))
+        execute_values(cur, "INSERT INTO qbo_reconciled (account_id, source_txn_id, posted_date) VALUES %s;",
+                       [(acct_uuid, i, d) for i, d in found])
+        cur.execute("""INSERT INTO qbo_baseline (account_id, as_of, balance, n_rec, n_missing, set_by)
+                       VALUES (%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (account_id) DO UPDATE SET as_of=EXCLUDED.as_of, balance=EXCLUDED.balance,
+                         n_rec=EXCLUDED.n_rec, n_missing=EXCLUDED.n_missing, set_by=EXCLUDED.set_by, set_at=now();""",
+                    (acct_uuid, as_of, bal, len(found), missing, (user or {}).get("name") or (user or {}).get("username")))
+        conn.commit()
+        return True, (f"Starting point set from QuickBooks: {name} reconciled to {dmy(as_of)} at {_money(bal)} "
+                      f"({len(found)} reconciled entries). "
+                      + (f"{out_n} entr{'y' if out_n == 1 else 'ies'} up to then, totalling {_money(out_sum)}, "
+                         f"{'isn' if out_n == 1 else 'aren'}'t reconciled in QuickBooks and {'is' if out_n == 1 else 'are'} "
+                         f"brought forward as outstanding. " if out_n else "Nothing up to then is outstanding. ")
+                      + f"Upload statements from {dmy(as_of + timedelta(days=1))}." + miss)
+    finally:
+        cur.close(); conn.close()
 
 
 def cleared_to(cur, sid, ps, pe):
@@ -4623,7 +4886,7 @@ DASH_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=vie
 <div class=tw><table>
 <thead><tr><th>Account</th><th>Currency</th><th>Statement period</th><th style="min-width:170px">Progress</th><th>Status</th><th class=a>Difference</th><th>Prepared / approved</th><th></th></tr></thead>
 <tbody>{% for r in rows %}<tr data-status="{{ r.status }}">
-<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a><div class="upto {{ '' if r.rec_to else 'faint' }}">{% if r.rec_to %}Reconciled to <b>{{ r.rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</div></td>
+<td><a href="{{ url_for('detail', name=r.name) }}" data-busy="Loading {{ r.name }}: its statement, matches and lines to record..."><b>{{ r.name }}</b></a><div class="upto {{ '' if r.rec_to else 'faint' }}">{% if r.rec_to %}Reconciled to <b>{{ r.rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</div>{% if r.qbo_base %}<div class="upto faint" title="The starting point taken from QuickBooks' reconciliation">QuickBooks: to {{ r.qbo_base[0].strftime('%d/%m/%Y') }} at {{ r.qbo_base[1]|money }}</div>{% endif %}</td>
 <td>{{ r.currency or '—' }}</td>
 {% if r.status=='none' %}<td class=faint>{{ 'No ' ~ month_label ~ ' statement' }}</td><td></td><td><span class="pill none">Not started</span></td><td class="a faint">—</td><td class=faint>—</td>
 <td class=a><a class=btn-sm href="{{ url_for('detail', name=r.name) }}?upload=1" data-busy="Loading {{ r.name }}...">Upload</a></td>
@@ -4703,10 +4966,19 @@ def dashboard():
     cur.execute(f"""SELECT DISTINCT ON (account_id) account_id, {STMT_COLS} FROM statement
                     WHERE date_trunc('month', period_end)::date=%s ORDER BY account_id, created_at DESC;""", (month,))
     stmts = {r[0]: r[1:] for r in cur.fetchall()}
-    cur.execute("SELECT account_id, max(period_end) FROM statement WHERE signed_off_at IS NOT NULL GROUP BY account_id;")
-    rec_tos = dict(cur.fetchall())
+    # ...counting a starting point taken from QuickBooks' reconciliation, which is shown beside it.
+    cur.execute("""SELECT a.account_id, greatest(max(s.period_end), b.as_of), b.as_of, b.balance FROM account a
+                   LEFT JOIN statement s ON s.account_id=a.account_id AND s.signed_off_at IS NOT NULL
+                   LEFT JOIN qbo_baseline b ON b.account_id=a.account_id GROUP BY a.account_id, b.as_of, b.balance;""")
+    rec_tos, qbo_bases = {}, {}
+    for a, upto, b_d, b_bal in cur.fetchall():
+        rec_tos[a] = upto
+        if b_d:
+            qbo_bases[a] = (b_d, b_bal)
     rows = dashboard_summaries([(a, n, t, (ccy or "").strip() or None, stmts.get(a), rec_tos.get(a))
                                 for a, n, t, ccy in accts])
+    for r, (a, *_x) in zip(rows, accts):
+        r["qbo_base"] = qbo_bases.get(a)
     # No statement yet first, then in progress, then signed off with the most recent sign-off last.
     rows.sort(key=lambda r: ({"none": 0, "open": 1, "signed": 2}[r["status"]],
                              r["signed_at"].timestamp() if r.get("signed_at") else 0, r["name"].lower()))
@@ -4785,6 +5057,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 <div class=meta>{% if not has_results %}<span class="pill none">No statement yet</span>{% elif signed_off %}<span class="pill ok">Signed off</span>{% elif rec.status=='balanced' %}<span class="pill info">Balanced</span>{% elif rec.status=='out' %}<span class="pill bad">Out of balance</span>{% else %}<span class="pill attn">In progress</span>{% endif %}
 {% if ccy %}<span>{{ ccy }}</span>{% endif %}{% if atype=='credit_card' %}<span class=faint>·</span><span>Credit card</span>{% endif %}
 <span class=faint>·</span><span title="The end of the latest signed-off reconciliation">{% if rec_to %}Reconciled to <b>{{ rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</span>
+{% if qbo_base %}<span class=faint>·</span><span title="Started from QuickBooks' reconciliation: its {{ qbo_base.n_rec }} reconciled entries up to {{ qbo_base.as_of.strftime('%d/%m/%Y') }} add up to this">QuickBooks reconciled to <b>{{ qbo_base.as_of.strftime('%d/%m/%Y') }}</b> at <b>{{ qbo_base.balance|money }}</b></span>{% endif %}
 {% if has_results %}<span class=faint>·</span><span>Statement {{ p_start }} to {{ p_end }}</span>{% if not signed_off %}<span class=faint>·</span><span title="Every bank line up to this date is matched or recorded">{% if cleared %}Cleared to <b>{{ cleared.strftime('%d/%m/%Y') }}</b>{% else %}Nothing cleared yet{% endif %}</span>{% endif %}{% endif %}
 {% if saved_at and not signed_off %}<span class=faint>·</span><span>Saved for later {{ saved_at.strftime('%d/%m/%Y %H:%M') }}{% if saved_by %} by {{ saved_by }}{% endif %}</span>{% endif %}
 {% if prep %}<span class=faint>·</span><span>Prepared by {{ prep }}</span>{% endif %}{% if signed_by %}<span class=faint>·</span><span>Approved by {{ signed_by }}{% if signed_off %} on {{ signed_off }}{% endif %}</span>{% endif %}</div></div>
@@ -4798,6 +5071,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if qbo_connected and qbo_linked %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=back value="{{ name }}"><button type=submit>Refresh books from QuickBooks</button></form>{% endif %}
 {% if can('upload') %}<button type=button data-drawer=books>Import books from a CSV</button>{% endif %}
 {% if can('settings') %}<div class=sep></div><div class=dh>Admin</div>
+{% if qbo_connected and qbo_linked %}<button type=button data-drawer=qbostart>QuickBooks starting point</button>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" class=ccyf><label for=ccy-in>Currency</label><input id=ccy-in name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX"><button type=submit class=btn-sm>Set</button></form>
 <form method=post action="{{ url_for('clear_account', name=name) }}" data-confirm="Clear this account's data? All statements and book transactions for it are removed here, to start fresh. QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Clear this account's data</button></form>
 <form method=post action="{{ url_for('delete_account', name=name) }}" data-confirm="Delete this account entirely? It and all its statements and transactions are removed here (for old sandbox accounts). QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Delete account</button></form>{% endif %}
@@ -4805,7 +5079,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 </div></div>
 {% if atype=='credit_card' %}<div class=help>Credit card: charges are positive and payments or refunds negative, as in your QuickBooks card register.</div>{% endif %}
 {{ sync_banner() }}
-{% if up_job %}<div id=upjob class=syncbar data-url="{{ url_for('upload_status', name=name) }}" style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;font-weight:550;line-height:1.5"><span class=spin-sm></span> Reading and matching your statement{% if up_job.file %} ({{ up_job.file }}){% endif %}: <span class=uj-step>{{ up_job.step }}</span>. A year's statement takes a few minutes; you can keep working, and this page refreshes when it's done.</div>
+{% if up_job %}<div id=upjob class=syncbar data-url="{{ url_for('upload_status', name=name) }}" style="background:var(--accent-soft);color:var(--accent);padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;font-weight:550;line-height:1.5"><span class=spin-sm></span> {% if up_job.kind == 'qbo_start' %}Reading QuickBooks' reconciliation: <span class=uj-step>{{ up_job.step }}</span>. Each year of history takes a few seconds; this page refreshes when it's done.{% else %}Reading and matching your statement{% if up_job.file %} ({{ up_job.file }}){% endif %}: <span class=uj-step>{{ up_job.step }}</span>. A year's statement takes a few minutes; you can keep working, and this page refreshes when it's done.{% endif %}</div>
 <script>(function(){var b=document.getElementById('upjob');if(!b||!window.fetch)return;var dirty=false;
 document.addEventListener('input',function(){dirty=true},true);
 function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(j){
@@ -4823,16 +5097,25 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=drawer-b>
 <label class=drop for=up-file><b>Choose the bank statement</b><span>PDF from online banking, CSV or OFX · <a href="{{ url_for('template', kind='bank') }}">CSV template</a></span><input id=up-file type=file name=statement accept=.pdf,.csv,.ofx required></label>
 <div class=two>
-<div class=fld><label for=up-ps>Period start</label><input id=up-ps type=date name=period_start></div>
-<div class=fld><label for=up-pe>Statement date (period end)</label><input id=up-pe type=date name=period_end></div>
+<div class=fld><label for=up-ps>Reconcile from</label><input id=up-ps type=date name=period_start><small>Empty: the day after the last reconciliation</small></div>
+<div class=fld><label for=up-pe>Reconcile to (statement date)</label><input id=up-pe type=date name=period_end><small>Empty: the last transaction</small></div>
 <div class=fld><label for=up-ob>Opening balance</label><input id=up-ob name=opening_balance inputmode=decimal placeholder="read from the statement"><small>Empty: the last signed-off closing</small></div>
 <div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
 <div class=fld><label for=up-pw>PDF password</label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}><small>Used once to open the file; never stored.</small></div>
-<details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding.</div></details>
+<details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</div></details>
 <div class=help style="margin:0">{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}</div>
 </div>
 <div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Uploading the file...">Upload &amp; reconcile</button></div></form></aside>
+{% if can('settings') and qbo_connected and qbo_linked %}<aside class=drawer id=dr-qbostart hidden aria-label="QuickBooks starting point"><form action="{{ url_for('qbo_start', name=name) }}" method=post style="display:contents">
+<div class=drawer-h><h2>Start from QuickBooks' reconciliation</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b>
+{% if qbo_base %}<div class="recnote" style="margin:0 0 12px">Now: reconciled in QuickBooks to <b>{{ qbo_base.as_of.strftime('%d/%m/%Y') }}</b> at <b>{{ qbo_base.balance|money }}</b>, from {{ qbo_base.n_rec }} reconciled entries{% if qbo_base.by %} · set by {{ qbo_base.by }}{% endif %} on {{ qbo_base.at.strftime('%d/%m/%Y') }}.{% if qbo_base.n_missing %} <span class=bad>{{ qbo_base.n_missing }} reconciled in QuickBooks weren't in ReconBook's books.</span>{% endif %}</div>{% endif %}
+<div class=help style="margin:0 0 12px">Already reconciled in QuickBooks? Start here from where it left off, without uploading older statements. ReconBook reads which entries QuickBooks has marked reconciled up to the date below; their total becomes the opening balance of the next statement, and every entry up to then that QuickBooks hasn't reconciled is brought forward as outstanding. QuickBooks isn't changed.</div>
+<div class=fld><label for=qs-date>Reconciled to (statement end date)</label><input id=qs-date type=date name=as_of required value="{{ qbo_base.as_of.isoformat() if qbo_base else '' }}"><small>The end date of the last statement reconciled in QuickBooks (its reconciliation history shows it).</small></div>
+<div class=fld><label for=qs-bal>Statement ending balance (optional)</label><input id=qs-bal name=balance inputmode=decimal placeholder="from that statement"><small>If typed, QuickBooks' reconciled total must equal it, or nothing is saved.</small></div>
+</div>
+<div class=drawer-f>{% if qbo_base %}<button type=submit name=remove value=1 class="btn-sm danger" formnovalidate data-confirm="Remove the starting point taken from QuickBooks? Its reconciled entries count as outstanding again.">Remove</button>{% endif %}<button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Reading QuickBooks' reconciliation...">{{ 'Read again' if qbo_base else 'Read from QuickBooks' }}</button></div></form></aside>{% endif %}
 <aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
 <div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b><div class=help style="margin:0">For working offline: a QuickBooks register exported as CSV. When QuickBooks is connected the books are read directly, with no export needed.</div>
@@ -5026,7 +5309,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% else %}
 <td><div class="acell{{ ' xo' if w.xfer_only else '' }}">{% if not w.xfer_only %}<select class=ttype aria-label="Transaction type" data-guess="{{ w.ttype or '' }}" title="{{ w.ttype_why or 'Narrow the accounts to one kind of transaction' }}"></select>{% if w.ttype_why %}<div class="hint ttype-why" title="{{ w.ttype_why }}">{{ w.ttype_why }}</div>{% endif %}{% endif %}<div class="acctbox main" data-dir="{{ 'xfer' if w.xfer_only else ('out' if w.out else 'in') }}" data-sel="{{ w.acct_id or '' }}"><input type=text class=acct-q placeholder="{{ 'Type the bank it was paid from' if w.xfer_only else 'Type to search accounts' }}" autocomplete=off aria-label="Account" role=combobox aria-expanded=false><button type=button class=acct-x title="Clear the account (the line won't be recorded)" aria-label="Clear account">&times;</button><input type=hidden name="acct_{{ w.line_id }}" class=acct-v value=""><div class=acct-list role=listbox hidden></div></div>
 {% if not w.xfer_only %}<div class=rowtools>{% if w.hedge %}<button type=button class="btn-sm hedge-btn" title="Forward deal {{ w.hedge.deal }}: record it the way hedges are booked">Hedge</button>{% endif %}<button type=button class="btn-sm split-btn" title="Record this line across several accounts">Split</button>{% if fx_ccy %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class=rate inputmode=decimal placeholder="Rate (QuickBooks')" aria-label="{{ fx_ccy }} rate" title="{{ home_ccy }} per {{ fx_ccy }}. Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}</div>{% endif %}
-<input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}">
+<input type=hidden name="split_{{ w.line_id }}" class=split-v value="{{ w.split }}"{% if w.split_from %} data-from="{{ w.split_from }}"{% endif %}>
 <input type=hidden name="kids_{{ w.line_id }}" class=kids-v value="{{ w.kids }}">
 {% if (x_ccy and not w.out) or (xfer_fx and not fx_ccy) %}{% set xc = x_ccy if (x_ccy and not w.out) else xfer_fx %}<input name="rate_{{ w.line_id }}" value="{{ w.rate }}" class="rate xrate" inputmode=decimal hidden placeholder="{{ acct_ccy }} per {{ xc }}" aria-label="{{ xc }} rate" data-date="{{ w.date }}" title="The rate the {{ acct_ccy }} converts at ({{ acct_ccy }} per {{ xc }}). Leave empty to use QuickBooks' rate for {{ w.date }}.">{% endif %}
 {% if w.hedge %}<input type=hidden name="hedge_{{ w.line_id }}" class=hedge-on value="{{ '1' if w.hedge_on else '' }}">{% endif %}
@@ -5278,7 +5561,7 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
     return l;
   }
   function open(){srow.hidden=false;box.classList.add('off');box.querySelector('.acct-q').disabled=true;btn.classList.add('on')}
-  function cancel(){lines=[];wrap.innerHTML='';srow.hidden=true;box.classList.remove('off');box.querySelector('.acct-q').disabled=false;btn.classList.remove('on');hid.value='';if(cb)cb.checked=!!main.get();count()}
+  function cancel(){lines=[];wrap.innerHTML='';var sf=cell.querySelector('.splitfrom');if(sf)sf.remove();srow.hidden=true;box.classList.remove('off');box.querySelector('.acct-q').disabled=false;btn.classList.remove('on');hid.value='';if(cb)cb.checked=!!main.get();count()}
   btn.addEventListener('click',function(){
     if(!srow.hidden){srow.querySelector('.acct-q')&&srow.querySelector('.acct-q').focus();return}
     open();if(!lines.length){var m=main.get();add(m&&!m.cust&&!m.ap?m.id:'',String(total));add('','')}sync(true)});
@@ -5286,6 +5569,9 @@ document.querySelectorAll('.acctbox.main').forEach(function(box){
   cell.querySelector('[data-cancel]').addEventListener('click',cancel);
   var saved=[];try{saved=hid.value?JSON.parse(hid.value):[]}catch(e){}
   if(saved.length){open();saved.forEach(function(p){add(p.a,p.v)});sync(false)}
+  // Pre-filled from the payee's last split: say so above the lines.
+  if(saved.length&&hid.getAttribute('data-from')){var sf=document.createElement('div');sf.className='hint splitfrom';
+    sf.textContent=hid.getAttribute('data-from');cell.insertBefore(sf,wrap)}
 });
 var all=document.getElementById('selall');if(all)all.addEventListener('change',function(){document.querySelectorAll('.rsel').forEach(function(c){if(!c.closest('tr.tsx'))c.checked=all.checked});count()});
 var f=document.getElementById('recform');
@@ -5825,14 +6111,19 @@ def book_pool(cur, acct_uuid, sid, p_start, p_end):
     cleared on an EARLIER signed-off statement is excluded, so it can't be matched twice -- while
     a past period still shows the items that were outstanding at its end, even if a later
     period has since cleared them."""
-    cur.execute("""SELECT min(period_start) FROM statement
-                   WHERE account_id=%s AND signed_off_at IS NOT NULL AND statement_id<>%s AND period_start < %s;""",
-                (acct_uuid, sid, p_start))
-    floor = cur.fetchone()[0] or p_start
+    cur.execute("""SELECT (SELECT min(period_start) FROM statement
+                           WHERE account_id=%s AND signed_off_at IS NOT NULL AND statement_id<>%s AND period_start < %s),
+                          EXISTS (SELECT 1 FROM qbo_baseline WHERE account_id=%s AND as_of < %s);""",
+                (acct_uuid, sid, p_start, acct_uuid, p_start))
+    floor, from_qbo = cur.fetchone()
+    # Started from QuickBooks' reconciliation: whatever it hadn't reconciled is still outstanding.
+    floor = date(1900, 1, 1) if from_qbo else (floor or p_start)
     cur.execute("""SELECT bt.txn_id, bt.posted_date, bt.amount, coalesce(bt.counterparty, bt.description,'')
                    FROM book_txn bt
                    WHERE bt.account_id=%s AND bt.posted_date BETWEEN %s AND %s
                      AND coalesce(bt.is_void,false)=false AND coalesce(bt.is_deleted,false)=false
+                     AND NOT EXISTS (SELECT 1 FROM qbo_reconciled r WHERE r.account_id=bt.account_id
+                                       AND r.source_txn_id=bt.source_txn_id AND r.posted_date=bt.posted_date)
                      AND NOT EXISTS (SELECT 1 FROM match_book_txn mbt
                                      JOIN match m ON m.match_id=mbt.match_id
                                      JOIN statement s ON s.statement_id=m.statement_id
@@ -5954,9 +6245,12 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     cur.execute("SELECT currency FROM account WHERE account_id=%s;", (acct_uuid,))
     acct_ccy = (cur.fetchone() or [None])[0]
     mem = PostingMemory(cur, acct_ccy) if unmatched_lines else None
+    smem = SplitMemory(cur, acct_ccy) if unmatched_lines else None
     coa = load_coa(cur, acct_ccy)
     xt = transfer_targets(cur, acct_qbo, atype, acct_ccy) if coa else []
     sb = split_banks(cur, acct_qbo, acct_ccy) if coa else []
+    split_ids = ({a["id"] for a in coa if a["type"] not in ("Accounts Receivable", "Accounts Payable")}
+                 | {a["id"] for a in sb})
     home = qbo_home_currency(cur)
     hedge_legs = {}
     if unmatched_lines:
@@ -6045,6 +6339,18 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                 item["hedge_on"] = True
                 item["hedge"] = {**item["hedge"], "rate": dr.get("hedge_rate") or item["hedge"]["rate"],
                                  "usd": dr.get("hedge_usd") or item["hedge"]["usd"]}
+        item["split_from"] = ""
+        if not dr and smem and not xfer_only and not item["hedge"] and not why_not:
+            # Split the way this payee's last line was (a loan's principal and interest, say).
+            ls = smem.suggest(who, out, a, split_ids)
+            if ls:
+                item["split"] = json.dumps(ls["parts"])
+                when = ls["date"].strftime("%d/%m/%Y") if ls["date"] else "before"
+                item["split_from"] = (f"Split like {when} ('{ls['desc'][:40]}'). " +
+                                      ("Same total: check the amounts haven't changed." if ls["same"] else
+                                       "A different total, so the amounts are scaled to it: type the right ones."))
+                # The same instalment can go as it is; a scaled one waits until the amounts are typed.
+                item["sel"] = ls["same"] and not item["dups"]
         # A receipt goes to the student (or family) itself, never to Accounts Receivable in general.
         if coa_type.get(item["acct_id"]) == "Accounts Receivable" or (item["acct_id"] or "").startswith("cust:"):
             c_ = item["cust"] or (item["acct_id"] or "")[5:]
@@ -6439,8 +6745,10 @@ def detail(name):
     if up_job and up_job.get("state") in ("done", "failed", "stalled") and \
             up_job.get("started") != session.get("up_seen:" + name):     # each upload's result shown once
         session["detail_msg"] = up_job.get("msg") if up_job["state"] != "stalled" else (
+            "Reading QuickBooks' reconciliation stopped before finishing (the server restarted). Try again."
+            if up_job.get("kind") == "qbo_start" else
             "Reading the statement stopped before finishing (the server restarted). Upload it again.")
-        if up_job["state"] == "done":
+        if up_job["state"] == "done" and up_job.get("kind") != "qbo_start":
             session["detail_ok"] = name
         else:
             session.pop("detail_ok", None)
@@ -6450,6 +6758,7 @@ def detail(name):
     st = _latest_statement(cur, acct_uuid)
     prep = signed_by = saved_at = saved_by = clr = None
     rec_to = reconciled_to(cur, acct_uuid)
+    qbo_base = qbo_baseline(cur, acct_uuid)
     n_lines = n_matched_lines = 0
     focus = focus_window(name, st[0], st[1], st[2]) if st and d.get("has_results") else None
     if st:
@@ -6493,7 +6802,7 @@ def detail(name):
     return render_template_string(DETAIL_TEMPLATE, name=name, atype=atype, ccy=ccy, qbo_linked=bool(acct_qbo),
                                   prep=prep, signed_by=signed_by, n_lines=n_lines, n_matched_lines=n_matched_lines,
                                   self_prepared=self_prepared, signoff_why=signoff_why, open_upload=open_upload,
-                                  rec_to=rec_to, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
+                                  rec_to=rec_to, qbo_base=qbo_base, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
@@ -6600,6 +6909,62 @@ def upload(name):
     return redirect(url_for("detail", name=name))
 
 
+@app.route("/account/<name>/qbo_start", methods=["POST"])
+def qbo_start(name):
+    """Set (or remove) the account's starting point from QuickBooks' reconciliation. Reading it goes
+    year by year through the account's history, so it runs in the background like an upload."""
+    if request.form.get("remove"):
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""DELETE FROM qbo_baseline WHERE account_id=(SELECT account_id FROM account WHERE name=%s LIMIT 1)
+                       RETURNING account_id;""", (name,))
+        gone = cur.fetchone()
+        if gone:
+            cur.execute("DELETE FROM qbo_reconciled WHERE account_id=%s;", (gone[0],))
+        conn.commit(); cur.close(); conn.close()
+        if gone:
+            log_activity("Removed the starting point from QuickBooks", name)
+        session["detail_msg"] = ("Removed the starting point from QuickBooks. Its reconciled entries count as outstanding again."
+                                 if gone else "There was no starting point to remove.")
+        return redirect(url_for("detail", name=name))
+    job = upload_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = "Wait for the statement or QuickBooks reading in progress on this account to finish."
+        return redirect(url_for("detail", name=name))
+    try:
+        as_of, bal = _form_date("as_of"), _form_amount("balance")
+    except ValueError as e:
+        session["detail_msg"] = str(e) if "amount" in str(e) else "Couldn't read that date."
+        return redirect(url_for("detail", name=name))
+    if not as_of or as_of >= date.today():
+        session["detail_msg"] = "Give the end date of the last statement reconciled in QuickBooks (a past date)."
+        return redirect(url_for("detail", name=name))
+    user = {k: session.get(k) for k in ("name", "username", "is_admin")}
+    log_activity(f"Started from QuickBooks' reconciliation to {as_of:%d/%m/%Y}", name)
+    if not SYNC_IN_BACKGROUND:                      # the tests run it inline
+        ok, msg = _qbo_start_run(name, as_of, bal, user)
+        session["detail_msg"] = msg
+        return redirect(url_for("detail", name=name))
+    job = {"state": "running", "kind": "qbo_start", "by": session.get("name"), "started": time.time(),
+           "beat": time.time(), "step": "Starting"}
+    set_config(_upload_key(name), json.dumps(job))
+
+    def progress(step):
+        job.update(step=step, beat=time.time())
+        set_config(_upload_key(name), json.dumps(job))
+
+    def run():
+        try:
+            ok, msg = _qbo_start_run(name, as_of, bal, user, progress=progress)
+            job.update(state="done" if ok else "failed", msg=msg, finished=time.time())
+        except Exception as e:
+            err = f"HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}" if isinstance(e, urllib.error.HTTPError) else str(e)
+            job.update(state="failed", finished=time.time(), msg=f"Couldn't read QuickBooks' reconciliation: {err}")
+        set_config(_upload_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="qbo_start").start()
+    return redirect(url_for("detail", name=name))
+
+
 @app.route("/account/<name>/upload_status")
 def upload_status(name):
     job = upload_job(name) or {}
@@ -6634,13 +6999,14 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             checked = ""
             if is_pdf:
                 step("Reading the PDF")
-                pdf_rows = parse_pdf(data, password, opening, progress=step)
+                # A typed opening is the period's; it's only the file's first balance when no start is chosen.
+                pdf_rows = parse_pdf(data, password, opening if not p_start else None, progress=step)
                 wrong = account_mismatch(name, pdf_rows.account_number)
                 if wrong:
                     return False, wrong
                 step(f"Saving {len(pdf_rows)} statement lines")
                 sid = _save_statement(pdf_rows, name, "pdf", opening, closing, p_start, p_end)
-                n, skipped = len(pdf_rows), pdf_rows.skipped
+                n, skipped = getattr(g, "kept", len(pdf_rows)), pdf_rows.skipped
                 checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
                            " Read from the PDF. It has no running balance to check against, so compare the totals with "
                            "the statement before signing off.")
@@ -6648,6 +7014,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
                 step("Reading the statement")
                 sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), filename, name, opening, closing,
                                               p_start, p_end)
+                n = getattr(g, "kept", n)
             step(f"Matching {n} lines against your books")
             note = run_matcher(sid)
         except ValueError as e:
@@ -6666,6 +7033,15 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
         log_activity(f"uploaded a statement ({n} lines)" + (f", replacing the one for {replaced}" if replaced else ""), name)
         if replaced:
             checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
+        n_pre, n_post = getattr(g, "left_out", (0, 0))
+        if n_pre or n_post:
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("SELECT period_start, period_end FROM statement WHERE statement_id=%s;", (sid,))
+            ps_, pe_ = cur.fetchone(); cur.close(); conn.close()
+            out_ = " and ".join(x for x in ((f"{n_pre} before {ps_:%d/%m/%Y}" if n_pre else ""),
+                                            (f"{n_post} after {pe_:%d/%m/%Y}" if n_post else "")) if x)
+            checked += (f" Only {ps_:%d/%m/%Y} to {pe_:%d/%m/%Y} is reconciled: {out_} in the file "
+                        f"{'was' if n_pre + n_post == 1 else 'were'} left out.")
         return True, (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
                       + (f" {note}" if note else "") + refreshed)
 
@@ -7233,6 +7609,8 @@ def _record_run(name, form, ids, user, progress=None):
             # Every recorded line teaches the suggestion engine (strongest tier).
             k2.execute("""INSERT INTO payee_correction (org_id, payee, category, money_out, vendor, vendor_ref, currency)
                           VALUES (%s,%s,%s,%s,%s,%s,%s);""", (ORG_ID, desc, acc["fqn"], out, payee or None, used_ref, ccy))
+        # A split is offered again on the payee's next line; recording one whole forgets it.
+        split_remember(k2, desc, out, ccy, parts, abs(amt), d, user)
         c2.commit(); k2.close(); c2.close()
         done += 1
     if done:
@@ -8293,6 +8671,8 @@ def delete_account(name):
         cur.execute("DELETE FROM statement_line WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s);", (acct,))
         cur.execute("DELETE FROM statement WHERE account_id=%s;", (acct,))
         cur.execute("DELETE FROM book_txn WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM qbo_reconciled WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM qbo_baseline WHERE account_id=%s;", (acct,))
         cur.execute("DELETE FROM account WHERE account_id=%s;", (acct,))
         conn.commit()
         session["sync_msg"] = "Removed account '" + name + "' and all its data."
@@ -8315,6 +8695,8 @@ def clear_account(name):
         cur.execute("DELETE FROM statement_line WHERE statement_id IN (SELECT statement_id FROM statement WHERE account_id=%s);", (acct,))
         cur.execute("DELETE FROM statement WHERE account_id=%s;", (acct,))
         cur.execute("DELETE FROM book_txn WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM qbo_reconciled WHERE account_id=%s;", (acct,))
+        cur.execute("DELETE FROM qbo_baseline WHERE account_id=%s;", (acct,))
         conn.commit()
         session["detail_msg"] = "Cleared all data for this account. Import your books and upload a statement to start fresh."
     cur.close(); conn.close()
