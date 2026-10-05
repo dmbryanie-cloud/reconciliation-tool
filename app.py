@@ -220,9 +220,14 @@ SLOW_MS = 5000
 @app.before_request
 def _start_timer():
     g._t0 = time.perf_counter()
+    if request.args.get("prof") and session.get("is_admin"):
+        # An admin adds ?prof=1 to a slow page: where its time went is written to the problems log.
+        import cProfile
+        g._prof = cProfile.Profile()
+        g._prof.enable()
 
 
-def log_problem(kind, detail="", ms=None):
+def log_problem(kind, detail="", ms=None, limit=2000):
     """Write one row to problem_log; returns its number, or None if it couldn't be saved."""
     t = g.get("_db") or {} if has_request_context() else {}
     try:
@@ -232,7 +237,7 @@ def log_problem(kind, detail="", ms=None):
                     (kind, session.get("username") or ("admin" if session.get("authed") else None) if has_request_context() else None,
                      request.method if has_request_context() else None,
                      request.path[:200] if has_request_context() else None,
-                     None if ms is None else int(ms), t.get("q"), (detail or "")[:2000]))
+                     None if ms is None else int(ms), t.get("q"), (detail or "")[:limit]))
         ref = cur.fetchone()[0]
         cur.execute("DELETE FROM problem_log WHERE id <= %s;", (ref - 1000,))
         conn.commit(); cur.close(); conn.close()
@@ -251,7 +256,15 @@ def _timing(resp):
     t = g.get("_db") or {}
     resp.headers["Server-Timing"] = (f'db;dur={t.get("q_ms", 0):.0f};desc="{t.get("q", 0)} queries", '
                                      f'conn;dur={t.get("conn_ms", 0):.0f};desc="{t.get("conn", 0)} new", total;dur={ms:.0f}')
-    if ms > SLOW_MS and request.endpoint not in ("static", "health"):
+    if g.get("_prof"):
+        g._prof.disable()
+        import pstats
+        st = pstats.Stats(g._prof)
+        def top(key, n):
+            rows = sorted(st.stats.items(), key=lambda kv: -kv[1][key])[:n]
+            return "\n".join(f"{v[key]:8.2f}s {v[1]:>9} {os.path.basename(k[0])}:{k[1]} {k[2]}" for k, v in rows)
+        log_problem("profile", "own time:\n" + top(2, 20) + "\nincluding calls:\n" + top(3, 30), ms, limit=8000)
+    elif ms > SLOW_MS and request.endpoint not in ("static", "health"):
         log_problem("slow", f'{t.get("q", 0)} queries took {t.get("q_ms", 0) / 1000:.1f}s; '
                             f'{t.get("conn", 0)} new connections took {t.get("conn_ms", 0) / 1000:.1f}s', ms)
     return resp
