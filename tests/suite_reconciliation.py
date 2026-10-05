@@ -10,6 +10,7 @@ import harness as H
 
 A, c = H.setup(H.account_sql(
     ('00000000-0000-0000-0000-0000000000a1', '35', 'Stanbic UGX', 'bank')))
+A.set_config("rule_clear_days", "31"); A.set_config("rule_group_days", "31")   # these checks use wide windows (Settings); the 3-day defaults are in suite_match_windows
 cur = c.cursor()
 T = H.Checker()
 check = T.check

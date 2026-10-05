@@ -11,6 +11,7 @@ UGX, UGX2, USD = ("00000000-0000-0000-0000-0000000000a1", "00000000-0000-0000-00
                   "00000000-0000-0000-0000-0000000000a4")
 A, c = H.setup(H.account_sql((UGX, "35", "Stanbic UGX", "bank"), (UGX2, "36", "Centenary UGX", "bank"),
                              (USD, "37", "Stanbic USD", "bank")))
+A.set_config("rule_clear_days", "31"); A.set_config("rule_group_days", "31")   # these checks use wide windows (Settings); the 3-day defaults are in suite_match_windows
 cur = c.cursor()
 cur.execute("UPDATE account SET currency='USD' WHERE account_id=%s", (USD,))
 c.commit()

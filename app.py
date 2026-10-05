@@ -25,10 +25,11 @@ from werkzeug.exceptions import HTTPException
 DB_URL = os.environ["SUPABASE_DB_URL"]
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 DATE_TOLERANCE_DAYS = 3
-CLEARING_WINDOW_DAYS = 31  # a cheque/payment can hit the bank this long after it's booked
+CLEARING_WINDOW_DAYS = 3   # a payment booked this long before it hits the bank is still suggested (wider in Settings)
 # Defaults for the rules an admin can change under Settings (stored in app_config as rule_<key>).
 RULES = {"date_days": (DATE_TOLERANCE_DAYS, 0, 10, "Days a bank line and its entry may differ and still match exactly"),
-         "clear_days": (CLEARING_WINDOW_DAYS, 3, 120, "Days a payment may clear the bank after it was booked"),
+         "clear_days": (CLEARING_WINDOW_DAYS, 1, 120, "Days a payment may clear the bank after it was booked"),
+         "group_days": (3, 0, 31, "Days apart the items in a combined (batched) match may be"),
          "transfer_days": (4, 0, 14, "Days apart the two sides of a transfer may be"),
          "charges_exact": (1, 0, 1, "Bank charges match on the exact date only"),
          "two_person": (1, 0, 1, "Sign-off needs a second person (admins excepted)"),
@@ -43,7 +44,6 @@ def rule(key):
         return min(hi, max(lo, v))
     except (TypeError, ValueError):
         return default
-GROUP_WINDOW_DAYS = 60
 MAX_GROUP = 5         # max items combined in a batch
 M2O_MAX_LINES = 1000  # skip combinatorial pass above this many unmatched items
 M2O_MAX_CANDS = 10    # candidates considered per item (sorted by date-closeness)
@@ -2950,6 +2950,7 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <label class=opt><span><b>Bank charges match on the exact date</b><small>Excise duty, ledger fees, commissions</small></span><input type=checkbox name=charges_exact value=1 {% if rules.charges_exact %}checked{% endif %}></label>
 <label class=opt><span><b>Days a bank line and its entry may differ</b><small>Still counted as an exact match</small></span><input class=n name=date_days value="{{ rules.date_days }}" inputmode=numeric></label>
 <label class=opt><span><b>Days a payment may clear late</b><small>Cheques and transfers booked before they reach the bank</small></span><input class=n name=clear_days value="{{ rules.clear_days }}" inputmode=numeric></label>
+<label class=opt><span><b>Days apart in a combined match</b><small>Several bank lines and one entry (or the other way) suggested together</small></span><input class=n name=group_days value="{{ rules.group_days }}" inputmode=numeric></label>
 <label class=opt><span><b>Days apart for transfer suggestions</b><small>Same amount, opposite direction, another account</small></span><input class=n name=transfer_days value="{{ rules.transfer_days }}" inputmode=numeric></label>
 <div class=hint style="padding:8px 14px">Open reconciliations are re-matched with the new rules the next time they're opened or refreshed.</div>
 </form>
@@ -2996,7 +2997,7 @@ def settings():
         return "Admins only. <a href='/'>Back</a>", 403
     msg = session.pop("sync_msg", None)
     if request.method == "POST":
-        keys = {"rules": ("charges_exact", "date_days", "clear_days", "transfer_days"),
+        keys = {"rules": ("charges_exact", "date_days", "clear_days", "group_days", "transfer_days"),
                 "signoff": ("two_person", "close_day")}.get(request.form.get("action"), ())
         for k in keys:
             default, lo, hi, _ = RULES[k]
@@ -4523,7 +4524,7 @@ def run_matcher(statement_id):
     rows = cur.fetchall()
     charges = ({str(r[0]) for r in rows if is_bank_charge(r[4], r[2])}   # these pair on the exact date only
                if rule("charges_exact") else set())
-    date_days, clear_days = rule("date_days"), rule("clear_days")
+    date_days, clear_days, group_days = rule("date_days"), rule("clear_days"), rule("group_days")
     lines = [r[:4] for r in rows]
     txns = book_pool(cur, acct_uuid, statement_id, p_start, p_end)
 
@@ -4602,7 +4603,7 @@ def run_matcher(statement_id):
                 continue
             groups = {}
             for (t, d, a, w) in txns:
-                if t not in used and str(t) in family and abs((ld - d).days) <= GROUP_WINDOW_DAYS:
+                if t not in used and str(t) in family and abs((ld - d).days) <= group_days:
                     groups.setdefault(family[str(t)], []).append((t, a))
             found = None
             for fam_txns in groups.values():
@@ -4624,7 +4625,7 @@ def run_matcher(statement_id):
         for l_id, ld, la in unmatched:
             if l_id in matched_lines:
                 continue
-            win = 0 if l_id in charges else GROUP_WINDOW_DAYS
+            win = 0 if l_id in charges else group_days
             cands = sorted([(t, a, d) for (t, d, a, w) in txns
                             if t not in used and abs((ld - d).days) <= win],
                            key=lambda c: abs((ld - c[2]).days))[:M2O_MAX_CANDS]
@@ -4644,7 +4645,7 @@ def run_matcher(statement_id):
     if len(unmatched_t) <= M2O_MAX_LINES:
         for t_id, td, ta in unmatched_t:
             cands = sorted([(l, a, d) for (l, d, a, w) in lines
-                            if l not in matched_lines and abs((td - d).days) <= (0 if l in charges else GROUP_WINDOW_DAYS)],
+                            if l not in matched_lines and abs((td - d).days) <= (0 if l in charges else group_days)],
                            key=lambda c: abs((td - c[2]).days))[:M2O_MAX_CANDS]
             found = None
             for k in range(2, min(MAX_GROUP, len(cands)) + 1):
@@ -4684,7 +4685,7 @@ def run_matcher(statement_id):
             gl, gt, sl, st, closed = [], [], Decimal(0), Decimal(0), None
             for j in range(k, len(order)):
                 d = order[j]
-                if (d - d0).days > CHARGE_GROUP_DAYS or (d.year, d.month) != (d0.year, d0.month):
+                if (d - d0).days > min(CHARGE_GROUP_DAYS, group_days) or (d.year, d.month) != (d0.year, d0.month):
                     break
                 ls_, ts_ = days[d]
                 gl += [i for i, _ in ls_]; gt += [i for i, _ in ts_]
@@ -5373,7 +5374,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <table id=revtbl><tr><th class=bk>{% if n_pending %}<input type=checkbox class=bk-all data-for=revbulk title="Select all to review" aria-label="Select all suggestions to review">{% endif %}</th><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td class=bk>{% if r.status=='proposed' %}<input type=checkbox name=mid value="{{ r.id }}" form=revbulk class=bk-pick aria-label="Select this suggestion">{% endif %}</td>
-<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else ('bank charges, dates differ' if r.charges else ('payment and its reversal' if r.reversal else 'batched total')))) }}</span></td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else ('bank charges, dates differ' if r.charges else ('payment and its reversal' if r.reversal else 'batched total')))) }}</span>{% if r.gap is not none %}<div class=hint>{{ 'same day' if r.gap == 0 else (r.gap ~ ' day' ~ ('' if r.gap == 1 else 's') ~ ' apart') }}</div>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
@@ -6370,6 +6371,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     for mid, mtype, status, delta, conf in rmatches:
         lids, tids = items.get(str(mid), ([], []))
         reviewable.append({"id": mid, "type": mtype, "status": status, "delta": delta,
+                           "gap": max((abs((a_[0] - b_[0]).days) for a_ in sls_by.get(str(mid), []) for b_ in bts_by.get(str(mid), [])
+                                       if hasattr(a_[0], "year") and hasattr(b_[0], "year")), default=None),
                            "charges": mtype == "many_to_one" and conf is not None and float(conf) == CHARGE_GROUP_CONF,
                            "reversal": mtype == "many_to_one" and conf is not None and float(conf) == REVERSAL_CONF,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), []),

@@ -17,6 +17,7 @@ USD, UGX, FXU, FXH = ("00000000-0000-0000-0000-0000000000a1", "00000000-0000-000
                       "00000000-0000-0000-0000-0000000000a3", "00000000-0000-0000-0000-0000000000a4")
 A, c = H.setup(H.account_sql((USD, "37", "DFCU USD 12477", "bank"), (UGX, "35", "DFCU UGX 04353", "bank"),
                              (FXU, "39", "FX in Transit", "bank"), (FXH, "38", "FX in Transit UGX", "bank")))
+A.set_config("rule_clear_days", "31"); A.set_config("rule_group_days", "31")   # these checks use wide windows (Settings); the 3-day defaults are in suite_match_windows
 cur = c.cursor()
 cur.execute("UPDATE account SET currency='USD' WHERE account_id IN (%s,%s)", (USD, FXU)); c.commit()
 T = H.Checker()
