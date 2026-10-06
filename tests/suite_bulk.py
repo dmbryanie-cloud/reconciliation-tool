@@ -45,7 +45,7 @@ def matched(line):
 cl = H.login(A)
 def upload(acct_name, rows):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    return cl.post(f"/account/{acct_name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    return cl.post(f"/account/{acct_name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
                    "period_start": "2026-07-01", "period_end": "2026-07-31"}, content_type="multipart/form-data")
 def page(n="Stanbic UGX"):
     return cl.get(f"/account/{n}").data.decode()

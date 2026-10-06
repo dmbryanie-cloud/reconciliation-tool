@@ -60,7 +60,7 @@ stmt = """Date,Description,Amount
 2026-09-22,SUPPLIER Y,-70000
 2026-09-25,NEW EXPENSE,-10000
 """
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 assert r.status_code == 302
 sid = str(q1("SELECT statement_id FROM statement")[0])

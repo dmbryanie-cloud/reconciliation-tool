@@ -58,7 +58,7 @@ lines += [("2026-02-10", "EFT BOL FEES INST ID 86116882 Fee Collection", -2000),
           ("2026-05-13", "OKELLO PAYMENT BACK", 50000)]
 body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in lines)
 cl = H.login(A)
-r = cl.post("/account/Stanbic 7994/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic 7994/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-02-01", "period_end": "2026-05-31"}, content_type="multipart/form-data")
 assert r.status_code == 302, r.data[:300]
 

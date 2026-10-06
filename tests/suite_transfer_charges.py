@@ -23,7 +23,7 @@ def lid(desc):
 cl = H.login(A)
 def upload(acct_name, rows):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    cl.post(f"/account/{acct_name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    cl.post(f"/account/{acct_name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-08-01", "period_end": "2026-08-31"}, content_type="multipart/form-data")
 def xfer_sec(p):
     m = re.search(r"<h2 id=sec-transfers.*?(<h2 id=|$)", p, re.S)

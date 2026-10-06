@@ -45,7 +45,7 @@ def locked_part(p):
 
 body = ("Date,Description,Amount\n2025-09-08,FEE ACH INWD CR,-2000\n2025-09-20,SERVICE CHARGE SEPT,-4600\n"
         "2025-10-15,SERVICE CHARGE OCT,-3000\n")
-cl.post(f"/account/{NAME}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2025-10-31"}, content_type="multipart/form-data")
 SEP1, SEP2, OCT = lid("FEE ACH INWD CR"), lid("SERVICE CHARGE SEPT"), lid("SERVICE CHARGE OCT")
 

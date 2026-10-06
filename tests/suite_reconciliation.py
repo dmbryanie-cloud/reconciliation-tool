@@ -37,7 +37,7 @@ jan = """Date,Description,Debit,Credit,Balance
 03 Jan 2026,Customer A,,500000,1500000
 """
 def upload(text, **bal):
-    r = cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(text.encode()), "s.csv"), **bal},
+    r = cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(text.encode()), "s.csv"), **bal},
                 content_type="multipart/form-data")
     assert r.status_code == 302, r.data[:400]
 

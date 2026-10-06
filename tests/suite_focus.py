@@ -22,7 +22,7 @@ def q(sql, args=()):
 cl = H.login(A)
 def upload(rows, ps, pe):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    return cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    return cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
                    "period_start": ps, "period_end": pe}, content_type="multipart/form-data")
 def page(qs=""):
     return cl.get("/account/Stanbic UGX" + qs).data.decode()
@@ -112,7 +112,7 @@ for i, (d, amt, who) in enumerate([("2026-06-02", 300000, "Fees A"), ("2026-06-1
 body = "Date,Description,Amount\n" + "".join(f"{d},{x},{a}\n" for d, x, a in [
     ("2026-06-02", "FEES A", 300000), ("2026-06-05", "LEDGER FEES", -2000), ("2026-06-15", "CHEQUE 101", -50000),
     ("2026-06-20", "FEES B", 100000)])
-cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "c.csv"), "opening_balance": "1,000,000",
+cl.post("/account/Centenary UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "c.csv"), "opening_balance": "1,000,000",
         "closing_balance": "1,348,000", "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
 def cpage(qs=""):
     return cl.get("/account/Centenary UGX" + qs).data.decode()
@@ -176,5 +176,45 @@ out.sent = sent; out.errors = errors; console.log(JSON.stringify(out));
     print("   ", o)
     check("browser: picking a month fills both dates and shows it", o.get("sent") == "2026-03-01|2026-03-31")
     check("browser: no script errors", o.get("errors") == [])
+
+    # The calendar on date fields: month and year chosen at the bottom (as in QuickBooks), then a day.
+    JS = r"""
+const { JSDOM, VirtualConsole } = require("jsdom");
+const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => errors.push(String(e.message || e)));
+const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
+const w = dom.window, d = w.document, out = {};
+const inp = d.getElementById("up-ps"); let changed = 0; inp.addEventListener("change", () => changed++);
+inp.value = "2026-03-15";
+inp.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true }));
+const box = d.querySelector(".dp");
+out.open = !!box; out.title = box && box.querySelector(".dp-h b").textContent;
+out.years = box && [...box.querySelectorAll(".dp-y option")].map(o => +o.value);
+const y = box.querySelector(".dp-y"); y.value = "2019"; y.dispatchEvent(new w.Event("change", { bubbles: true }));
+const mo = d.querySelector(".dp-m"); mo.value = "6"; mo.dispatchEvent(new w.Event("change", { bubbles: true }));
+out.after = d.querySelector(".dp-h b").textContent;
+d.querySelector('.dp-g button[data-v="2019-07-04"]').click();
+out.value = inp.value; out.changed = changed; out.closed = !d.querySelector(".dp");
+inp.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true }));
+d.body.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+out.outside = !d.querySelector(".dp");
+out.errors = errors; console.log(JSON.stringify(out));
+"""
+    f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
+    g = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8"); g.write(JS); g.close()
+    try:
+        res = subprocess.run([node, g.name, f.name], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+    finally:
+        os.unlink(f.name); os.unlink(g.name)
+    if res.stderr.strip():
+        print(res.stderr[-1500:])
+    o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
+    print("   ", o)
+    check("calendar: opens on the field's date", o.get("open") and o.get("title") == "March 2026")
+    check("…with a year list at the bottom, several years back", 2011 in (o.get("years") or []) and 2026 in (o.get("years") or []))
+    check("…choosing a year and month there moves the calendar", o.get("after") == "July 2019")
+    check("…a day fills the field (and tells the page) and closes it",
+          o.get("value") == "2019-07-04" and o.get("changed") == 1 and o.get("closed"))
+    check("…a click elsewhere closes it", o.get("outside"))
+    check("calendar: no script errors", o.get("errors") == [])
 
 sys.exit(T.summary())

@@ -2403,7 +2403,80 @@ details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6p
   .cards{grid-template-columns:repeat(2,1fr)}
 }
 @media print{.side,.topbar,#flash{display:none}.app{display:block}}
-</style>"""
+/* Our own calendar for date fields: the browser's has no quick way to another year (QuickBooks-style
+   month and year pickers at the bottom). Typing a date still works as before. */
+input[type=date]{cursor:pointer}
+input[type=date]::-webkit-calendar-picker-indicator{display:none}
+.dp{position:fixed;z-index:1000;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 28px rgba(16,24,40,.18);padding:10px;width:258px;font-size:13px;color:var(--ink)}
+.dp-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.dp-h b{font-weight:600}
+.dp-h button,.dp-f button{border:1px solid var(--line);background:var(--panel);border-radius:6px;cursor:pointer;color:var(--ink);font:inherit}
+.dp-h button{width:28px;height:26px}
+.dp-g{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
+.dp-g span{font-size:11px;color:var(--faint);padding:3px 0}
+.dp-g button{border:0;background:none;border-radius:6px;padding:6px 0;cursor:pointer;color:var(--ink);font:inherit;font-variant-numeric:tabular-nums}
+.dp-g button:hover:not(:disabled){background:var(--accent-soft)}
+.dp-g button.o{color:var(--faint)}
+.dp-g button.t{box-shadow:inset 0 0 0 1px var(--accent)}
+.dp-g button.s{background:var(--accent);color:#fff}
+.dp-g button:disabled{color:var(--line);cursor:default}
+.dp-f{display:flex;gap:6px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)}
+.dp-f select{border:1px solid var(--line);border-radius:6px;padding:4px;font:inherit;background:var(--panel);color:var(--ink)}
+.dp-f .dp-y{width:76px}.dp-f .dp-m{flex:1}
+.dp-f button{padding:4px 8px;font-size:12px}
+</style>
+<script>
+(function(){
+var MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
+var box=null,inp=null,y=0,m=0;
+function iso(d){return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2)}
+function parse(v){var a=/^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(v||'');return a?new Date(+a[1],a[2]-1,+a[3]):null}
+function close(){if(box){box.remove();box=null;inp=null}}
+function set(v){inp.value=v;inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));var i=inp;close();i.focus()}
+function draw(){
+  var lo=parse(inp.min),hi=parse(inp.max),sel=inp.value,today=iso(new Date());
+  var first=new Date(y,m,1),start=new Date(y,m,1-first.getDay());
+  var h='<div class=dp-h><button type=button data-n=-1 aria-label="Previous month">&lsaquo;</button><b>'+MN[m]+' '+y+'</b><button type=button data-n=1 aria-label="Next month">&rsaquo;</button></div><div class=dp-g>';
+  ['Su','Mo','Tu','We','Th','Fr','Sa'].forEach(function(w){h+='<span>'+w+'</span>'});
+  for(var i=0;i<42;i++){var d=new Date(start.getFullYear(),start.getMonth(),start.getDate()+i),v=iso(d);
+    var off=(lo&&d<lo)||(hi&&d>hi);
+    h+='<button type=button data-v="'+v+'" class="'+(d.getMonth()!==m?'o ':'')+(v===today?'t ':'')+(v===sel?'s':'')+'"'+(off?' disabled':'')+'>'+d.getDate()+'</button>'}
+  var ny=new Date().getFullYear(),y0=Math.min(lo?lo.getFullYear():ny-15,y),y1=Math.max(hi?hi.getFullYear():ny+5,y);
+  h+='</div><div class=dp-f><select class=dp-m aria-label="Month">';
+  MN.forEach(function(n,k){h+='<option value='+k+(k===m?' selected':'')+'>'+n+'</option>'});
+  h+='</select><select class=dp-y aria-label="Year">';
+  for(var k=y1;k>=y0;k--)h+='<option'+(k===y?' selected':'')+'>'+k+'</option>';
+  h+='</select><button type=button data-today>Today</button>'+(inp.required?'':'<button type=button data-clear>Clear</button>')+'</div>';
+  box.innerHTML=h;
+}
+function place(){var r=inp.getBoundingClientRect(),w=box.offsetWidth,hh=box.offsetHeight;
+  var left=Math.max(8,Math.min(r.left,window.innerWidth-w-8)),top=r.bottom+4;
+  if(top+hh>window.innerHeight-8&&r.top-hh-4>8)top=r.top-hh-4;
+  box.style.left=left+'px';box.style.top=top+'px'}
+function open(el){
+  if(inp===el)return;close();inp=el;var d=parse(el.value)||parse(el.min&&new Date()<parse(el.min)?el.min:'')||new Date();
+  y=d.getFullYear();m=d.getMonth();
+  box=document.createElement('div');box.className='dp';box.setAttribute('role','dialog');box.setAttribute('aria-label','Choose a date');
+  (el.closest('dialog')||document.body).appendChild(box);draw();place();
+  box.addEventListener('mousedown',function(e){if(e.target.tagName!=='SELECT')e.preventDefault()});
+  box.addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;
+    if(b.dataset.n){m+=+b.dataset.n;if(m<0){m=11;y--}if(m>11){m=0;y++}draw();place()}
+    else if(b.dataset.v)set(b.dataset.v);
+    else if(b.hasAttribute('data-today'))set(iso(new Date()));
+    else if(b.hasAttribute('data-clear'))set('')});
+  box.addEventListener('change',function(e){if(e.target.classList.contains('dp-m'))m=+e.target.value;
+    if(e.target.classList.contains('dp-y'))y=+e.target.value;draw();place()});
+}
+document.addEventListener('click',function(e){
+  var el=e.target.closest&&e.target.closest('input[type=date]');
+  if(el&&!el.disabled&&!el.readOnly&&!el.hasAttribute('data-nopicker')){e.preventDefault();open(el);return}
+  if(box&&!box.contains(e.target))close()});
+document.addEventListener('keydown',function(e){
+  if(!box)return;if(e.key==='Escape'){var i=inp;close();if(i)i.focus()}else if(e.key==='Tab')close()});
+window.addEventListener('resize',close);
+window.addEventListener('scroll',function(e){if(box&&!box.contains(e.target))place()},true);
+})();
+</script>"""
 
 # The page frame every signed-in page shares: the navy sidebar (brand, bank accounts, QuickBooks
 # status, the user menu) and the top bar (where you are, search). SHELL_END closes it and adds the
@@ -4520,7 +4593,8 @@ def delete_statements(cur, ids):
     cur.execute("DELETE FROM statement WHERE statement_id = ANY(%s::uuid[]);", (ids,))   # lines go with it
 
 
-def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None):
+def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None,
+                    replace_ok=True):
     if not rows: raise ValueError("No transactions found in the file.")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
@@ -4569,6 +4643,23 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
                          f"sign-off under Reports (⋯ menu on {'its row' if n == 1 else 'each row'} → Undo sign-off), "
                          f"then upload again; or upload only the months after {dmy(max(o[2] for o in signed))}. "
                          f"Nothing was changed.")
+    if overlap and not replace_ok:
+        # Replacing loses the review work done on it (QuickBooks keeps what was recorded): only when asked.
+        cur.execute("""SELECT 1 FROM match WHERE statement_id = ANY(%s::uuid[])
+                         AND (created_by = 'user' OR confirmed_by IS NOT NULL)
+                       UNION ALL SELECT 1 FROM writeback_log w JOIN statement_line sl ON sl.line_id = w.line_id
+                         WHERE sl.statement_id = ANY(%s::uuid[]) LIMIT 1;""",
+                    ([str(o[0]) for o in overlap], [str(o[0]) for o in overlap]))
+        if cur.fetchone():
+            cur.close(); conn.close()
+            dmy = lambda d: d.strftime("%d/%m/%Y")
+            periods = "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in overlap)
+            raise ValueError(f"Not uploaded: these dates ({dmy(p_start)} to {dmy(p_end)}) overlap the open reconciliation "
+                             f"for {periods}, which has work in it (matches confirmed or made by hand, lines recorded or "
+                             f"ignored). Only one reconciliation per period is kept, so uploading would replace it and that "
+                             f"work would have to be redone (what was recorded stays in QuickBooks). To replace it, tick "
+                             f"\"Replace the open reconciliation\" and upload again; or choose dates after "
+                             f"{dmy(max(o[2] for o in overlap))}. Nothing was changed.")
     if overlap:
         delete_statements(cur, [o[0] for o in overlap])
         if has_request_context():
@@ -4591,10 +4682,10 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     conn.commit(); cur.close(); conn.close()
     return sid
 
-def ingest_file(text, filename, account_name, opening=None, closing=None, p_start=None, p_end=None):
+def ingest_file(text, filename, account_name, opening=None, closing=None, p_start=None, p_end=None, replace_ok=True):
     is_ofx = (filename or "").lower().endswith(".ofx") or "<OFX>" in text[:3000].upper()
     rows = parse_ofx(text) if is_ofx else parse_csv(text)
-    sid = _save_statement(rows, account_name, "ofx" if is_ofx else "csv", opening, closing, p_start, p_end)
+    sid = _save_statement(rows, account_name, "ofx" if is_ofx else "csv", opening, closing, p_start, p_end, replace_ok)
     return sid, len(rows), getattr(rows, "skipped", [])
 
 
@@ -5455,6 +5546,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
 <div class=fld><label for=up-pw>PDF password</label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}><small>Used once to open the file; never stored.</small></div>
+{% if has_results and not signed_off %}<label class=hint style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 10px"><input type=checkbox name=replace value=1> <span>Replace the open reconciliation ({{ p_start.strftime('%d/%m/%Y') }} to {{ p_end.strftime('%d/%m/%Y') }}) if the dates overlap. Its confirmed and hand-made matches, Ignores and record choices are lost; entries recorded in QuickBooks stay there. Without this, an upload that would replace work is refused.</span></label>{% endif %}
 <details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</div></details>
 <div class=help style="margin:0">{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}</div>
 </div>
@@ -7395,6 +7487,7 @@ def upload(name):
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
     args = dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password, opening=opening,
                 closing=closing, p_start=_form_date("period_start"), p_end=_form_date("period_end"),
+                replace_ok=bool(request.form.get("replace")),
                 user={k: session.get(k) for k in ("name", "username", "is_admin")})
     if not SYNC_IN_BACKGROUND:                      # the tests run it inline
         ok, msg = _upload_run(**args)
@@ -7502,7 +7595,8 @@ def pdf_check(data, password=None):
     pdf.close()
 
 
-def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None):
+def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None,
+                replace_ok=True):
     """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
     context (the background job has none), as the user who uploaded it. Returns (ok, message)."""
     with app.test_request_context():
@@ -7518,7 +7612,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
                 if wrong:
                     return False, wrong
                 step(f"Saving {len(pdf_rows)} statement lines")
-                sid = _save_statement(pdf_rows, name, "pdf", opening, closing, p_start, p_end)
+                sid = _save_statement(pdf_rows, name, "pdf", opening, closing, p_start, p_end, replace_ok)
                 n, skipped = getattr(g, "kept", len(pdf_rows)), pdf_rows.skipped
                 checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
                            " Read from the PDF. It has no running balance to check against, so compare the totals with "
@@ -7526,7 +7620,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             else:
                 step("Reading the statement")
                 sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), filename, name, opening, closing,
-                                              p_start, p_end)
+                                              p_start, p_end, replace_ok)
                 n = getattr(g, "kept", n)
             step(f"Matching {n} lines against your books")
             note = run_matcher(sid)

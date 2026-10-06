@@ -27,7 +27,7 @@ T1 = str(cur.fetchone()[0]); c.commit()
 cl = H.login(A)
 stmt = ("Date,Description,Amount\n2026-04-30,LEDGER FEE,-4000\n2026-04-30,EXCISE DUTY A,-600\n"
         "2026-05-02,EXCISE DUTY B,-600\n")
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-04-01", "period_end": "2026-05-31"}, content_type="multipart/form-data")
 assert r.status_code == 302
 

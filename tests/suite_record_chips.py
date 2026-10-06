@@ -36,7 +36,7 @@ cl = H.login(A)
 body = ("Date,Description,Amount\n2026-09-02,PENS LTD,-77000\n2026-09-03,PAPER WORLD,-31000\n2026-09-04,SHELL KAMPALA,-120000\n"
         "2026-09-05,EXCISE DUTY,-500\n2026-09-05,LEDGER FEES,-2500\n2026-09-06,TRANSFER TO CENTENARY,-400000\n"
         "2026-09-07,MYSTERY ITEM,-9999\n2026-09-08,PENS LTD,-15000\n")
-cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 p = cl.get("/account/Stanbic UGX").data.decode()
 lid = lambda who: str(q("SELECT line_id FROM statement_line WHERE description=%s LIMIT 1", (who,))[0][0])

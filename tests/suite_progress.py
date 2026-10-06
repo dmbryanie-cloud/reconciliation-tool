@@ -25,7 +25,7 @@ def q(sql, args=()):
 cl = H.login(A)
 def upload(acct_name, rows, ps, pe):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    r = cl.post(f"/account/{acct_name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    r = cl.post(f"/account/{acct_name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
                 "period_start": ps, "period_end": pe}, content_type="multipart/form-data")
     assert r.status_code == 302, r.data[:300]
 def text(path):
@@ -105,7 +105,7 @@ def slow_run(progress=None, **kw):
 A._upload_run, A.SYNC_IN_BACKGROUND = slow_run, True
 A.start_sync = lambda full=False, by=None: False
 body = "Date,Description,Amount\n2026-10-03,OCT LINE,-50\n"
-r = cl.post("/account/DFCU UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+r = cl.post("/account/DFCU UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
             "period_start": "2026-10-01", "period_end": "2026-10-31"}, content_type="multipart/form-data")
 check("a big upload returns at once (the work goes on in the background)", r.status_code == 302)
 p = text("/account/DFCU UGX")
@@ -113,7 +113,7 @@ check("…the page shows it's being read and matched, with the step", "id=upjob"
       and "year.csv" in p)
 st = cl.get("/account/DFCU UGX/upload_status").get_json()
 check("…and reports progress to the page", st == {"state": "running", "step": "Reading the PDF: page 10 of 120"})
-r = cl.post("/account/DFCU UGX/upload", data={"statement": (io.BytesIO(body.encode()), "again.csv")}, content_type="multipart/form-data")
+r = cl.post("/account/DFCU UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "again.csv")}, content_type="multipart/form-data")
 check("…a second upload meanwhile is refused", "still being read and matched" in text("/account/DFCU UGX"))
 gate.set()
 for th in threading.enumerate():
@@ -127,7 +127,7 @@ check("…shown once", "Statement uploaded." not in text("/account/DFCU UGX"))
 def bad_run(progress=None, **kw):
     return False, "Not uploaded: this account already has a signed-off reconciliation for 2026-10-01 to 2026-10-31."
 A._upload_run = bad_run
-cl.post("/account/DFCU UGX/upload", data={"statement": (io.BytesIO(body.encode()), "x.csv")}, content_type="multipart/form-data")
+cl.post("/account/DFCU UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "x.csv")}, content_type="multipart/form-data")
 for th in threading.enumerate():
     if th.name == "upload":
         th.join(20)
@@ -193,7 +193,7 @@ upload("Centenary UGX", [("2026-05-05", "MAY", 30)], "2026-05-01", "2026-05-31")
 q("UPDATE statement SET signed_off_at=now(), signed_off_by='Jane' WHERE account_id=%s AND period_end <= '2026-04-30' RETURNING 1", (CEN,))
 year = [("2025-09-10", "SEP", 1), ("2026-03-05", "MAR", 10), ("2026-04-05", "APR", 20), ("2026-08-05", "AUG", 40)]
 body = "Date,Description,Amount\n" + "".join(f"{d},{x},{a}\n" for d, x, a in year)
-cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+cl.post("/account/Centenary UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 p = text("/account/Centenary UGX")
 check("a year overlapping two signed-off months is refused, naming both at once",
@@ -210,13 +210,13 @@ check("…undoing an older month's sign-off reopens that month only",
       q("SELECT period_start::text, signed_off_at IS NULL FROM statement WHERE account_id=%s ORDER BY period_start", (CEN,))
       == [("2026-03-01", True), ("2026-04-01", False), ("2026-05-01", True)])
 check("…and says which", "(01/03/2026 to 31/03/2026): it&#39;s back in progress" in text("/reports"))
-cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+cl.post("/account/Centenary UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 check("with one still signed off, it names just that one", "already has a signed-off reconciliation inside these dates "
       "(01/09/2025 to 30/09/2026): 01/04/2026 to 30/04/2026" in text("/account/Centenary UGX"))
 apr = q("SELECT statement_id::text FROM statement WHERE account_id=%s AND period_start='2026-04-01'", (CEN,))[0][0]
 cl.post("/account/Centenary UGX/reopen", data={"s": apr})
-cl.post("/account/Centenary UGX/upload", data={"statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
+cl.post("/account/Centenary UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "year.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 check("once none is signed off, the year replaces the months it covers",
       q("SELECT period_start::text, period_end::text FROM statement WHERE account_id=%s", (CEN,)) == [("2025-09-01", "2026-09-30")]

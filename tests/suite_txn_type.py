@@ -35,7 +35,7 @@ def lid(desc):
 cl = H.login(A)
 def upload(name, rows):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    r = cl.post(f"/account/{name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    r = cl.post(f"/account/{name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
                 "period_start": "2026-07-01", "period_end": "2026-07-31"}, content_type="multipart/form-data")
     assert r.status_code == 302, r.data[:300]
 

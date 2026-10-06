@@ -67,7 +67,7 @@ def start(as_of, balance=""):
     return cl.post("/account/Stanbic UGX/qbo_start", data={"as_of": as_of, "balance": balance})
 def upload(rows, ps, pe, opening=""):
     body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a in rows)
-    return cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"),
+    return cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"),
                    "opening_balance": opening, "closing_balance": "710000", "period_start": ps, "period_end": pe},
                    content_type="multipart/form-data")
 

@@ -107,7 +107,7 @@ check("account-page refresh while running stays on the page with the note",
 
 # 3. uploads and balance fetches stay out of a running sync
 stmt = "Date,Description,Amount\n2026-09-10,Vendor,-101\n"
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data", follow_redirects=True)
 body = r.get_data(as_text=True)
 check("upload during a sync doesn't sync", STATE["queries"] == q0)

@@ -33,7 +33,7 @@ def upload(rows, ps="", pe="", opening="", closing="", balance=True):
         body = "Date,Description,Amount,Balance\n" + "".join(f"{d},{t},{a},{b}\n" for d, t, a, b in rows)
     else:
         body = "Date,Description,Amount\n" + "".join(f"{d},{t},{a}\n" for d, t, a, *_ in rows)
-    r = cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "opening_balance": opening,
+    r = cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "opening_balance": opening,
                 "closing_balance": closing, "period_start": ps, "period_end": pe}, content_type="multipart/form-data")
     assert r.status_code == 302, r.data[:300]
     return msg()

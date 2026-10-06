@@ -60,7 +60,7 @@ def statement(acct, name, n, start=date(2026, 1, 1)):
                  description, counterparty, last_modified) VALUES (%s,%s,%s,'Deposit',%s,%s,'UGX',%s,%s,now()) RETURNING 1""",
               (A.ORG_ID, acct, f"{name}{i}", d + timedelta(days=1), a + (100 if i % 2 else 0), t.title(), t.title()))
     body = "Date,Description,Amount\n" + "".join(f"{d.isoformat()},{t},{a}\n" for d, t, a in rows)
-    cl.post(f"/account/{name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    cl.post(f"/account/{name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-01-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
     return rows
 

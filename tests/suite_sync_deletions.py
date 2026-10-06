@@ -70,7 +70,7 @@ check("5 rows synced live", all(row(i) and not row(i)[1] for i in "12349"))
 # 2. an open statement matching P2 and P3
 cl = H.login(A)
 stmt = "Date,Description,Amount\n2026-09-10,Vendor,-200\n2026-09-10,Vendor,-300\n2026-09-10,Vendor,-400\n"
-cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 cur.execute("SELECT count(*) FROM match"); check("statement matched 3 lines", cur.fetchone()[0] == 3); c.rollback()
 
@@ -194,12 +194,12 @@ def watching_query(entity, token, since=None, changed_since=None, each=None):
     cur.execute("SELECT statement_id FROM statement ORDER BY created_at DESC LIMIT 1"); seen.setdefault("latest", cur.fetchone()[0]); c.rollback()
     return fake_query(entity, token, since, changed_since, each)
 A.qbo_query = watching_query
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-15"}, content_type="multipart/form-data", follow_redirects=True)
 check("one reconciliation per period: an upload overlapping a signed-off one is refused",
       "already has a signed-off reconciliation" in r.get_data(as_text=True) and "seen" and not seen)
 cur.execute("UPDATE statement SET signed_off_at=NULL"); c.commit()   # reopened
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data", follow_redirects=True)
 page = r.get_data(as_text=True)
 A.qbo_query = fake_query

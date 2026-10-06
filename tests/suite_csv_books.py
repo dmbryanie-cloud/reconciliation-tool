@@ -31,7 +31,7 @@ def import_books(acct):
     return html.unescape(re.sub(r"<[^>]+>", "", m.group(1))) if m else ""
 def upload(acct):
     body = "Date,Description,Amount\n2026-06-05,FUEL,-50000\n2026-06-20,FEES BANKED,200000\n"
-    cl.post(f"/account/{acct}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+    cl.post(f"/account/{acct}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
 def pool(acct_uuid):
     k = c.cursor(); s = A._latest_statement(k, acct_uuid); r = A.reconcile(k, acct_uuid, s); c.rollback()

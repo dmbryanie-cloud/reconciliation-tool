@@ -33,7 +33,7 @@ for i, d in enumerate((4, 5, 6, 7, 8, 11)):
     q("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, posted_date, amount, currency,
          description, counterparty, last_modified) VALUES (%s,%s,%s,'Deposit',%s,%s,'UGX',%s,%s,now()) RETURNING 1""",
       (A.ORG_ID, STB, f"b{i}", f"2026-06-{d:02d}", 250000 + d + 100, f"School fees student {d}", f"School fees student {d}"))
-cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
 html = cl.get("/account/Stanbic UGX").data.decode()
 check("the list to record has a search bar with Tick only these / Untick all",

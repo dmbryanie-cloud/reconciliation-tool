@@ -43,7 +43,7 @@ body = ("Date,Description,Amount\n2026-06-10,SUPPLIES,-500000\n2026-06-12,UNIFOR
         "2026-06-15,KITCHEN PART 1,-400000\n2026-06-15,KITCHEN PART 2,-500000\n"
         "2026-06-22,TRANSPORT PART 1,-300000\n2026-06-22,TRANSPORT PART 2,-360000\n")
 cl = H.login(A)
-cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
 p_ = pairs()
 check("same amount 5 days apart: not suggested", "SUPPLIES" not in p_)

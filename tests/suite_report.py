@@ -35,7 +35,7 @@ def text(html):
 
 cl = H.login(A)
 def upload(acct_name, body, **kw):
-    r = cl.post(f"/account/{acct_name}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), **kw},
+    r = cl.post(f"/account/{acct_name}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), **kw},
                 content_type="multipart/form-data")
     assert r.status_code == 302, r.data[:300]
 

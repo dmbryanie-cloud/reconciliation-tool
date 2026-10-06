@@ -55,7 +55,7 @@ body = ("Date,Description,Amount\n"
         "2025-09-12,FEE ACH INWD CR,-4000\n2025-09-12,GOVERNMENT EXCISE DUTY CHARGE,-600\n"
         "2025-10-20,EFT BOL FEES INST ID 2 Fee Collection,-2000\n2025-10-20,Excise Duty EFT BOL FEES 2,-300\n"
         "2025-11-20,MONTHLY MANAGEMENT FEE,-36000\n2025-09-15,GODWIN KAB MB TRANSFER,22527000\n")
-cl.post(f"/account/{NAME}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2025-11-30"}, content_type="multipart/form-data")
 CHG = [lid(t) for t in ("EFT BOL FEES INST ID 1 Fee Collection", "Excise Duty EFT BOL FEES 1", "FEE ACH INWD CR",
                         "GOVERNMENT EXCISE DUTY CHARGE", "EFT BOL FEES INST ID 2 Fee Collection", "Excise Duty EFT BOL FEES 2")]

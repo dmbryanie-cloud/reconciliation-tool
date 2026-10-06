@@ -42,7 +42,7 @@ def join_jobs():
 
 cl = H.login(A)
 body = "Date,Description,Amount\n" + "".join(f"2025-11-{d:02d},EXCISE DUTY {d},-{d}00\n" for d in range(1, 9))
-cl.post(f"/account/{NAME}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2025-11-01", "period_end": "2025-11-30"}, content_type="multipart/form-data")
 L = [lid(f"EXCISE DUTY {d}") for d in range(1, 9)]
 form = {"bulk": "1", **{f"acct_{x}": "83" for x in L}, f"acct_{'0' * 8}-0000-0000-0000-{'9' * 12}": "83"}   # + a stray line's choice

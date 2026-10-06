@@ -15,7 +15,7 @@ T = H.Checker()
 check = T.check
 
 cl = H.login(A)
-r = cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(b"Date,Description,Amount\n2026-01-05,Fee,-100\n"), "s.csv"),
+r = cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(b"Date,Description,Amount\n2026-01-05,Fee,-100\n"), "s.csv"),
             "closing_balance": "-100", "period_start": "2026-01-01", "period_end": "2026-01-31"}, content_type="multipart/form-data")
 assert r.status_code == 302
 
@@ -55,7 +55,7 @@ with other.session_transaction() as s_:
     other_tok = s_["csrf"]
 r4 = fresh.post("/account/Stanbic UGX/balances", data={"closing": "3", "_csrf": other_tok})
 check("another session's token is refused", r4.status_code == 400)
-r5 = fresh.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(b"Date,Description,Amount\n"), "x.csv")},
+r5 = fresh.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(b"Date,Description,Amount\n"), "x.csv")},
                 content_type="multipart/form-data")
 check("multipart upload without token refused", r5.status_code == 400)
 check("GETs unaffected (CSV download)", fresh.get("/account/Stanbic UGX/exceptions.csv").status_code == 200)

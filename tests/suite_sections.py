@@ -26,7 +26,7 @@ c.commit()
 cl = H.login(A)
 stmt = ("Date,Description,Amount\n2026-09-20,SUPPLIER X,-80000\n2026-09-22,SUPPLIER Y,-70000\n"
         "2026-09-25,NEW EXPENSE,-10000\n")
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(stmt.encode()), "s.csv"), "closing_balance": "0",
             "period_start": "2026-09-01", "period_end": "2026-09-30"}, content_type="multipart/form-data")
 assert r.status_code == 302
 page = cl.get("/account/Stanbic")

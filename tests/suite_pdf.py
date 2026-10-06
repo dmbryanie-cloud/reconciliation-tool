@@ -38,7 +38,7 @@ def n_stmts():
 
 cl = H.login(A)
 def upload(pdf, name="statement.pdf", acct="Stanbic", **form):
-    r = cl.post(f"/account/{acct}/upload", data={"statement": (io.BytesIO(pdf), name), **form},
+    r = cl.post(f"/account/{acct}/upload", data={"replace": "1", "statement": (io.BytesIO(pdf), name), **form},
                 content_type="multipart/form-data")
     return r, cl.get(f"/account/{acct}").data.decode()
 
@@ -235,7 +235,7 @@ check("OFX for another account: refused too", n_stmts() == 0 and "looks like DFC
 
 # ---- 6. the page -------------------------------------------------------------------------------
 check("upload box takes PDFs and has a password field", "accept=.pdf,.csv,.ofx" in page and "name=pdf_password" in page)
-r = cl.post("/account/Stanbic/upload", data={"statement": (io.BytesIO(b"Date,Description,Amount\n2026-04-02,X,-5\n"), "s.csv"),
+r = cl.post("/account/Stanbic/upload", data={"replace": "1", "statement": (io.BytesIO(b"Date,Description,Amount\n2026-04-02,X,-5\n"), "s.csv"),
             "closing_balance": "0"}, content_type="multipart/form-data")
 check("…CSV upload unaffected", r.status_code == 302 and stmt()[6] == "csv")
 # ---- an amount too wide for its column: the bank wraps its last digit onto the next line --------

@@ -63,7 +63,7 @@ body = ("Date,Description,Amount\n2025-09-16,EFT BOL FEES INST ID 82220009 Fee C
         "2025-09-16,Excise Duty EFT BOL FEES 82220009 Fee Collection,-300\n"
         "2025-09-18,FEE ACH INWD CR,-4000\n2025-09-18,GOVERNMENT EXCISE DUTY CHARGE,-600\n2025-09-20,STATIONERY,-15000\n"
         + "".join(f"{d},FEE {d},{fee}\n{d},EXCISE {d},{ex}\n" for _, d, fee, ex in EXTRA))
-cl.post(f"/account/{NAME}/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2025-09-01", "period_end": "2025-09-30"}, content_type="multipart/form-data")
 F1, E1 = lid("EFT BOL FEES INST ID 82220009 Fee Collection"), lid("Excise Duty EFT BOL FEES 82220009 Fee Collection")
 F2, E2, ST = lid("FEE ACH INWD CR"), lid("GOVERNMENT EXCISE DUTY CHARGE"), lid("STATIONERY")

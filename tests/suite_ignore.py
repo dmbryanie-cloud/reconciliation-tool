@@ -31,7 +31,7 @@ q("""INSERT INTO book_txn (org_id, account_id, source_txn_id, source_txn_type, p
 cl = H.login(A)
 body = ("Date,Description,Amount\n2026-06-02,PENS LTD,-77000\n2026-06-05,PRINTER INK,-45000\n"
         "2026-06-09,PAPER SUPPLIES,-31000\n2026-06-12,CHAIRS,-250000\n")
-cl.post("/account/Stanbic UGX/upload", data={"statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
+cl.post("/account/Stanbic UGX/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"), "closing_balance": "0",
         "period_start": "2026-06-01", "period_end": "2026-06-30"}, content_type="multipart/form-data")
 lid = lambda who: str(q("SELECT line_id FROM statement_line WHERE description=%s", (who,))[0][0])
 PENS, INK, PAPER, CHAIRS = lid("PENS LTD"), lid("PRINTER INK"), lid("PAPER SUPPLIES"), lid("CHAIRS")
