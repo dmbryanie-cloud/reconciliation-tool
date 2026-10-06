@@ -3231,7 +3231,8 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 </tbody></table></div>
 {% if invites %}<div class=invs><h3>Invited, not set up yet ({{ invites|length }})</h3>
 {% for v in invites %}<div class=inv><div><b>{{ v.name }}</b> <span class=sub2>{{ v.email }} · {{ v.role }}{% if v.expires %} · access until {{ v.expires.strftime('%d %b %Y') }}{% endif %} · invited {{ v.sent }}{% if v.by %} by {{ v.by }}{% endif %} · {% if v.lapsed %}<span class=bad>link expired</span>{% else %}{{ 'emailed' if v.emailed else 'link not emailed' }}, works until {{ v.until }}{% endif %}</span></div>
-<form method=post class=tf><input type=hidden name=action value=reinvite><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm data-busy="Sending...">{{ 'Send again' if email_on else 'New link' }}</button></form>
+{% if email_on %}<form method=post class=tf><input type=hidden name=action value=reinvite><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm data-busy="Sending...">Send again</button></form>{% endif %}
+<form method=post class=tf><input type=hidden name=action value=invitelink><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm title="A new link to copy and send yourself (WhatsApp, another email). Any emailed link stops working." data-busy="Making the link...">Copy link</button></form>
 <form method=post class=tf data-confirm="Cancel the invitation for {{ v.name }}? Its link stops working."><input type=hidden name=action value=uninvite><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm>Cancel</button></form></div>{% endfor %}</div>{% endif %}
 <div class=rule><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.5c0 4.3 2.9 7.7 7 9 4.1-1.3 7-4.7 7-9V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></svg>
 <div>{% if two_person %}<b>Sign-off needs a second person.</b> The person who prepared a reconciliation can't sign it off, unless they're an admin. {% endif %}Every sign-off records who prepared and who approved it, and both names print on the report. The recovery password from your server settings always works as an admin, so you can't be locked out.</div></div>
@@ -3617,8 +3618,8 @@ def users():
         un = (request.form.get("username") or "").strip().lower()
         row = user_row(un) if un else None
         conn = get_conn(); cur = conn.cursor(); _ensure_users(cur)
-        if action in ("invite", "reinvite"):
-            if action == "reinvite":
+        if action in ("invite", "reinvite", "invitelink"):
+            if action in ("reinvite", "invitelink"):
                 cur.execute("""SELECT email, name, preset, expires FROM user_invite WHERE lower(email)=lower(%s)
                                AND used_at IS NULL;""", (request.form.get("email") or "",))
                 inv = cur.fetchone()
@@ -3645,15 +3646,19 @@ def users():
                 error, open_add = "The access-until date has already passed.", True
             else:
                 link = create_invite(email, nm, preset_k, exp, session.get("name"))
-                why = send_invite(email, nm, link, session.get("name"))
-                if why is None:
+                why = "you asked for the link" if action == "invitelink" else send_invite(email, nm, link, session.get("name"))
+                if action == "invitelink":
+                    msg = f"A new invitation link for {nm} is below; any link emailed before no longer works."
+                    session["invite_link"] = {"name": nm, "email": email, "link": link}
+                elif why is None:
                     msg = (f"Invitation sent to {nm} at {email}. They choose their username and password from the link, "
                            f"which works for {INVITE_DAYS} days.")
                 else:
                     msg = f"Invitation for {nm} ready, but it wasn't emailed: {why}. Send them the link below yourself."
                     session["invite_link"] = {"name": nm, "email": email, "link": link}
-                log_activity(f"invited {nm} ({email}) as {PERM_PRESETS[preset_k][0]}"
-                             + (f", access until {exp:%d/%m/%Y}" if exp else ""))
+                log_activity((f"made a new invitation link for {nm} ({email})" if action == "invitelink" else
+                              f"invited {nm} ({email}) as {PERM_PRESETS[preset_k][0]}")
+                             + (f", access until {exp:%d/%m/%Y}" if exp and action != "invitelink" else ""))
         elif action == "uninvite":
             cur.execute("DELETE FROM user_invite WHERE lower(email)=lower(%s) AND used_at IS NULL RETURNING name;",
                         (request.form.get("email") or "",))

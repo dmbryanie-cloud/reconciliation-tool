@@ -89,6 +89,13 @@ second = re.search(r"https?://\S+/invite/\S+", SENT[-1][2]).group(0)
 check("Send again: a new link; the old one stops working", len(SENT) == 2 and second != first
       and "isn't valid" in html.unescape(guest.get(path(first)).data.decode())
       and "Welcome" in html.unescape(guest.get(path(second)).data.decode()))
+n = len(SENT)
+admin.post("/users", data={"action": "invitelink", "email": "audit@example.com"})
+p = users_page(); third = link_on(p)
+check("Copy link: a new link shown to copy, not emailed; the emailed one stops working", third and len(SENT) == n
+      and "isn't valid" in html.unescape(guest.get(path(second)).data.decode())
+      and "Welcome" in html.unescape(guest.get(path(third)).data.decode()) and "Copy link" in p)
+second = third
 admin.post("/users", data={"action": "uninvite", "email": "audit@example.com"})
 check("Cancel: the link stops working", "isn't valid" in html.unescape(guest.get(path(second)).data.decode())
       and "Invited, not set up yet" not in users_page())
