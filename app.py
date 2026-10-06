@@ -520,13 +520,99 @@ def _ensure_users(cur=None):
         c.execute("""SELECT column_name FROM information_schema.columns WHERE table_name='app_users';""")
         have = {r[0] for r in c.fetchall()}
         for col, typ in (("perms", "text"), ("title", "text"), ("active", "boolean DEFAULT true"),
-                         ("expires", "date"), ("last_seen", "timestamptz")):
+                         ("expires", "date"), ("last_seen", "timestamptz"), ("email", "text")):
             if col not in have:
                 c.execute(f"ALTER TABLE app_users ADD COLUMN IF NOT EXISTS {col} {typ};")
+        # An invitation: the person sets their own username and password from the link (only its hash is kept).
+        c.execute("""CREATE TABLE IF NOT EXISTS user_invite (token_hash text PRIMARY KEY, email text NOT NULL,
+                     name text NOT NULL, preset text NOT NULL, expires date, created_by text,
+                     created_at timestamptz NOT NULL DEFAULT now(), link_until timestamptz NOT NULL,
+                     used_at timestamptz, used_by text, emailed boolean NOT NULL DEFAULT false);""")
         conn.commit()
         _USERS_READY.append(True)
     finally:
         c.close(); conn.close()
+
+
+# Email goes through Brevo's web API (Render's free plan blocks SMTP). Without a key, invites show their
+# link to the admin to send themselves.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "ReconBook")
+INVITE_DAYS = 7
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def email_ready():
+    return bool(BREVO_API_KEY and EMAIL_FROM)
+
+
+def send_email(to, to_name, subject, text, html_body):
+    """Send one email. Returns None when sent, else why not."""
+    if not email_ready():
+        return "email isn't set up on this server"
+    body = json.dumps({"sender": {"name": EMAIL_FROM_NAME, "email": EMAIL_FROM}, "to": [{"email": to, "name": to_name or to}],
+                       "subject": subject, "textContent": text, "htmlContent": html_body}).encode()
+    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=body, method="POST",
+                                 headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return None if 200 <= r.status < 300 else f"the email service answered {r.status}"
+    except urllib.error.HTTPError as e:
+        return f"the email service refused it (HTTP {e.code}: {e.read().decode(errors='ignore')[:160]})"
+    except Exception as e:
+        return f"the email service couldn't be reached ({e})"
+
+
+def app_base_url():
+    """The address people open the app at, for links in emails: APP_URL, else the QuickBooks callback's site."""
+    base = os.environ.get("APP_URL") or re.sub(r"(https?://[^/]+).*", r"\1", QBO_REDIRECT_URI or "")
+    return (base or request.host_url).rstrip("/")
+
+
+def _invite_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_invite(email, name, preset, expires, by):
+    """A new invitation (any earlier unused one to the same address stops working). Returns the link."""
+    token = secrets.token_urlsafe(32)
+    _ensure_users()
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM user_invite WHERE lower(email)=lower(%s) AND used_at IS NULL;", (email,))
+    cur.execute("""INSERT INTO user_invite (token_hash, email, name, preset, expires, created_by, link_until)
+                   VALUES (%s,%s,%s,%s,%s,%s, now() + %s * interval '1 day');""",
+                (_invite_hash(token), email, name, preset, expires, by, INVITE_DAYS))
+    conn.commit(); cur.close(); conn.close()
+    return app_base_url() + url_for("invite", token=token)
+
+
+def send_invite(email, name, link, by):
+    """Email the invitation. Returns None when sent, else why not."""
+    company = get_config("company_name") or "your organisation"
+    text = (f"Hello {name},\n\n{by or 'An admin'} has invited you to ReconBook, the bank reconciliation app for {company}.\n\n"
+            f"Open this link to choose your username and password:\n{link}\n\nThe link works for {INVITE_DAYS} days.")
+    html_body = (f"<p>Hello {escape(name)},</p><p>{escape(by or 'An admin')} has invited you to <b>ReconBook</b>, the bank "
+                 f"reconciliation app for {escape(company)}.</p><p><a href=\"{escape(link)}\" style=\"display:inline-block;"
+                 f"background:#13213b;color:#fff;padding:10px 16px;border-radius:7px;text-decoration:none\">Set up your sign-in"
+                 f"</a></p><p style=\"color:#5d6779;font-size:13px\">Or open this link: {escape(link)}<br>It works for "
+                 f"{INVITE_DAYS} days.</p>")
+    err = send_email(email, name, "You're invited to ReconBook", text, html_body)
+    if err is None:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE user_invite SET emailed=true WHERE lower(email)=lower(%s) AND used_at IS NULL;", (email,))
+        conn.commit(); cur.close(); conn.close()
+    return err
+
+
+def invite_by_token(token):
+    """(email, name, preset, expires, link_until, used_at) for an invitation link, or None."""
+    _ensure_users()
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT email, name, preset, expires, link_until, used_at FROM user_invite WHERE token_hash=%s;",
+                (_invite_hash(token or ""),))
+    r = cur.fetchone(); cur.close(); conn.close()
+    return r
 
 
 # What each tick lets a person do. Everyone can view; admins can do everything.
@@ -3123,8 +3209,12 @@ def terms():
 USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Users · ReconBook</title>""" + CSS + """</head><body>
 """ + SHELL_TOP + """<div class=wrap>
 <div class=ph><div><h1>Users &amp; permissions</h1><div class=meta>{{ users|length }} user{{ '' if users|length == 1 else 's' }} · tick what each person may do</div></div>
-<div class=acts><button type=button class=btn data-drawer=adduser>Add user</button></div></div>
+<div class=acts><button type=button class=btn data-drawer=adduser>Invite a user</button></div></div>
 {% if msg %}<div id=flash role=status>{{ msg }}</div>{% elif error %}<div id=flash role=alert>{{ error }}</div>{% endif %}
+{% if invite_link %}<div class="panel invlink" style="margin-bottom:14px;padding:12px 14px"><b>Invitation link for {{ invite_link.name }}</b> ({{ invite_link.email }})
+<div style="display:flex;gap:8px;margin-top:8px"><input id=inv-link value="{{ invite_link.link }}" readonly style="flex:1;min-width:0" onfocus="this.select()" aria-label="Invitation link">
+<button type=button class=btn-sm onclick="var i=document.getElementById('inv-link');i.select();try{navigator.clipboard.writeText(i.value)}catch(e){document.execCommand('copy')}this.textContent='Copied'">Copy link</button></div>
+<div class=hint style="margin-top:6px">Send it to them privately (WhatsApp, email). It's shown only now and works for 7 days.</div></div>{% endif %}
 <div class=panel style="margin-bottom:14px"><div class=tw><table class=perm>
 <thead><tr><th>User</th><th class=p>View &amp; reports</th>{% for k, lab in perms %}<th class=p>{{ lab }}</th>{% endfor %}<th></th></tr></thead><tbody>
 {% for u in users %}<tr{% if not u.active %} class=off{% endif %}>
@@ -3137,8 +3227,12 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <form method=post><input type=hidden name=action value=active><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=on value="{{ '0' if u.active else '1' }}"><button type=submit>{{ 'Switch off sign-in' if u.active else 'Switch sign-in back on' }}</button></form>
 <div class=sep></div><form method=post data-confirm="Remove user {{ u.username }}? Their past sign-offs keep their name."><input type=hidden name=action value=delete><input type=hidden name=username value="{{ u.username }}"><button type=submit class=danger>Remove user</button></form>{% endif %}
 </div></span></td></tr>
-{% else %}<tr><td colspan=9 class=muted>No named users yet. Add one with the button above.</td></tr>{% endfor %}
+{% else %}<tr><td colspan=9 class=muted>No named users yet. Invite one with the button above.</td></tr>{% endfor %}
 </tbody></table></div>
+{% if invites %}<div class=invs><h3>Invited, not set up yet ({{ invites|length }})</h3>
+{% for v in invites %}<div class=inv><div><b>{{ v.name }}</b> <span class=sub2>{{ v.email }} · {{ v.role }}{% if v.expires %} · access until {{ v.expires.strftime('%d %b %Y') }}{% endif %} · invited {{ v.sent }}{% if v.by %} by {{ v.by }}{% endif %} · {% if v.lapsed %}<span class=bad>link expired</span>{% else %}{{ 'emailed' if v.emailed else 'link not emailed' }}, works until {{ v.until }}{% endif %}</span></div>
+<form method=post class=tf><input type=hidden name=action value=reinvite><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm data-busy="Sending...">{{ 'Send again' if email_on else 'New link' }}</button></form>
+<form method=post class=tf data-confirm="Cancel the invitation for {{ v.name }}? Its link stops working."><input type=hidden name=action value=uninvite><input type=hidden name=email value="{{ v.email }}"><button type=submit class=btn-sm>Cancel</button></form></div>{% endfor %}</div>{% endif %}
 <div class=rule><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.5c0 4.3 2.9 7.7 7 9 4.1-1.3 7-4.7 7-9V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></svg>
 <div>{% if two_person %}<b>Sign-off needs a second person.</b> The person who prepared a reconciliation can't sign it off, unless they're an admin. {% endif %}Every sign-off records who prepared and who approved it, and both names print on the report. The recovery password from your server settings always works as an admin, so you can't be locked out.</div></div>
 </div>
@@ -3146,17 +3240,15 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <table><tbody>{% for a in activity %}<tr><td class="faint num" style="width:120px">{{ a.at }}</td><td style="white-space:normal"><b>{{ a.name or a.username or 'Someone' }}</b> {{ a.action }}{% if a.account %} · <a href="{{ url_for('detail', name=a.account) }}">{{ a.account }}</a>{% endif %}</td></tr>
 {% else %}<tr><td class=muted>Nothing yet. Uploads, recordings, undos and sign-offs appear here.</td></tr>{% endfor %}</tbody></table></div>
 
-<aside class=drawer id=dr-adduser {% if not open_add %}hidden{% endif %} aria-label="Add a user"><form method=post style="display:contents">
-<div class=drawer-h><h2>Add a user</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
-<div class=drawer-b><input type=hidden name=action value=save><input type=hidden name=new value=1>
-<div class=two><div class=fld><label for=au-name>Full name</label><input id=au-name name=name placeholder="e.g. Grace Nabirye" required></div>
-<div class=fld><label for=au-un>Username</label><input id=au-un name=username autocapitalize=off placeholder="grace.nabirye" required></div></div>
-<div class=fld><label for=au-title>Job title</label><input id=au-title name=title placeholder="e.g. Accounts assistant"></div>
-<div class=fld><label for=au-pw>Password</label><div class=pw-wrap><input id=au-pw name=password type=password placeholder="At least 6 characters" style="width:100%"><button type=button class=pw-toggle onclick="togglePw(this,'au-pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div><small>Share it with them privately; they can change it after signing in.</small></div>
-<div class=fld><label for=au-preset>Start from <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>A starting set of ticks; change any of them afterwards.</span></span></label><select id=au-preset name=preset>{% for k, p in presets %}<option value="{{ k }}">{{ p[0] }}{% if p[1] %} ({{ p[1]|join(', ') }}){% else %} (view and reports){% endif %}</option>{% endfor %}</select></div>
-<div class=fld><label for=au-exp>Access until <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Leave empty for no end date. Useful for auditors.</span></span></label><input id=au-exp name=expires type=date></div>
+<aside class=drawer id=dr-adduser {% if not open_add %}hidden{% endif %} aria-label="Invite a user"><form method=post style="display:contents">
+<div class=drawer-h><h2>Invite a user <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>They get an email with a link to choose their own username and password. The link works for 7 days.{% if not email_on %} Email isn't set up on this server yet, so you'll get the link to send them yourself.{% endif %}</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-b><input type=hidden name=action value=invite>
+<div class=fld><label for=au-name>Full name</label><input id=au-name name=name placeholder="e.g. Grace Nabirye" required value="{{ request.form.get('name', '') if open_add else '' }}"></div>
+<div class=fld><label for=au-email>Email</label><input id=au-email name=email type=email autocapitalize=off placeholder="grace@example.com" required value="{{ request.form.get('email', '') if open_add else '' }}"></div>
+<div class=fld><label for=au-preset>Role <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>What they may do. Change any tick afterwards on this page.</span></span></label><select id=au-preset name=preset>{% for k, p in presets %}<option value="{{ k }}">{{ p[0] }}{% if p[1] %} ({{ p[1]|join(', ') }}){% else %} (view and reports){% endif %}</option>{% endfor %}</select></div>
+<div class=fld><label for=au-exp>Access until <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Leave blank for no end date. Set one for an auditor or a temporary helper: their sign-in stops after that day.</span></span></label><input id=au-exp name=expires type=date></div>
 </div>
-<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Add user</button></div></form></aside>
+<div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Sending the invitation...">{{ 'Send invitation' if email_on else 'Create invitation link' }}</button></div></form></aside>
 {% if edit_user %}<aside class=drawer id=dr-edituser aria-label="Edit user"><form method=post style="display:contents">
 <div class=drawer-h><h2>{{ edit_user.name }}</h2><a href="{{ url_for('users') }}" class=icon-btn style="margin-left:auto" aria-label="Close">&times;</a></div>
 <div class=drawer-b><input type=hidden name=action value=save><input type=hidden name=username value="{{ edit_user.username }}">
@@ -3183,6 +3275,8 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 .rule{display:flex;gap:10px;padding:10px 14px;border-top:1px solid var(--line-soft);color:var(--muted);font-size:12.5px;align-items:flex-start}
 .rule svg{flex:none;color:var(--gold);margin-top:1px}.rule b{color:var(--ink)}
 .drawer-f{margin-top:auto;padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+.invs{border-top:1px solid var(--line-soft);padding:10px 14px}.invs h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin:0 0 6px}
+.inv{display:flex;gap:8px;align-items:center;padding:6px 0;flex-wrap:wrap}.inv>div{flex:1;min-width:220px}
 </style>
 <script>""" + PW_TOGGLE_JS + """</script>
 </div>""" + SHELL_END + """</body></html>"""
@@ -3523,7 +3617,51 @@ def users():
         un = (request.form.get("username") or "").strip().lower()
         row = user_row(un) if un else None
         conn = get_conn(); cur = conn.cursor(); _ensure_users(cur)
-        if action == "save":
+        if action in ("invite", "reinvite"):
+            if action == "reinvite":
+                cur.execute("""SELECT email, name, preset, expires FROM user_invite WHERE lower(email)=lower(%s)
+                               AND used_at IS NULL;""", (request.form.get("email") or "",))
+                inv = cur.fetchone()
+                email, nm, preset_k, exp = inv if inv else (None, None, None, None)
+            else:
+                email = (request.form.get("email") or "").strip()
+                nm = (request.form.get("name") or "").strip()[:80]
+                preset_k = request.form.get("preset") if request.form.get("preset") in PERM_PRESETS else "assistant"
+                try:
+                    exp = date.fromisoformat(request.form.get("expires")) if request.form.get("expires") else None
+                except ValueError:
+                    exp = None
+            cur.execute("SELECT username FROM app_users WHERE lower(email)=lower(%s);", (email or "",))
+            taken = cur.fetchone()
+            if action == "reinvite" and not email:
+                error = "That invitation was already used or cancelled."
+            elif not nm:
+                error, open_add = "Type their full name.", True
+            elif not _EMAIL_RE.match(email or ""):
+                error, open_add = "Type a valid email address.", True
+            elif taken:
+                error, open_add = f"{email} already has a sign-in ({taken[0]}).", True
+            elif exp and exp < date.today():
+                error, open_add = "The access-until date has already passed.", True
+            else:
+                link = create_invite(email, nm, preset_k, exp, session.get("name"))
+                why = send_invite(email, nm, link, session.get("name"))
+                if why is None:
+                    msg = (f"Invitation sent to {nm} at {email}. They choose their username and password from the link, "
+                           f"which works for {INVITE_DAYS} days.")
+                else:
+                    msg = f"Invitation for {nm} ready, but it wasn't emailed: {why}. Send them the link below yourself."
+                    session["invite_link"] = {"name": nm, "email": email, "link": link}
+                log_activity(f"invited {nm} ({email}) as {PERM_PRESETS[preset_k][0]}"
+                             + (f", access until {exp:%d/%m/%Y}" if exp else ""))
+        elif action == "uninvite":
+            cur.execute("DELETE FROM user_invite WHERE lower(email)=lower(%s) AND used_at IS NULL RETURNING name;",
+                        (request.form.get("email") or "",))
+            gone = cur.fetchone()
+            if gone:
+                msg = f"Cancelled the invitation for {gone[0]}. Its link no longer works."
+                log_activity(f"cancelled the invitation for {gone[0]}")
+        elif action == "save":
             nm = (request.form.get("name") or "").strip()
             pw = request.form.get("password") or ""
             title = (request.form.get("title") or "").strip()[:60] or None
@@ -3577,7 +3715,9 @@ def users():
         if msg and not error:
             session["sync_msg"] = msg
             return redirect(url_for("users"))
-    else:
+    invite_link = None
+    if request.method != "POST":
+        invite_link = session.pop("invite_link", None)
         msg = session.pop("sync_msg", None)
         eu = (request.args.get("edit") or "").strip().lower()
         row = user_row(eu) if eu else None
@@ -3595,6 +3735,13 @@ def users():
         rows.append({"username": un, "name": nm, "admin": bool(adm), "title": title, "active": active, "expires": expires,
                      "seen": ago, "initials": "".join(w[0] for w in nm.split()[:2]).upper(),
                      "perms": set(p for p in perms.split(",") if p) if perms is not None else {p for p, _ in PERMS if p != "users"}})
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT email, name, preset, expires, created_at, link_until, emailed, created_by FROM user_invite
+                   WHERE used_at IS NULL ORDER BY created_at DESC;""")
+    invites = [{"email": e, "name": n, "role": PERM_PRESETS.get(pk, ("?",))[0], "expires": x,
+                "sent": ca.astimezone(EAT).strftime("%d %b %Y"), "lapsed": lu < now, "until": lu.astimezone(EAT).strftime("%d %b"),
+                "emailed": em, "by": by} for e, n, pk, x, ca, lu, em, by in cur.fetchall()]
+    cur.close(); conn.close()
     activity = []
     try:
         conn = get_conn(); cur = conn.cursor()
@@ -3608,7 +3755,8 @@ def users():
         pass
     return render_template_string(USERS_PAGE, users=rows, error=error, msg=msg, edit_user=edit_user, open_add=open_add,
                                   perms=PERMS, presets=list(PERM_PRESETS.items()), activity=activity,
-                                  two_person=rule("two_person"))
+                                  two_person=rule("two_person"), invites=invites, invite_link=invite_link,
+                                  email_on=email_ready())
 
 
 BACKUP_TABLES = ["account", "statement", "statement_line", "book_txn", "match",
@@ -3823,7 +3971,7 @@ def check_csrf():
 
 @app.before_request
 def require_login():
-    if request.endpoint in ("login", "static", "health", "terms", "privacy"):
+    if request.endpoint in ("login", "static", "health", "terms", "privacy", "invite"):
         return
     if not session.get("authed"):
         return redirect(url_for("login"))
@@ -3891,6 +4039,76 @@ CHANGE_PW_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=vi
 </div>
 <script>""" + PW_TOGGLE_JS + """</script>""" + SHELL_END + """
 </body></html>"""
+
+
+INVITE_PAGE = LOGIN_PAGE.split("<div class=card>")[0] + """<div class=card>
+<div class=brand>""" + SCALE_ICON + """<b>ReconBook</b></div>
+<div class=co>{{ company or 'Bank reconciliation for QuickBooks' }}</div>
+{% if not inv %}<div class=err role=alert style="margin-top:0">{{ error }}</div>
+<button type=button class=go onclick="location.href='{{ url_for('login') }}'">Go to sign in</button>
+{% else %}<p style="margin:0 0 16px;line-height:1.5">Welcome, <b>{{ inv.name }}</b>. Choose the username and password you'll sign in with{% if inv.role %} (as {{ inv.role }}){% endif %}.</p>
+<form method=post>
+<div class=f><label for=un>Username</label><input id=un type=text name=username value="{{ username }}" autocapitalize=off autocomplete=username required pattern="[A-Za-z0-9._@-]{2,60}" title="Letters, numbers, dots or dashes"></div>
+<div class=f><label for=pw>Password</label><div class=pw-wrap><input id=pw type=password name=password placeholder="At least 6 characters" autocomplete=new-password required minlength=6>
+<button type=button class=pw-toggle onclick="togglePw(this,'pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div></div>
+<div class=f><label for=pw2>Password again</label><input id=pw2 type=password name=confirm autocomplete=new-password required minlength=6></div>
+<button type=submit class=go>Set up and sign in</button>
+{% if error %}<div class=err role=alert>{{ error }}</div>{% endif %}
+</form>{% endif %}
+</div>
+<div class=foot><a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="mailto:{{ contact_email }}">Contact</a></div>
+<script>""" + PW_TOGGLE_JS + """</script>
+</body></html>"""
+
+
+@app.route("/invite/<token>", methods=["GET", "POST"])
+def invite(token):
+    """An invited person chooses their username and password, and is signed in."""
+    company = get_config("company_name")
+    r = invite_by_token(token)
+    bad = ("This invitation link isn't valid. Ask an admin to send a new one." if not r else
+           "This invitation was already used. Sign in with the username and password you chose." if r[5] else
+           "This invitation link has expired. Ask an admin to send a new one." if r[4] < datetime.now(timezone.utc) else None)
+    if bad:
+        return render_template_string(INVITE_PAGE, inv=None, error=bad, company=company), 404 if not r else 410
+    email, name, preset_k, expires, _, _ = r
+    preset = PERM_PRESETS.get(preset_k, PERM_PRESETS["assistant"])
+    inv = {"name": name, "role": preset[0]}
+    username = re.sub(r"[^a-z0-9._-]", "", email.split("@")[0].lower())[:60]
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip().lower()
+        pw, pw2 = request.form.get("password") or "", request.form.get("confirm") or ""
+        if not re.fullmatch(r"[a-z0-9._@-]{2,60}", username):
+            error = "Choose a username of letters, numbers, dots or dashes (at least 2)."
+        elif get_user(username) or username == "admin":
+            error = f"The username {username} is taken. Choose another."
+        elif len(pw) < 6:
+            error = "The password needs at least 6 characters."
+        elif pw != pw2:
+            error = "The two passwords don't match."
+        else:
+            conn = get_conn(); cur = conn.cursor()
+            # used once: whoever gets here first sets it up
+            cur.execute("""UPDATE user_invite SET used_at=now(), used_by=%s WHERE token_hash=%s AND used_at IS NULL
+                           AND link_until > now() RETURNING 1;""", (username, _invite_hash(token)))
+            if not cur.fetchone():
+                conn.rollback(); cur.close(); conn.close()
+                return render_template_string(INVITE_PAGE, inv=None, company=company,
+                                              error="This invitation was already used or has expired."), 410
+            cur.execute("""INSERT INTO app_users (username, name, password_hash, is_admin, perms, title, active, expires, email)
+                           VALUES (%s,%s,%s,%s,%s,%s,true,%s,%s);""",
+                        (username, name, generate_password_hash(pw), preset_k == "admin", ",".join(preset[1]),
+                         None if preset_k == "admin" else preset[0], expires, email))
+            conn.commit(); cur.close(); conn.close()
+            session.clear()
+            session["csrf"] = secrets.token_urlsafe(32)
+            session["authed"] = True
+            _load_session_user(user_row(username))
+            log_activity(f"accepted the invitation and set up the sign-in {username}")
+            session["sync_msg"] = f"Welcome, {name}. You're signed in as {username}."
+            return redirect(url_for("dashboard"))
+    return render_template_string(INVITE_PAGE, inv=inv, username=username, error=error, company=company)
 
 
 @app.route("/change-password", methods=["GET", "POST"])
