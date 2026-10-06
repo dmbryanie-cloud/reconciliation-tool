@@ -1221,6 +1221,10 @@ def sync_from_quickbooks(full=False, progress=None):
         except Exception:
             cdc_ok = False
             notes.append("couldn't read deletions from QuickBooks; they'll be checked on the next sync")
+    step("Reading how far QuickBooks is reconciled")
+    bad = refresh_qbo_rec_points(token)
+    if bad:
+        notes.append("couldn't read QuickBooks' reconciliation for " + ", ".join(bad))
     fetch_secs = time.time() - t0
     step(f"Saving {len(rows):,} transactions")
     conn = get_conn(); cur = conn.cursor()
@@ -1327,6 +1331,10 @@ try:
                     set_at timestamptz NOT NULL DEFAULT now());""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_reconciled (account_id uuid NOT NULL, source_txn_id text NOT NULL,
                     posted_date date NOT NULL, PRIMARY KEY (account_id, source_txn_id, posted_date));""")
+    # How far QuickBooks itself is reconciled in an open statement's period (its latest entry marked R),
+    # read on each sync: bank lines up to then are already in QuickBooks, so they're never offered to record.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_rec_point (account_id uuid PRIMARY KEY, as_of date,
+                    checked_at timestamptz NOT NULL DEFAULT now());""")
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
     # from posting the same line twice to the company file.
     _cur.execute("""CREATE TABLE IF NOT EXISTS writeback_log (line_id uuid PRIMARY KEY, status text NOT NULL,
@@ -5026,6 +5034,39 @@ def qbo_reconciled_lines(token, acct_qbo, start, end, progress=None):
     return out
 
 
+def refresh_qbo_rec_points(token):
+    """For each linked account with an open reconciliation: the date of its latest entry QuickBooks marks
+    reconciled within that statement's period (None if none). QuickBooks' own reconciliation ended on or
+    after it, so every bank line up to then is already in QuickBooks. Returns the accounts that failed."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT DISTINCT ON (a.account_id) a.account_id, a.source_account_id, a.name, s.period_start, s.period_end
+                   FROM statement s JOIN account a ON a.account_id = s.account_id
+                   WHERE s.signed_off_at IS NULL AND a.source_account_id IS NOT NULL
+                   ORDER BY a.account_id, s.period_end DESC;""")
+    todo = cur.fetchall()
+    bad = []
+    for acct_uuid, acct_qbo, name, ps, pe in todo:
+        try:
+            got = qbo_reconciled_lines(token, acct_qbo, ps, pe)
+        except Exception:
+            bad.append(name); continue
+        cur.execute("""INSERT INTO qbo_rec_point (account_id, as_of) VALUES (%s,%s)
+                       ON CONFLICT (account_id) DO UPDATE SET as_of=EXCLUDED.as_of, checked_at=now();""",
+                    (acct_uuid, max((d for _, d in got), default=None)))
+        conn.commit()
+    cur.close(); conn.close()
+    return bad
+
+
+def qbo_rec_to(cur, acct_uuid):
+    """The date QuickBooks is known to be reconciled up to for this account (or None): from the last
+    sync, or the starting point taken from QuickBooks' reconciliation."""
+    cur.execute("""SELECT greatest((SELECT as_of FROM qbo_rec_point WHERE account_id=%s),
+                                   (SELECT as_of FROM qbo_baseline WHERE account_id=%s));""", (acct_uuid, acct_uuid))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
 def _qbo_start_run(name, as_of, stmt_bal, user, progress=None):
     """Take the account's starting point from QuickBooks' reconciliation up to as_of: which entries
     QuickBooks has reconciled, and their total (the reconciled balance). With stmt_bal (the bank
@@ -5399,7 +5440,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% if can('undo') and has_results and not signed_off %}<aside class=drawer id=dr-qrec hidden aria-label="Copies in a period QuickBooks reconciled"><form action="{{ url_for('detail', name=name) }}" method=get style="display:contents">
 <div class=drawer-h><h2>Copies in a period QuickBooks reconciled</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b><div class=help style="margin:0 0 12px">If QuickBooks was already reconciled up to a date, it had every bank transaction to that date — so whatever was recorded from here for those dates is in QuickBooks twice. Give the date to list them; nothing changes until you confirm on the next screen.</div>
-<div class=fld><label for=qr-date>QuickBooks reconciled up to</label><input id=qr-date type=date name=qrec required min="{{ p_start }}" max="{{ p_end }}" value="{{ qrec.isoformat() if qrec else '' }}"></div></div>
+<div class=fld><label for=qr-date>QuickBooks reconciled up to</label><input id=qr-date type=date name=qrec required min="{{ p_start }}" max="{{ p_end }}" value="{{ qrec.isoformat() if qrec else q_to.isoformat() if q_to and p_start <= q_to <= p_end else '' }}"></div></div>
 <div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn>Check</button></div></form></aside>{% endif %}
 {% if not qbo_linked %}<aside class=drawer id=dr-books hidden aria-label="Import books from a CSV"><form action="{{ url_for('import_books', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
 <div class=drawer-h><h2>Import books from a CSV</h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
@@ -5641,6 +5682,11 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <button type=submit formaction="{{ url_for('record_save', name=name) }}" class=btn-sm data-busy="Saving your selection..." title="Keep what's ticked and chosen, to carry on later">Save selection</button>
 <span id=selcount class=hint></span></div>
 </form>
+{% if locked %}<details class=ignlist id=qlocked open><summary>In QuickBooks' reconciled period — match, don't record ({{ locked|length }})</summary>
+<div class=hint style="margin:6px 0">QuickBooks is reconciled to {{ q_to.strftime('%d/%m/%Y') }}, so every bank line up to then is already in QuickBooks, perhaps combined with others or on another date. Match each to its QuickBooks entry by hand, or ignore it. Nothing is suggested for recording here.</div>
+<form method=post action="{{ url_for('record_ignore', name=name) }}"><table class=rectbl><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th></th></tr>
+{% for w in locked %}<tr><td>{{ w.date }}</td><td class=desc>{{ w.who }}{% if w.wb == 'gone' %}<div class=hint>The entry recorded from here{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was deleted in QuickBooks.</div>{% endif %}</td><td class=a>{{ w.amount|money }}</td>
+<td style="white-space:nowrap"><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable or '' }}">Match by hand</button> <button type=submit name=ignore value="{{ w.line_id }}" class=btn-sm title="It's already in QuickBooks: take it off this list without matching it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td></tr>{% endfor %}</table></form></details>{% endif %}
 {% if ignored %}<details class=ignlist id=ignored><summary>Ignored — already in QuickBooks ({{ ignored|length }})</summary>
 <div class=hint style="margin:6px 0">Taken off the list to record. Each stays on the statement but not in the books until it's matched.</div>
 <table><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Ignored by</th><th></th></tr>
@@ -6607,7 +6653,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         for l_id in deleted_in_qbo(cur, acct_uuid, [k for k, v in wb.items() if v[0] == "done"]):
             wb[l_id] = ("gone", wb[l_id][1])
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
-    pool_ids = {str(t[0]) for t in rec["un_books"]}
+    q_to = qbo_rec_to(cur, acct_uuid) if unmatched_lines and not signed else None
+    pool_ids ={str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
     # A line in a suggested match still to review is already in QuickBooks if the suggestion is right:
     # it isn't offered for recording until the suggestion is rejected.
@@ -6682,6 +6729,12 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             item["sel"] = item["sel"] and bool(item["acct_id"])
         if dr and coa_type.get(dr.get("acct")) == "Accounts Payable":
             item["vend"] = dr.get("cust") or ""
+        # Dated in a period QuickBooks has reconciled: the money is in QuickBooks already, so it's to be
+        # matched (or ignored), never recorded -- no account is suggested.
+        item["locked"] = bool(q_to and dd <= q_to and item["wb"] in (None, "taken", "gone"))
+        if item["locked"]:
+            item.update(sug=None, acct_id=None, sel=False, recordable=False, split="", hedge=None,
+                        why_not=f"QuickBooks is reconciled to {q_to:%d/%m/%Y}")
         (writebacks if out else deposits).append(item)
     _unmatched = [l for l in lines if l[0] not in ml]
     _all_unmatched = [(str(l[0]), l[1], l[2], l[3]) for l in _unmatched]
@@ -6700,6 +6753,12 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                 xfers[l_id] = kept
             else:
                 del xfers[l_id]
+        if q_to:   # a transfer in QuickBooks' reconciled period is there already: matched, never recorded
+            for l in _unmatched:
+                if l[1] <= q_to and str(l[0]) in xfers:
+                    xfers[str(l[0])] = [c for c in xfers[str(l[0])] if c.get("rule") != "unrecorded"]
+                    if not xfers[str(l[0])]:
+                        del xfers[str(l[0])]
         choices = transfer_choices(cur, acct_uuid, [l for l in _unmatched if str(l[0]) in xfers])
     except Exception:
         xfers, xfer_dismissed, choices = {}, [], {}   # a suggestion engine must never break the reconciliation itself
@@ -6721,7 +6780,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         if item.get("saved") and kind:
             item["ttype"], item["ttype_why"] = kind, "Your saved choice"
         # A clear transfer pair with no account chosen yet: suggest the other account (not ticked).
-        if pair and not aid and not item["xfer_only"] and pair.get("other_qbo") in xt_ids:
+        if pair and not aid and not item["xfer_only"] and not item["locked"] and pair.get("other_qbo") in xt_ids:
             item["acct_id"] = pair["other_qbo"]
         item["cats"] = line_categories(item, xt_ids)
     acct_names = {a["id"]: a["fqn"] for a in coa + xt}
@@ -6736,14 +6795,17 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             "n_exact": sum(1 for m in matched if m[0] == "exact"),
             "n_fuzzy": sum(1 for m in matched if m[0] == "fuzzy"), "n_m2o": n_m2o, "n_signflip": n_signflip,
             "matched": matched, "reviewable": reviewable, "writebacks": writebacks, "deposits": deposits,
-            "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]],
-                                  key=_record_rank),
+            "record_rows": sorted([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]
+                                   and not w["locked"]], key=_record_rank),
+            "locked": sorted([w for w in writebacks + deposits if w["locked"] and not w["waiting"]], key=lambda w: w["date"]),
+            "q_to": q_to,
             "n_waiting": sum(1 for w in writebacks + deposits if w["waiting"]),
             "twice": recorded_twice(cur, sid, rec["un_books"]),
             "ignored": sorted([w for w in writebacks + deposits if w["wb"] == "ignored"], key=lambda w: w["date"]),
-            "rec_chips": record_chips([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]],
-                                      acct_names),
-            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored") and not w["waiting"]),
+            "rec_chips": record_chips([w for w in writebacks + deposits if w["wb"] != "ignored" and not w["waiting"]
+                                       and not w["locked"]], acct_names),
+            "n_to_record": sum(1 for w in writebacks + deposits if w["wb"] not in ("done", "ignored") and not w["waiting"]
+                               and not w["locked"]),
             "on_stmt": on_stmt_in, "in_books": rec["un_books"], "rec": rec, "diff": rec["rec_diff"],
             "n_pending": rec["n_pending"], "user_matches": user_matches,
             "acct_linked": bool(acct_qbo),
@@ -7117,7 +7179,7 @@ def apply_focus(d, f0, f1):
     d["matched"] = [m for m in d["matched"] if inw(m[2])]
     d["reviewable"] = [r for r in d["reviewable"] if side_in(r)]
     d["user_matches"] = [u for u in d["user_matches"] if side_in(u)]
-    for k in ("writebacks", "deposits", "record_rows", "ignored"):
+    for k in ("writebacks", "deposits", "record_rows", "ignored", "locked"):
         d[k] = [w for w in d[k] if inw(w["date"])]
     d["on_stmt"] = [l for l in d["on_stmt"] if inw(l[1])]
     d["in_books"] = [t for t in d["in_books"] if inw(t[1])]
@@ -7885,6 +7947,10 @@ def _record_run(name, form, ids, user, progress=None):
     waiting = {r[0] for r in cur.fetchall()}
     n_waiting = sum(1 for l in lines if str(l[0]) in waiting)
     lines = [l for l in lines if str(l[0]) not in waiting]
+    # Never into a period QuickBooks has reconciled: the money is there already.
+    q_to = qbo_rec_to(cur, acct_uuid)
+    n_locked = sum(1 for l in lines if q_to and l[1] <= q_to)
+    lines = [l for l in lines if not (q_to and l[1] <= q_to)]
     dups = possible_duplicates(cur, acct_uuid, lines)
     pool = book_pool(cur, acct_uuid, s[0], s[1], s[2])
     cur.execute("""SELECT mbt.txn_id::text FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
@@ -8148,6 +8214,10 @@ def _record_run(name, form, ids, user, progress=None):
     if n_waiting:
         msg += (f" {n_waiting} line{' was' if n_waiting == 1 else 's were'} left out: a suggested match is waiting for "
                 f"{'it' if n_waiting == 1 else 'them'} (Suggested matches) — if it's right, the money is already in QuickBooks.")
+    if n_locked:
+        msg += (f" {n_locked} line{' was' if n_locked == 1 else 's were'} left out: QuickBooks is reconciled to "
+                f"{q_to:%d/%m/%Y}, so {'it is' if n_locked == 1 else 'they are'} in QuickBooks already — match "
+                f"{'it' if n_locked == 1 else 'them'} instead.")
     if no_acct:
         msg += (f" {no_acct} line{' has' if no_acct == 1 else 's have'} no account, so "
                 f"{'it was' if no_acct == 1 else 'they were'} left for later.")
@@ -8433,6 +8503,13 @@ def _record_transfer_pair(name, lid, other):
         problem = "Both accounts must be linked to QuickBooks."
     elif (not cross and flow(me) != -flow(them)) or (cross and (not flow(me) or (flow(me) > 0) == (flow(them) > 0))):
         problem = "The two lines aren't the same money moving in opposite directions."
+    else:
+        for r in (me, them):
+            q_to = qbo_rec_to(cur, r[6])
+            if q_to and r[1] <= q_to:
+                problem = (f"QuickBooks is reconciled to {q_to:%d/%m/%Y} on {r[10]}, so this transfer is in "
+                           f"QuickBooks already. Match it instead of recording it.")
+                break
     if problem:
         cur.close(); conn.close(); return False, problem
     amount, x_ccy, x_rate = abs(me[2]), None, None
