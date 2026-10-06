@@ -13,7 +13,8 @@ from pdfgen import make_pdf, encrypt
 
 ACCT = "00000000-0000-0000-0000-0000000000a1"
 ACCT2 = "00000000-0000-0000-0000-0000000000a2"
-A, c = H.setup(H.account_sql((ACCT, "35", "Stanbic", "bank"), (ACCT2, "36", "DFCU USD 12477", "bank")))
+A, c = H.setup(H.account_sql((ACCT, "35", "Stanbic", "bank"), (ACCT2, "36", "DFCU USD 12477", "bank"),
+                              ("00000000-0000-0000-0000-0000000000a3", "37", "KCB 09708", "bank")))
 cur = c.cursor()
 T = H.Checker()
 check = T.check
@@ -269,5 +270,39 @@ check("…opening typed for the period kept; closing from the PDF", s[2] == D("1
       and "1 before 04/01/2026" in page)
 k = c.cursor(); rec = A.reconcile(k, ACCT, A._latest_statement(k, ACCT)); c.rollback()
 check("…and the period adds up", rec["foot_diff"] == 0)
+
+# ---- KCB layout: a Reference column after the balance, whole-shilling amounts, "0" in the unused ---------
+# column, and each description centred on its date: half printed above the date's line, half below.
+KO, KI, KB, KR = 360, 430, 515, 522       # right edges of Money Out / Money In / Ledger Balance; Reference's left
+def krow(y, d, out, inn, bal, ref, above=(), below=()):
+    it = [(26, y, d), (90, y, d), (KO, y, out, "r"), (KI, y, inn, "r"), (KB, y, bal, "r"), (KR - 2, y, ref)]
+    it += [(160, y - 6 * (len(above) - i), t) for i, t in enumerate(above)]
+    it += [(158, y + 5 + 11 * i, t) for i, t in enumerate(below)]
+    return it
+KCB = make_pdf([[(26, 40, "Account Statement"), (26, 55, "Account: 2321509708"), (26, 70, "Period: Last 12 Months"),
+    (26, 100, "Transaction"), (90, 106, "Value Date"), (160, 106, "Transaction Details"), (KO, 106, "Money Out", "r"),
+    (KI, 106, "Money In", "r"), (KB, 106, "Ledger Balance", "r"), (KR + 4, 106, "Reference"), (40, 112, "Date"),
+    *krow(130, "06.10.2025", "0", "0", "22,320,375", "", above=(), below=()), (160, 130, "BALANCE B/FWD"),
+    *krow(160, "07.10.2025", "0", "8,460,000", "30,780,375", "FT25280R2P5C", above=("Transfer Oracle Fusion",),
+          below=("NORTH1242782151886 KCB BANK",)),
+    *krow(186, "03.11.2025", "-3,450", "0", "30,776,925", "FT253070DDXQ", above=("Transfer Charge TNGS DFCU 4353",),
+          below=("AC-UGX1402500040022",)),
+    *krow(223, "03.11.2025", "-14,000,000", "0", "16,776,925", "FT253070DDXQ",
+          above=("Direct Credits TNGS DFCU 4353", "MRS MATOVU PAYMENT PLANTS"),
+          below=("AND HERB OUTWARD CREDIT", "CLEARING ACCOUNT"))]])
+r, page = upload(KCB, acct="KCB 09708")
+got = q("""SELECT sl.posted_date::text, sl.amount, sl.description FROM statement_line sl JOIN statement s USING (statement_id)
+           JOIN account a USING (account_id) WHERE a.name='KCB 09708' ORDER BY sl.posted_date, sl.amount DESC""")
+check("KCB: every line read despite the Reference after the balance", [g[:2] for g in got] == [
+      ("2025-10-07", D("8460000")), ("2025-11-03", D("-3450")), ("2025-11-03", D("-14000000"))]
+      and "every running balance checks out" in page)
+check("…each description whole, from above and below its date",
+      [g[2] for g in got] == ["Transfer Oracle Fusion NORTH1242782151886 KCB BANK",
+                              "Transfer Charge TNGS DFCU 4353 AC-UGX1402500040022",
+                              "Direct Credits TNGS DFCU 4353 MRS MATOVU PAYMENT PLANTS AND HERB OUTWARD CREDIT CLEARING ACCOUNT"])
+check("…opening from BALANCE B/FWD", q("""SELECT opening_balance FROM statement s JOIN account a USING (account_id)
+      WHERE a.name='KCB 09708'""")[0][0] == D("22320375"))
+check("…'Account: 2321509708' read as its account number",
+      A.parse_pdf(KCB).account_number == "2321509708")
 
 sys.exit(T.summary())

@@ -4091,6 +4091,8 @@ def _pdf_header(line):
             col = "amount"
         if col == "debit" and t == "payments" and "withdrawals" in texts:
             col = None
+        if t in ("reference", "ref", "references") and i > 0:
+            col = "_ref"        # not money: a transaction reference printed after the balance (KCB)
         if col and col not in cols:
             x0 = line[i - 1]["x0"] if t in ("out", "in") and prev in ("money", "paid") else w["x0"]
             cols[col] = (x0, w["x1"])
@@ -4104,6 +4106,8 @@ def _pdf_col(w, cols):
     c = (w["x0"] + w["x1"]) / 2
     best = None
     for name, (x0, x1) in cols.items():
+        if name.startswith("_"):
+            continue
         dist = min(abs(c - (x0 + x1) / 2), abs(w["x1"] - x1))
         if best is None or dist < best[0]:
             best = (dist, name)
@@ -4228,14 +4232,18 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
     desc_col = None      # where descriptions start, from the last line that had one
     for pl in page_lines:
         prev = None      # the transaction a wrapped description line belongs to (same page only)
-        above = None     # the last text-only line: it may start the next line's description (DFCU)
+        block = []       # text-only lines since the last dated line: they may start the next one's description
         for line in pl:
             text = " ".join(w["text"] for w in line)
             h = _pdf_header(line) if not _pdf_date(line, dayfirst)[0] else None
             if h:
-                cols, prev, above = h, None, None; continue
+                cols, prev, block = h, None, []; continue
             d, k = _pdf_date(line, dayfirst)
-            body, money = _pdf_money_tail(line[k:] if d else line, cols)
+            words = line[k:] if d else line
+            if d and cols and "_ref" in cols:      # the reference after the money isn't part of it
+                while words and words[-1]["x0"] >= cols["_ref"][0] - 15 and not _MONEY_STRICT.match(words[-1]["text"]):
+                    words = words[:-1]
+            body, money = _pdf_money_tail(words, cols)
             if d:
                 d2, k2 = _pdf_date(body, dayfirst)       # a value date next to the transaction date
                 if d2:
@@ -4247,7 +4255,7 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                     opening = v if opening is None else opening
                 else:
                     closing = v
-                prev = above = None; continue
+                prev, block = None, []; continue
             if not d:
                 # A wrapped description: no numbers, lined up under the description, close below it.
                 owner = None
@@ -4255,29 +4263,51 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                         and line[0]["x0"] >= prev["desc_x0"] - 4 and line[0]["top"] - prev["bottom"] < 14
                         and line[-1]["x1"] <= prev["money_x0"] + 2):
                     prev["desc"] = _pdf_join(prev["desc"], text)
+                    prev["wraps"].append(text)
                     prev["bottom"] = line[0]["bottom"]
                     owner = prev
                 else:
                     prev = None
-                above = ({"text": text, "x0": line[0]["x0"], "bottom": line[0]["bottom"], "owner": owner}
-                         if not money and not _PDF_SKIP.search(text) else None)
+                if not money and not _PDF_SKIP.search(text):
+                    block.append({"text": text, "x0": line[0]["x0"], "top": line[0]["top"],
+                                  "bottom": line[0]["bottom"], "owner": owner})
+                else:
+                    block = []
                 continue
             if not money:
-                prev = above = None; continue
-            if not desc and above and line[0]["top"] - above["bottom"] < 14 and (
-                    desc_col is None or abs(above["x0"] - desc_col) <= 4):
-                # The description starts on the line above the date (DFCU centres the date on a
-                # wrapped description): it was taken as the end of the line before; it's this one's.
-                o = above["owner"]
-                if o is not None and o["desc"].endswith(above["text"]):
-                    o["desc"] = o["desc"][:-len(above["text"])].rstrip()
-                desc = above["text"]
-            above = None
+                prev, block = None, []; continue
+            taken = []
+            if not desc:
+                # The description is on the lines around the date, not on its line (DFCU and KCB centre
+                # the date on a wrapped description): the lines just above are this one's -- even those
+                # first read as the end of the line before, when they sit nearer this date than that one's.
+                run, top = [], line[0]["top"]
+                for b in reversed(block):
+                    if top - b["bottom"] >= 14 or (desc_col is not None and abs(b["x0"] - desc_col) > 4):
+                        break
+                    run.insert(0, b); top = b["top"]
+                for b in reversed(run):
+                    o = b["owner"]
+                    if o is not None and (taken if not o["centred"] else
+                                          b["top"] - o["top"] <= line[0]["top"] - b["top"]):
+                        break
+                    taken.insert(0, b)
+                for b in taken:
+                    o = b["owner"]
+                    if o is not None and b["text"] in o["wraps"]:
+                        o["wraps"].remove(b["text"])
+                        o["desc"] = o["base"]
+                        for w_ in o["wraps"]:
+                            o["desc"] = _pdf_join(o["desc"], w_)
+                desc = " ".join(b["text"] for b in taken)
+            block = []
             if body:
                 desc_col = body[0]["x0"]
             r = {"date": d, "desc": desc, "debit": None, "credit": None, "amount": None, "balance": None,
-                 "known": False, "desc_x0": body[0]["x0"] if body else (desc_col or money[0]["x0"]),
-                 "money_x0": money[0]["x0"], "bottom": line[0]["bottom"]}
+                 "known": False, "desc_x0": body[0]["x0"] if body else min(b["x0"] for b in taken) if taken
+                 else (desc_col or money[0]["x0"]),
+                 "money_x0": money[0]["x0"], "bottom": line[0]["bottom"], "top": line[0]["top"],
+                 "centred": not body, "base": desc, "wraps": []}
             if cols:
                 for w in money:
                     c = _pdf_col(w, cols)
@@ -4373,7 +4403,8 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
 
 def _statement_account_number(text):
     """The account number a statement prints ("Account Number : 02183656112477", "A/C No. 9030 0123 4567")."""
-    m = re.search(r"\b(?:account|a/c|acct)\.?\s*(?:number|no\.?|num|#)\s*[:.]?\s*(\d[\d -]{4,}\d)", text, re.I)
+    m = (re.search(r"\b(?:account|a/c|acct)\.?\s*(?:number|no\.?|num|#)\s*[:.]?\s*(\d[\d -]{4,}\d)", text, re.I)
+         or re.search(r"\baccount\s*:\s*(\d[\d -]{4,}\d)", text, re.I))     # "Account: 2321509708" (KCB)
     return re.sub(r"\D", "", m.group(1)) if m else None
 
 
