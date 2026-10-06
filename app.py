@@ -222,12 +222,56 @@ def _start_timer():
     g._t0 = time.perf_counter()
     if request.args.get("prof") and session.get("is_admin"):
         # An admin adds ?prof=1 to a slow page: where its time went is written to the problems log.
-        import cProfile
-        g._prof = cProfile.Profile()
-        g._prof.enable()
+        # Sampled from a side thread (light, unlike a full profiler) and written every 20s, so a page
+        # cut off by the server's time limit still leaves its findings.
+        g._prof = threading.Event()
+        threading.Thread(target=_sample_request, args=(threading.get_ident(), g._prof, request.path),
+                         daemon=True, name="prof").start()
 
 
-def log_problem(kind, detail="", ms=None, limit=2000):
+def _sample_request(tid, stop, path):
+    import sys
+    t0, inner, incl, n, ref = time.time(), Counter(), Counter(), 0, None
+    def save():
+        txt = (f"{path}: {n} samples over {time.time() - t0:.0f}s\nwhere it was (app.py line):\n"
+               + "\n".join(f"{c * 100 // max(n, 1):4d}% {k}" for k, c in inner.most_common(25))
+               + "\ninside (app.py function):\n"
+               + "\n".join(f"{c * 100 // max(n, 1):4d}% {k}" for k, c in incl.most_common(25)))
+        ms = int((time.time() - t0) * 1000)
+        try:
+            conn = get_conn(); cur = conn.cursor()
+            if ref:
+                cur.execute("UPDATE problem_log SET detail=%s, ms=%s WHERE id=%s RETURNING id;", (txt, ms, ref))
+            else:
+                cur.execute("INSERT INTO problem_log (kind, path, ms, detail) VALUES ('profile', %s, %s, %s) RETURNING id;",
+                            (path[:200], ms, txt))
+            new = cur.fetchone()[0]
+            conn.commit(); cur.close(); conn.close()
+            return new
+        except Exception as e:
+            print("profile:", e)
+            return ref
+    last = time.time()
+    while not stop.wait(0.1):
+        f = sys._current_frames().get(tid)
+        if f is None:
+            break
+        n += 1
+        mine, first = set(), None
+        while f is not None:
+            if f.f_code.co_filename.endswith("app.py") and "site-packages" not in f.f_code.co_filename:
+                if first is None:
+                    first = f"{f.f_code.co_name}:{f.f_lineno}"
+                mine.add(f.f_code.co_name)
+            f = f.f_back
+        inner[first or "(outside app.py)"] += 1
+        incl.update(mine)
+        if time.time() - last > 20:
+            ref, last = save(), time.time()
+    save()
+
+
+def log_problem(kind, detail="", ms=None):
     """Write one row to problem_log; returns its number, or None if it couldn't be saved."""
     t = g.get("_db") or {} if has_request_context() else {}
     try:
@@ -237,7 +281,7 @@ def log_problem(kind, detail="", ms=None, limit=2000):
                     (kind, session.get("username") or ("admin" if session.get("authed") else None) if has_request_context() else None,
                      request.method if has_request_context() else None,
                      request.path[:200] if has_request_context() else None,
-                     None if ms is None else int(ms), t.get("q"), (detail or "")[:limit]))
+                     None if ms is None else int(ms), t.get("q"), (detail or "")[:2000]))
         ref = cur.fetchone()[0]
         cur.execute("DELETE FROM problem_log WHERE id <= %s;", (ref - 1000,))
         conn.commit(); cur.close(); conn.close()
@@ -257,14 +301,8 @@ def _timing(resp):
     resp.headers["Server-Timing"] = (f'db;dur={t.get("q_ms", 0):.0f};desc="{t.get("q", 0)} queries", '
                                      f'conn;dur={t.get("conn_ms", 0):.0f};desc="{t.get("conn", 0)} new", total;dur={ms:.0f}')
     if g.get("_prof"):
-        g._prof.disable()
-        import pstats
-        st = pstats.Stats(g._prof)
-        def top(key, n):
-            rows = sorted(st.stats.items(), key=lambda kv: -kv[1][key])[:n]
-            return "\n".join(f"{v[key]:8.2f}s {v[1]:>9} {os.path.basename(k[0])}:{k[1]} {k[2]}" for k, v in rows)
-        log_problem("profile", "own time:\n" + top(2, 20) + "\nincluding calls:\n" + top(3, 30), ms, limit=8000)
-    elif ms > SLOW_MS and request.endpoint not in ("static", "health"):
+        g._prof.set()          # the sampler writes its last findings and stops
+    if ms > SLOW_MS and request.endpoint not in ("static", "health"):
         log_problem("slow", f'{t.get("q", 0)} queries took {t.get("q_ms", 0) / 1000:.1f}s; '
                             f'{t.get("conn", 0)} new connections took {t.get("conn_ms", 0) / 1000:.1f}s', ms)
     return resp
