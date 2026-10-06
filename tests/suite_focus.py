@@ -234,4 +234,38 @@ out.errors = errors; console.log(JSON.stringify(out));
     check("…a click elsewhere closes it", o.get("outside"))
     check("calendar: no script errors", o.get("errors") == [])
 
+    # Info icons: the explanations sit behind an "i" in each heading (shown on hover, focus or tap).
+    JS = r"""
+const { JSDOM, VirtualConsole } = require("jsdom");
+const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => errors.push(String(e.message || e)));
+const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
+const w = dom.window, d = w.document, out = {};
+const h = d.querySelector("h2[data-sec] .info").closest("h2"), i = h.querySelector(".info");
+out.title = h.getAttribute("data-title"); out.tip = i.querySelector(".tip").textContent.length;
+const before = h.className + "|" + h.getAttribute("aria-expanded");
+i.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true }));
+out.open = i.classList.contains("open"); out.sectionSame = before === h.className + "|" + h.getAttribute("aria-expanded");
+d.body.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+out.closed = !i.classList.contains("open");
+out.helpLeft = d.querySelectorAll("div.help").length;
+out.errors = errors; console.log(JSON.stringify(out));
+"""
+    f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
+    g = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8"); g.write(JS); g.close()
+    try:
+        res = subprocess.run([node, g.name, f.name], capture_output=True, text=True, encoding="utf-8", cwd=H.HERE)
+    finally:
+        os.unlink(f.name); os.unlink(g.name)
+    if res.stderr.strip():
+        print(res.stderr[-1500:])
+    o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
+    print("   ", o)
+    check("info: the explanation is behind an i in the heading, not on the page",
+          (o.get("tip") or 0) > 40 and o.get("helpLeft") == 0)
+    check("…the section's title doesn't include it", o.get("title") and "How this works" not in o["title"]
+          and len(o["title"]) < 80)
+    check("…a tap opens it without folding the section; a tap elsewhere closes it",
+          o.get("open") and o.get("sectionSame") and o.get("closed"))
+    check("info: no script errors", o.get("errors") == [])
+
 sys.exit(T.summary())

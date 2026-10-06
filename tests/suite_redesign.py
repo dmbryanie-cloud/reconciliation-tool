@@ -117,7 +117,7 @@ st = admin.get("/settings").data.decode()
 check("settings page: QuickBooks card, rules, sign-off, backup", "QuickBooks Online" in st and 'name=date_days value="5"' in st
       and "Sign-off and month end" in st and "Download a backup now" in st)
 admin.post("/settings", data={"action": "rules", "date_days": "3", "clear_days": "31", "transfer_days": "4", "charges_exact": "1"})
-check("settings lists the bank accounts with Show ticks", "<h2>Bank accounts</h2>" in st and st.count("class=acc name=active") == 2)
+check("settings lists the bank accounts with Show ticks", "<h2>Bank accounts <span class=info" in st and st.count("class=acc name=active") == 2)
 r = admin.post("/accounts", data={"to": "settings", "active": [STB]})
 check("hiding one from Settings returns there and hides it", r.headers["Location"].endswith("/settings#banks")
       and q("SELECT is_active FROM account WHERE account_id=%s", (DF,)) == [(False,)]
