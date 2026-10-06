@@ -502,14 +502,31 @@ def check_password(pw):
     return bool(APP_PASSWORD) and pw == APP_PASSWORD
 
 
-def _ensure_users(cur):
-    cur.execute("""CREATE TABLE IF NOT EXISTS app_users (
-        username text PRIMARY KEY, name text, password_hash text,
-        is_admin boolean DEFAULT false, created_at timestamptz DEFAULT now());""")
-    # perms: comma-separated ticks (NULL = from before permissions: everything but users & settings)
-    for col, typ in (("perms", "text"), ("title", "text"), ("active", "boolean DEFAULT true"),
-                     ("expires", "date"), ("last_seen", "timestamptz")):
-        cur.execute(f"ALTER TABLE app_users ADD COLUMN IF NOT EXISTS {col} {typ};")
+_USERS_READY = []
+
+
+def _ensure_users(cur=None):
+    """Create the users table and its columns, once per process, on a connection of its own committed at once.
+    ALTER TABLE locks the table even when the column exists: run inside a request's open transaction it
+    blocked every other connection touching users -- adding a user waited on itself until the timeout (502)."""
+    if _USERS_READY:
+        return
+    conn = get_conn(); c = conn.cursor()
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS app_users (
+            username text PRIMARY KEY, name text, password_hash text,
+            is_admin boolean DEFAULT false, created_at timestamptz DEFAULT now());""")
+        # perms: comma-separated ticks (NULL = from before permissions: everything but users & settings)
+        c.execute("""SELECT column_name FROM information_schema.columns WHERE table_name='app_users';""")
+        have = {r[0] for r in c.fetchall()}
+        for col, typ in (("perms", "text"), ("title", "text"), ("active", "boolean DEFAULT true"),
+                         ("expires", "date"), ("last_seen", "timestamptz")):
+            if col not in have:
+                c.execute(f"ALTER TABLE app_users ADD COLUMN IF NOT EXISTS {col} {typ};")
+        conn.commit()
+        _USERS_READY.append(True)
+    finally:
+        c.close(); conn.close()
 
 
 # What each tick lets a person do. Everyone can view; admins can do everything.
