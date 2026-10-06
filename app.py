@@ -2074,8 +2074,8 @@ def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
     """
     since = _sync_since()
     if since and str(as_of) < since:
-        raise ValueError(f"The period ends before the sync window ({since}). Enter the book balance by hand, "
-                         f"or raise SYNC_MONTHS.")
+        # Older than the synced entries: ask QuickBooks for the balance on that day instead.
+        return qbo_balance_sheet_balance(token, acct_uuid, acct_qbo, as_of)
     q = f"SELECT * FROM Account WHERE Id = '{acct_qbo}'"
     req = urllib.request.Request(f"{QBO_BASE}/v3/company/{qbo_realm()}/query?query=" + urllib.parse.quote(q))
     req.add_header("Authorization", f"Bearer {token}")
@@ -2092,6 +2092,43 @@ def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
     later = cur.fetchone()[0]
     cur.close(); conn.close()
     return current - later
+
+
+def qbo_balance_sheet_balance(token, acct_uuid, acct_qbo, as_of):
+    """The account's balance at the end of `as_of`, from QuickBooks' Balance Sheet for that day: for
+    periods before the synced entries. The Balance Sheet is in the home currency, so it's used only for
+    home-currency accounts."""
+    dmy = as_of.strftime("%d/%m/%Y")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT currency FROM account WHERE account_id=%s;", (acct_uuid,))
+    ccy = (cur.fetchone() or [None])[0]
+    home = qbo_home_currency(cur)
+    cur.close(); conn.close()
+    if ccy and home and ccy != home:
+        raise ValueError(f"QuickBooks only gives the {ccy} balance on {dmy} in {home}. Type the book balance by hand: "
+                         f"the balance on {dmy} in the account's register in QuickBooks.")
+    rep = qbo_report(token, "BalanceSheet", {"start_date": as_of.isoformat(), "end_date": as_of.isoformat(),
+                                             "accounting_method": "Accrual", "minorversion": "75"})
+
+    def find(rows):
+        for r in (rows or {}).get("Row", []):
+            cd = r.get("ColData")
+            if cd and len(cd) > 1 and str(cd[0].get("id") or "") == str(acct_qbo):
+                return cd[-1].get("value")
+            hd = (r.get("Header") or {}).get("ColData")
+            if hd and len(hd) > 1 and str(hd[0].get("id") or "") == str(acct_qbo):
+                # an account with sub-accounts: its total includes them, as its register balance does
+                sm = (r.get("Summary") or {}).get("ColData") or hd
+                return sm[-1].get("value")
+            got = find(r.get("Rows"))
+            if got is not None:
+                return got
+        return None
+    v = find(rep.get("Rows"))
+    if v is None:
+        raise ValueError(f"QuickBooks' Balance Sheet for {dmy} doesn't list this account (nothing posted to it by "
+                         f"then?). Type the book balance by hand: 0 if it had no entries yet.")
+    return _D(v or 0)
 
 
 # ---------------- shared styling ----------------
