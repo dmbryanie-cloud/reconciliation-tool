@@ -9304,7 +9304,11 @@ def balances(name):
             rematch = (new_ps, new_pe) != (ps, pe)
             if rematch:
                 if new_ps > first or new_pe < last:
-                    raise ValueError(f"the period must cover the statement's transactions ({first} to {last})")
+                    raise ValueError(
+                        f"nothing was saved. The period you typed ({new_ps:%d/%m/%Y} to {new_pe:%d/%m/%Y}) leaves out "
+                        f"statement lines: they run from {first:%d/%m/%Y} to {last:%d/%m/%Y}, so the period must start on "
+                        f"or before {first:%d/%m/%Y} and end on or after {last:%d/%m/%Y}. To work on one month, use the "
+                        f"month picker above the lists instead; the balances can be saved with the period left as it was.")
                 cur.execute("UPDATE statement SET period_start=%s, period_end=%s WHERE statement_id=%s;", (new_ps, new_pe, sid))
                 ps = new_ps
             opening, o_src, closing, c_src = _resolve_balances(
