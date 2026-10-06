@@ -19,7 +19,7 @@ cur.execute("UPDATE account SET currency='USD' WHERE account_id=%s", (USD,)); c.
 T = H.Checker()
 check = T.check
 A.qbo_home_currency = lambda cur: "UGX"
-A._sync_since = lambda: "2025-10-01"
+A.set_config("sync_window_from", "2025-10-01")      # the books synced so far reach back to here
 
 ASKED = []
 def fake_report(token, report, params):
@@ -47,6 +47,24 @@ try:
     A.qbo_book_balance_at("tok", USD, "36", date(2025, 4, 16)); msg = ""
 except ValueError as e:
     msg = str(e)
-check("a foreign-currency account: asked to type it (the Balance Sheet is in UGX), QuickBooks not asked",
-      "only gives the USD balance" in msg and len(ASKED) == n)
+check("a foreign-currency account: asked to Sync (the Balance Sheet is in UGX), QuickBooks not asked",
+      "Press Sync" in msg and len(ASKED) == n)
+
+# ---- sync reaches back to cover every open reconciliation ----------------------------------------------------
+A.SYNC_MONTHS = 12
+env = A._env_since()
+check("no open reconciliation: the window is SYNC_MONTHS", A._sync_since() == env)
+cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end, opening_balance, closing_balance, currency)
+               VALUES (%s,%s,'2024-09-01','2025-02-01',0,0,'UGX')""", (A.ORG_ID, UGX)); c.commit()
+check("an open reconciliation from 01/09/2024: sync reaches back to three months before it", A._sync_since() == "2024-06-01")
+A.set_config("sync_entities", A._sync_plan(full=True)[1]); A.set_config("sync_force_full", "0")
+A.set_config("last_sync_at", A.datetime.now(A.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S-00:00"))
+A.set_config("sync_window_from", env)
+cs, _, notes = A._sync_plan()
+check("…the books only reach back to SYNC_MONTHS: the next sync is a full one, saying why",
+      cs is None and any("reaching back to 2024-06-01" in x for x in notes))
+A.set_config("sync_window_from", "2024-06-01")
+check("…once a full sync has reached back, syncs are quick again", A._sync_plan()[0] is not None)
+cur.execute("UPDATE statement SET signed_off_at=now()"); c.commit()
+check("signed off: the window goes back to SYNC_MONTHS", A._sync_since() == env)
 sys.exit(T.summary())

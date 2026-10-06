@@ -685,15 +685,35 @@ QBO_PAGE_SIZE = 1000
 QBO_MAX_PAGES = 50  # safety ceiling: 50,000 records per entity
 SYNC_MONTHS = int(os.environ.get("SYNC_MONTHS", "24"))  # how far back sync reaches
 
+SYNC_MARGIN_MONTHS = 3     # before an open reconciliation's start: entries still outstanding from then
+
+
+def _months_back(d, n):
+    m = d.month - n
+    return date(d.year + (m - 1) // 12, (m - 1) % 12 + 1, 1)
+
+
+def _env_since():
+    """First day of the month SYNC_MONTHS ago, as YYYY-MM-DD (None: all history)."""
+    return None if SYNC_MONTHS <= 0 else _months_back(date.today(), SYNC_MONTHS).isoformat()
+
+
 def _sync_since():
-    """First day of the month SYNC_MONTHS ago, as YYYY-MM-DD."""
-    if SYNC_MONTHS <= 0:
-        return None  # 0 or negative = pull all history
-    t = date.today()
-    m = t.month - SYNC_MONTHS
-    y = t.year + (m - 1) // 12
-    m = (m - 1) % 12 + 1
-    return f"{y:04d}-{m:02d}-01"
+    """How far back sync reaches, as YYYY-MM-DD (None: all history): SYNC_MONTHS, or further when an open
+    reconciliation starts earlier -- its book entries and book balance need QuickBooks' entries from then."""
+    since = _env_since()
+    if since is None:
+        return None
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT min(period_start) FROM statement WHERE signed_off_at IS NULL;")
+        first = cur.fetchone()[0]
+        cur.close(); conn.close()
+    except Exception:
+        return since
+    if first:
+        since = min(since, _months_back(first, SYNC_MARGIN_MONTHS).isoformat())
+    return since
 
 def qbo_query(entity, token, since=None, changed_since=None, each=None):
     """Query a QBO entity, following STARTPOSITION paging until exhausted.
@@ -1120,6 +1140,12 @@ def _sync_plan(full=False):
     changed_since = None if (full or get_config("sync_entities") != ent_sig or get_config("sync_force_full") == "1") \
         else get_config("last_sync_at")
     notes = []
+    # Reaching further back than the last full sync did: only a full sync brings in the older entries.
+    since, have = _sync_since(), get_config("sync_window_from") or _env_since() or "all"
+    if changed_since and since and have != "all" and since < have:
+        changed_since = None
+        notes.append(f"an open reconciliation starts before the books synced so far, so this was a full sync "
+                     f"reaching back to {since}")
     if changed_since and _sync_age_days(changed_since) > CDC_MAX_DAYS:
         # Deletions older than the change feed's reach can only be found by a full pull.
         changed_since = None
@@ -1270,6 +1296,8 @@ def sync_from_quickbooks(full=False, progress=None):
         set_config("last_sync_at", started_at)   # only advance if every entity pulled OK
         set_config("sync_entities", ent_sig)
         set_config("synced_realm", realm)
+        if changed_since is None:
+            set_config("sync_window_from", since or "all")     # how far back the books are complete
         # Past the CDC cap some deletions may be missing: make the next sync a full one.
         set_config("sync_force_full", "1" if capped else "0")
         if capped:
@@ -2072,8 +2100,8 @@ def qbo_book_balance_at(token, acct_uuid, acct_qbo, as_of):
     transactions dated after `as_of`. That's exact as long as sync is fresh and reaches back to
     `as_of` -- the caller syncs first, and this refuses dates before the sync window.
     """
-    since = _sync_since()
-    if since and str(as_of) < since:
+    since = get_config("sync_window_from") or _env_since()      # how far back the synced books are complete
+    if since and since != "all" and str(as_of) < since:
         # Older than the synced entries: ask QuickBooks for the balance on that day instead.
         return qbo_balance_sheet_balance(token, acct_uuid, acct_qbo, as_of)
     q = f"SELECT * FROM Account WHERE Id = '{acct_qbo}'"
@@ -2105,8 +2133,9 @@ def qbo_balance_sheet_balance(token, acct_uuid, acct_qbo, as_of):
     home = qbo_home_currency(cur)
     cur.close(); conn.close()
     if ccy and home and ccy != home:
-        raise ValueError(f"QuickBooks only gives the {ccy} balance on {dmy} in {home}. Type the book balance by hand: "
-                         f"the balance on {dmy} in the account's register in QuickBooks.")
+        raise ValueError(f"The books synced so far don't reach back to {dmy}. Press Sync on the dashboard: it reaches "
+                         f"back to cover this reconciliation, and the book balance fills in when it finishes. (Or type "
+                         f"it: the {ccy} balance on {dmy} in the account's register in QuickBooks.)")
     rep = qbo_report(token, "BalanceSheet", {"start_date": as_of.isoformat(), "end_date": as_of.isoformat(),
                                              "accounting_method": "Accrual", "minorversion": "75"})
 
