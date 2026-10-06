@@ -36,23 +36,36 @@ FEB_MAR = FEB + "2026-03-05,CHARGE,-3450\n"
 MAR = "Date,Description,Amount\n2026-03-05,CHARGE,-3450\n"
 
 upload(FEB, period_start="2026-02-01", period_end="2026-02-28")
-check("the upload box offers to replace the open reconciliation",
-      "Replace the open reconciliation (01/02/2026 to 28/02/2026)" in page())
 m = upload(FEB_MAR, period_start="2026-02-01", period_end="2026-03-31")
-check("no work in it yet: an overlapping upload replaces it as before", periods() == [("2026-02-01", "2026-03-31")]
-      and "replaces the earlier reconciliation" in m)
+check("no work in it yet: an overlapping upload replaces it as before, without asking",
+      periods() == [("2026-02-01", "2026-03-31")] and "replaces the earlier reconciliation" in m and "id=replaceq" not in page())
 
 # Work: a line ignored.
 lid = str(q("SELECT line_id FROM statement_line WHERE description='DEPOSIT'")[0][0])
 cl.post(f"/account/{NAME}/record_ignore", data={"ignore": lid})
 m = upload(FEB_MAR, period_start="2026-02-01", period_end="2026-03-31")
-check("with work in it: refused, saying why and what to do", "Not uploaded" in m and "has work in it" in m
-      and 'tick "Replace the open reconciliation"' in m and "Nothing was changed" in m)
-check("…the reconciliation and its work are untouched", periods() == [("2026-02-01", "2026-03-31")]
+p = page()
+check("with work in it: the page asks whether to replace it, saying what would be lost",
+      "Replace the open reconciliation?" in p and "has work in it" in p
+      and "Replace it with the new statement" in p and "Keep the open reconciliation" in p)
+check("…nothing changed while it asks", periods() == [("2026-02-01", "2026-03-31")]
       and q("SELECT status FROM writeback_log WHERE line_id=%s", (lid,)) == [("ignored",)])
-m = upload(FEB_MAR, period_start="2026-02-01", period_end="2026-03-31", replace="1")
-check("ticked: it's replaced", "replaces the earlier reconciliation" in m and periods() == [("2026-02-01", "2026-03-31")]
-      and not q("SELECT 1 FROM statement_line WHERE line_id=%s", (lid,)))
+check("…the statement read is kept for the answer (not the file)", q("SELECT count(*) FROM pending_upload")[0][0] == 1)
+
+cl.post(f"/account/{NAME}/upload_replace", data={"answer": "keep"})
+check("Keep: the open reconciliation stays, the new statement is dropped",
+      "Kept the open reconciliation" in page() and periods() == [("2026-02-01", "2026-03-31")]
+      and q("SELECT 1 FROM statement_line WHERE line_id=%s", (lid,)) and not q("SELECT 1 FROM pending_upload")
+      and "id=replaceq" not in page())
+
+upload(FEB_MAR, period_start="2026-02-01", period_end="2026-03-31")
+cl.post(f"/account/{NAME}/upload_replace", data={"answer": "replace"})
+m = page()
+check("Replace: done from the statement already read, no second upload", "Statement uploaded." in m
+      and "replaces the earlier reconciliation" in m and periods() == [("2026-02-01", "2026-03-31")]
+      and not q("SELECT 1 FROM statement_line WHERE line_id=%s", (lid,)) and not q("SELECT 1 FROM pending_upload"))
+cl.post(f"/account/{NAME}/upload_replace", data={"answer": "replace"})
+check("answering again: nothing waiting, says so", "no longer waiting" in page())
 
 # A statement after it never overlaps: kept alongside.
 lid = str(q("SELECT line_id FROM statement_line WHERE description='DEPOSIT'")[0][0])

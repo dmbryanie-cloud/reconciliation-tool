@@ -179,6 +179,7 @@ out.sent = sent; out.errors = errors; console.log(JSON.stringify(out));
 
     # The calendar on date fields: month and year chosen at the bottom (as in QuickBooks), then a day.
     JS = r"""
+(async () => {
 const { JSDOM, VirtualConsole } = require("jsdom");
 const errors = []; const vc = new VirtualConsole(); vc.on("jsdomError", e => errors.push(String(e.message || e)));
 const dom = new JSDOM(require("fs").readFileSync(process.argv[2], "utf8"), { runScripts: "dangerously", virtualConsole: vc, pretendToBeVisual: true });
@@ -188,16 +189,28 @@ inp.value = "2026-03-15";
 inp.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true }));
 const box = d.querySelector(".dp");
 out.open = !!box; out.title = box && box.querySelector(".dp-h b").textContent;
-out.years = box && [...box.querySelectorAll(".dp-y option")].map(o => +o.value);
-const y = box.querySelector(".dp-y"); y.value = "2019"; y.dispatchEvent(new w.Event("change", { bubbles: true }));
-const mo = d.querySelector(".dp-m"); mo.value = "6"; mo.dispatchEvent(new w.Event("change", { bubbles: true }));
-out.after = d.querySelector(".dp-h b").textContent;
-d.querySelector('.dp-g button[data-v="2019-07-04"]').click();
-out.value = inp.value; out.changed = changed; out.closed = !d.querySelector(".dp");
+const yrs = () => [...d.querySelectorAll(".dp-yr")].map(b => +b.textContent);
+const q = sel => d.querySelector(sel);
+out.years = yrs();
+q('[data-w="1"]').click(); out.yearsFwd = yrs();
+q('[data-w="-1"]').click(); q('[data-w="-1"]').click(); q('[data-w="-1"]').click(); out.yearsBack = yrs();
+q('[data-yr="2023"]').click(); out.pickedYear = q(".dp-h b").textContent;
+q('[data-y="1"]').click(); out.nextYear = q(".dp-h b").textContent;
+q('[data-n="1"]').click(); out.nextMonth = q(".dp-h b").textContent;
+// hold > : the list of months
+q('[data-n="1"]').dispatchEvent(new w.Event("pointerdown", { bubbles: true }));
+await new Promise(r => setTimeout(r, 600));
+out.monthList = [...d.querySelectorAll(".dp-ms button")].map(b => b.textContent);
+q('[data-n="1"]').dispatchEvent(new w.MouseEvent("click", { bubbles: true }));   // the click ending the hold
+out.stillList = !!q(".dp-ms");
+q('.dp-ms [data-m="6"]').click(); out.after = q(".dp-h b").textContent;
+q('.dp-g button[data-v="2024-07-04"]').click();
+out.value = inp.value; out.changed = changed; out.closed = !q(".dp");
 inp.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true }));
 d.body.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
-out.outside = !d.querySelector(".dp");
+out.outside = !q(".dp");
 out.errors = errors; console.log(JSON.stringify(out));
+})();
 """
     f = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8"); f.write(html); f.close()
     g = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=H.HERE, encoding="utf-8"); g.write(JS); g.close()
@@ -210,10 +223,14 @@ out.errors = errors; console.log(JSON.stringify(out));
     o = json.loads([l for l in res.stdout.splitlines() if l.startswith("{")][-1]) if "{" in res.stdout else {}
     print("   ", o)
     check("calendar: opens on the field's date", o.get("open") and o.get("title") == "March 2026")
-    check("…with a year list at the bottom, several years back", 2011 in (o.get("years") or []) and 2026 in (o.get("years") or []))
-    check("…choosing a year and month there moves the calendar", o.get("after") == "July 2019")
+    check("…three years at the bottom, this one in the middle", o.get("years") == [2025, 2026, 2027])
+    check("…> moves them on a year, < back", o.get("yearsFwd") == [2026, 2027, 2028] and o.get("yearsBack") == [2023, 2024, 2025])
+    check("…picking one goes to that year", o.get("pickedYear") == "March 2023")
+    check("…» a year on, › a month on", o.get("nextYear") == "March 2024" and o.get("nextMonth") == "April 2024")
+    check("…holding › lists the months to pick from", len(o.get("monthList") or []) == 12 and o.get("stillList")
+          and o.get("after") == "July 2024")
     check("…a day fills the field (and tells the page) and closes it",
-          o.get("value") == "2019-07-04" and o.get("changed") == 1 and o.get("closed"))
+          o.get("value") == "2024-07-04" and o.get("changed") == 1 and o.get("closed"))
     check("…a click elsewhere closes it", o.get("outside"))
     check("calendar: no script errors", o.get("errors") == [])
 

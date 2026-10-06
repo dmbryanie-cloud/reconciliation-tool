@@ -8,6 +8,7 @@ import itertools
 import time
 import re
 import uuid
+import pickle
 import psycopg2
 from collections import Counter
 from difflib import SequenceMatcher
@@ -1333,6 +1334,10 @@ try:
                     posted_date date NOT NULL, PRIMARY KEY (account_id, source_txn_id, posted_date));""")
     # How far QuickBooks itself is reconciled in an open statement's period (its latest entry marked R),
     # read on each sync: bank lines up to then are already in QuickBooks, so they're never offered to record.
+    # A statement read but not saved, waiting for "Replace the open reconciliation?" (the rows as read,
+    # never the file or its password). One per account; a new upload or an answer clears it.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS pending_upload (account text PRIMARY KEY, data bytea NOT NULL,
+                    question text NOT NULL, by_name text, created_at timestamptz NOT NULL DEFAULT now());""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_rec_point (account_id uuid PRIMARY KEY, as_of date,
                     checked_at timestamptz NOT NULL DEFAULT now());""")
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
@@ -2407,46 +2412,56 @@ details.how>div{display:block;margin:6px 0 4px;padding:9px 12px;border-radius:6p
    month and year pickers at the bottom). Typing a date still works as before. */
 input[type=date]{cursor:pointer}
 input[type=date]::-webkit-calendar-picker-indicator{display:none}
-.dp{position:fixed;z-index:1000;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 28px rgba(16,24,40,.18);padding:10px;width:258px;font-size:13px;color:var(--ink)}
-.dp-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
-.dp-h b{font-weight:600}
-.dp-h button,.dp-f button{border:1px solid var(--line);background:var(--panel);border-radius:6px;cursor:pointer;color:var(--ink);font:inherit}
-.dp-h button{width:28px;height:26px}
+.dp{position:fixed;z-index:1000;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 28px rgba(16,24,40,.18);padding:10px;width:258px;font-size:13px;color:var(--ink);user-select:none;-webkit-user-select:none}
+.dp-h{display:flex;align-items:center;gap:4px;margin-bottom:6px}
+.dp-h b{flex:1;text-align:center;font-weight:600}
+.dp button{font:inherit;color:var(--ink);cursor:pointer}
+.dp-h button,.dp-f .dp-w{border:1px solid var(--line);background:var(--panel);border-radius:6px;width:28px;height:26px;padding:0;touch-action:none}
 .dp-g{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
 .dp-g span{font-size:11px;color:var(--faint);padding:3px 0}
-.dp-g button{border:0;background:none;border-radius:6px;padding:6px 0;cursor:pointer;color:var(--ink);font:inherit;font-variant-numeric:tabular-nums}
-.dp-g button:hover:not(:disabled){background:var(--accent-soft)}
+.dp-g button,.dp-ms button,.dp-f .dp-yr{border:0;background:none;border-radius:6px;padding:6px 0;font-variant-numeric:tabular-nums}
+.dp-g button:hover:not(:disabled),.dp-ms button:hover,.dp-f .dp-yr:hover{background:var(--accent-soft)}
 .dp-g button.o{color:var(--faint)}
 .dp-g button.t{box-shadow:inset 0 0 0 1px var(--accent)}
-.dp-g button.s{background:var(--accent);color:#fff}
+.dp-g button.s,.dp-ms button.s,.dp-f .dp-yr.s{background:var(--accent);color:#fff}
 .dp-g button:disabled{color:var(--line);cursor:default}
-.dp-f{display:flex;gap:6px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)}
-.dp-f select{border:1px solid var(--line);border-radius:6px;padding:4px;font:inherit;background:var(--panel);color:var(--ink)}
-.dp-f .dp-y{width:76px}.dp-f .dp-m{flex:1}
-.dp-f button{padding:4px 8px;font-size:12px}
+.dp-ms{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px 0}
+.dp-ms button{padding:12px 0}
+.dp-f{display:flex;gap:4px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)}
+.dp-f .dp-yr{flex:1}
 </style>
 <script>
 (function(){
 var MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
-var box=null,inp=null,y=0,m=0;
+var box=null,inp=null,y=0,m=0,yw=0,months=false,held=null,heldFired=false;
 function iso(d){return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2)}
 function parse(v){var a=/^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(v||'');return a?new Date(+a[1],a[2]-1,+a[3]):null}
-function close(){if(box){box.remove();box=null;inp=null}}
+function close(){if(box){box.remove();box=null;inp=null}clearTimeout(held)}
 function set(v){inp.value=v;inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));var i=inp;close();i.focus()}
+function go(dm){m+=dm;while(m<0){m+=12;y--}while(m>11){m-=12;y++}if(y<yw)yw=y;if(y>yw+2)yw=y-2}
 function draw(){
   var lo=parse(inp.min),hi=parse(inp.max),sel=inp.value,today=iso(new Date());
-  var first=new Date(y,m,1),start=new Date(y,m,1-first.getDay());
-  var h='<div class=dp-h><button type=button data-n=-1 aria-label="Previous month">&lsaquo;</button><b>'+MN[m]+' '+y+'</b><button type=button data-n=1 aria-label="Next month">&rsaquo;</button></div><div class=dp-g>';
-  ['Su','Mo','Tu','We','Th','Fr','Sa'].forEach(function(w){h+='<span>'+w+'</span>'});
-  for(var i=0;i<42;i++){var d=new Date(start.getFullYear(),start.getMonth(),start.getDate()+i),v=iso(d);
-    var off=(lo&&d<lo)||(hi&&d>hi);
-    h+='<button type=button data-v="'+v+'" class="'+(d.getMonth()!==m?'o ':'')+(v===today?'t ':'')+(v===sel?'s':'')+'"'+(off?' disabled':'')+'>'+d.getDate()+'</button>'}
-  var ny=new Date().getFullYear(),y0=Math.min(lo?lo.getFullYear():ny-15,y),y1=Math.max(hi?hi.getFullYear():ny+5,y);
-  h+='</div><div class=dp-f><select class=dp-m aria-label="Month">';
-  MN.forEach(function(n,k){h+='<option value='+k+(k===m?' selected':'')+'>'+n+'</option>'});
-  h+='</select><select class=dp-y aria-label="Year">';
-  for(var k=y1;k>=y0;k--)h+='<option'+(k===y?' selected':'')+'>'+k+'</option>';
-  h+='</select><button type=button data-today>Today</button>'+(inp.required?'':'<button type=button data-clear>Clear</button>')+'</div>';
+  var h='<div class=dp-h><button type=button data-y=-1 title="Back a year" aria-label="Previous year">&laquo;</button>'+
+    '<button type=button data-n=-1 title="Back a month (hold to pick a month)" aria-label="Previous month">&lsaquo;</button>'+
+    '<b>'+MN[m]+' '+y+'</b>'+
+    '<button type=button data-n=1 title="Forward a month (hold to pick a month)" aria-label="Next month">&rsaquo;</button>'+
+    '<button type=button data-y=1 title="Forward a year" aria-label="Next year">&raquo;</button></div>';
+  if(months){
+    h+='<div class=dp-ms role=listbox aria-label="Choose a month">';
+    MN.forEach(function(n,k){h+='<button type=button data-m='+k+(k===m?' class=s':'')+'>'+n.slice(0,3)+'</button>'});
+    h+='</div>';
+  }else{
+    var first=new Date(y,m,1),start=new Date(y,m,1-first.getDay());
+    h+='<div class=dp-g>';
+    ['Su','Mo','Tu','We','Th','Fr','Sa'].forEach(function(w){h+='<span>'+w+'</span>'});
+    for(var i=0;i<42;i++){var d=new Date(start.getFullYear(),start.getMonth(),start.getDate()+i),v=iso(d);
+      var off=(lo&&d<lo)||(hi&&d>hi);
+      h+='<button type=button data-v="'+v+'" class="'+(d.getMonth()!==m?'o ':'')+(v===today?'t ':'')+(v===sel?'s':'')+'"'+(off?' disabled':'')+'>'+d.getDate()+'</button>'}
+    h+='</div>';
+  }
+  h+='<div class=dp-f><button type=button class=dp-w data-w=-1 aria-label="Earlier years">&lsaquo;</button>';
+  for(var k=yw;k<yw+3;k++)h+='<button type=button class="dp-yr'+(k===y?' s':'')+'" data-yr='+k+'>'+k+'</button>';
+  h+='<button type=button class=dp-w data-w=1 aria-label="Later years">&rsaquo;</button></div>';
   box.innerHTML=h;
 }
 function place(){var r=inp.getBoundingClientRect(),w=box.offsetWidth,hh=box.offsetHeight;
@@ -2454,18 +2469,26 @@ function place(){var r=inp.getBoundingClientRect(),w=box.offsetWidth,hh=box.offs
   if(top+hh>window.innerHeight-8&&r.top-hh-4>8)top=r.top-hh-4;
   box.style.left=left+'px';box.style.top=top+'px'}
 function open(el){
-  if(inp===el)return;close();inp=el;var d=parse(el.value)||parse(el.min&&new Date()<parse(el.min)?el.min:'')||new Date();
-  y=d.getFullYear();m=d.getMonth();
+  if(inp===el)return;close();inp=el;months=false;
+  var d=parse(el.value)||(el.min&&new Date()<parse(el.min)?parse(el.min):null)||new Date();
+  y=d.getFullYear();m=d.getMonth();yw=y-1;
   box=document.createElement('div');box.className='dp';box.setAttribute('role','dialog');box.setAttribute('aria-label','Choose a date');
-  (el.closest('dialog')||document.body).appendChild(box);draw();place();
-  box.addEventListener('mousedown',function(e){if(e.target.tagName!=='SELECT')e.preventDefault()});
-  box.addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;
-    if(b.dataset.n){m+=+b.dataset.n;if(m<0){m=11;y--}if(m>11){m=0;y++}draw();place()}
-    else if(b.dataset.v)set(b.dataset.v);
-    else if(b.hasAttribute('data-today'))set(iso(new Date()));
-    else if(b.hasAttribute('data-clear'))set('')});
-  box.addEventListener('change',function(e){if(e.target.classList.contains('dp-m'))m=+e.target.value;
-    if(e.target.classList.contains('dp-y'))y=+e.target.value;draw();place()});
+  document.body.appendChild(box);draw();place();
+  box.addEventListener('mousedown',function(e){e.preventDefault()});
+  // Holding < or > opens the list of months to pick one.
+  box.addEventListener('pointerdown',function(e){var b=e.target.closest&&e.target.closest('[data-n]');if(!b)return;
+    heldFired=false;clearTimeout(held);held=setTimeout(function(){heldFired=true;months=true;draw();place()},450)});
+  ['pointerup','pointerleave','pointercancel'].forEach(function(t){box.addEventListener(t,function(){clearTimeout(held)})});
+  box.addEventListener('contextmenu',function(e){if(e.target.closest('[data-n]'))e.preventDefault()});
+  box.addEventListener('click',function(e){e.stopPropagation();   // a redraw detaches the target: never 'outside'
+    var b=e.target.closest('button');if(!b)return;
+    if(b.dataset.n){if(heldFired){heldFired=false;return}months=false;go(+b.dataset.n)}
+    else if(b.dataset.y){y+=+b.dataset.y;if(y<yw)yw=y;if(y>yw+2)yw=y-2}
+    else if(b.dataset.m){m=+b.dataset.m;months=false}
+    else if(b.dataset.w){yw+=+b.dataset.w}
+    else if(b.dataset.yr){y=+b.dataset.yr}
+    else if(b.dataset.v){set(b.dataset.v);return}
+    draw();place()});
 }
 document.addEventListener('click',function(e){
   var el=e.target.closest&&e.target.closest('input[type=date]');
@@ -3733,7 +3756,7 @@ def require_login():
 
 # Which tick each action needs (anything not listed: any signed-in user).
 PERM_BY_ENDPOINT = {
-    "upload": "upload", "upload_status": "upload", "qbo_start": "users", "import_books": "upload", "balances": "upload",
+    "upload": "upload", "upload_status": "upload", "upload_replace": "upload", "qbo_start": "users", "import_books": "upload", "balances": "upload",
     "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
@@ -4061,6 +4084,11 @@ PDF_MAX_PAGES = 300
 
 
 class PdfPasswordError(ValueError):
+    pass
+
+
+class ReplaceNeeded(ValueError):
+    """An upload would replace an open reconciliation that has work in it: the user is asked first."""
     pass
 
 
@@ -4654,12 +4682,10 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
             cur.close(); conn.close()
             dmy = lambda d: d.strftime("%d/%m/%Y")
             periods = "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in overlap)
-            raise ValueError(f"Not uploaded: these dates ({dmy(p_start)} to {dmy(p_end)}) overlap the open reconciliation "
-                             f"for {periods}, which has work in it (matches confirmed or made by hand, lines recorded or "
-                             f"ignored). Only one reconciliation per period is kept, so uploading would replace it and that "
-                             f"work would have to be redone (what was recorded stays in QuickBooks). To replace it, tick "
-                             f"\"Replace the open reconciliation\" and upload again; or choose dates after "
-                             f"{dmy(max(o[2] for o in overlap))}. Nothing was changed.")
+            raise ReplaceNeeded(f"This statement ({dmy(p_start)} to {dmy(p_end)}) overlaps the open reconciliation for "
+                                f"{periods}, which has work in it: matches confirmed or made by hand, lines recorded or "
+                                f"ignored. Only one reconciliation per period is kept, so replacing it means redoing that "
+                                f"work (anything recorded stays in QuickBooks).")
     if overlap:
         delete_statements(cur, [o[0] for o in overlap])
         if has_request_context():
@@ -5530,6 +5556,11 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
   else if(dirty){b.innerHTML='The statement is ready. <a href="" onclick="location.reload();return false">Reload to see it</a>'}
   else location.reload()}).catch(function(){setTimeout(tick,6000)})}
 setTimeout(tick,3000)})();</script>{% endif %}
+{% if pending %}<div class="recnote warn" id=replaceq role=alertdialog aria-labelledby=replaceq-t style="margin:0 0 14px">
+<b id=replaceq-t>Replace the open reconciliation?</b> {{ pending.question }}{% if pending.by %} (uploaded by {{ pending.by }}){% endif %}
+<form method=post action="{{ url_for('upload_replace', name=name) }}" style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+<button type=submit name=answer value=replace class=btn data-busy="Replacing...">Replace it with the new statement</button>
+<button type=submit name=answer value=keep class=btn-sm>Keep the open reconciliation</button></form></div>{% endif %}
 {% if detail_msg %}{% if detail_ok %}<div id=flash role=status class=ok data-stay><b>Statement uploaded.</b> {{ detail_msg }}</div>{% else %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}{% endif %}
 {% if not has_results %}<div class="panel empty"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M12 11v6"/><path d="m9.5 13.5 2.5-2.5 2.5 2.5"/></svg>
 <div><b>No statement yet.</b> Upload this account's bank statement (PDF, CSV or OFX) to start the reconciliation.</div>
@@ -5546,7 +5577,6 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
 <div class=fld><label for=up-pw>PDF password</label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}><small>Used once to open the file; never stored.</small></div>
-{% if has_results and not signed_off %}<label class=hint style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 10px"><input type=checkbox name=replace value=1> <span>Replace the open reconciliation ({{ p_start.strftime('%d/%m/%Y') }} to {{ p_end.strftime('%d/%m/%Y') }}) if the dates overlap. Its confirmed and hand-made matches, Ignores and record choices are lost; entries recorded in QuickBooks stay there. Without this, an upload that would replace work is refused.</span></label>{% endif %}
 <details class=how><summary>How this works</summary><div>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</div></details>
 <div class=help style="margin:0">{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}</div>
 </div>
@@ -7411,7 +7441,8 @@ def detail(name):
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
-                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None, **d)
+                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None,
+                                  pending=pending_upload(name) if can("upload") else None, **d)
 
 
 def _form_amount(field):
@@ -7485,33 +7516,11 @@ def upload(name):
     except ValueError as e:
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
-    args = dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password, opening=opening,
-                closing=closing, p_start=_form_date("period_start"), p_end=_form_date("period_end"),
-                replace_ok=bool(request.form.get("replace")),
-                user={k: session.get(k) for k in ("name", "username", "is_admin")})
-    if not SYNC_IN_BACKGROUND:                      # the tests run it inline
-        ok, msg = _upload_run(**args)
-        session["detail_msg"] = msg
-        if ok:
-            session["detail_ok"] = name
-        return redirect(url_for("detail", name=name))
-    job = {"state": "running", "by": session.get("name"), "started": time.time(), "beat": time.time(),
-           "step": "Starting", "file": f.filename}
-    set_config(_upload_key(name), json.dumps(job))
-
-    def progress(step):
-        job.update(step=step, beat=time.time())
-        set_config(_upload_key(name), json.dumps(job))
-
-    def run():
-        try:
-            ok, msg = _upload_run(progress=progress, **args)
-            job.update(state="done" if ok else "failed", msg=msg, finished=time.time())
-        except Exception as e:
-            job.update(state="failed", finished=time.time(), msg=f"The statement couldn't be processed: {e}")
-        set_config(_upload_key(name), json.dumps(job))
-
-    threading.Thread(target=run, daemon=True, name="upload").start()
+    pending_upload(name, take=True)        # a new upload replaces any statement still waiting for an answer
+    _start_upload(name, dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password,
+                             opening=opening, closing=closing, p_start=_form_date("period_start"),
+                             p_end=_form_date("period_end"), replace_ok=bool(request.form.get("replace")),
+                             user={k: session.get(k) for k in ("name", "username", "is_admin")}))
     return redirect(url_for("detail", name=name))
 
 
@@ -7571,6 +7580,81 @@ def qbo_start(name):
     return redirect(url_for("detail", name=name))
 
 
+def _keep_pending(name, rows, fmt, opening, closing, p_start, p_end, question, user):
+    blob = pickle.dumps({"rows": rows, "fmt": fmt, "opening": opening, "closing": closing,
+                         "p_start": p_start, "p_end": p_end})
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""INSERT INTO pending_upload (account, data, question, by_name) VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (account) DO UPDATE SET data=EXCLUDED.data, question=EXCLUDED.question,
+                     by_name=EXCLUDED.by_name, created_at=now();""",
+                (name, psycopg2.Binary(blob), question, (user or {}).get("name")))
+    conn.commit(); cur.close(); conn.close()
+
+
+def pending_upload(name, take=False):
+    """The statement waiting for "Replace the open reconciliation?" on this account: {question, by, at,
+    data}, or None. Kept a day. take: remove it as it's read."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(("DELETE FROM pending_upload WHERE account=%s RETURNING question, by_name, created_at, data;" if take else
+                 "SELECT question, by_name, created_at, data FROM pending_upload WHERE account=%s;"), (name,))
+    r = cur.fetchone()
+    conn.commit(); cur.close(); conn.close()
+    if not r or r[2] < datetime.now(timezone.utc) - timedelta(days=1):
+        return None
+    return {"question": r[0], "by": r[1], "at": r[2], "data": bytes(r[3])}
+
+
+def _start_upload(name, args):
+    """Run an upload: inline under the tests, otherwise as a background job the page follows."""
+    if not SYNC_IN_BACKGROUND:                      # the tests run it inline
+        ok, msg = _upload_run(**args)
+        session["detail_msg"] = msg
+        if ok:
+            session["detail_ok"] = name
+        return
+    job = {"state": "running", "by": session.get("name"), "started": time.time(), "beat": time.time(),
+           "step": "Starting", "file": args.get("filename")}
+    set_config(_upload_key(name), json.dumps(job))
+
+    def progress(step):
+        job.update(step=step, beat=time.time())
+        set_config(_upload_key(name), json.dumps(job))
+
+    def run():
+        try:
+            ok, msg = _upload_run(progress=progress, **args)
+            job.update(state="done" if ok else "failed", msg=msg, finished=time.time())
+        except Exception as e:
+            job.update(state="failed", finished=time.time(), msg=f"The statement couldn't be processed: {e}")
+        set_config(_upload_key(name), json.dumps(job))
+
+    threading.Thread(target=run, daemon=True, name="upload").start()
+
+
+@app.route("/account/<name>/upload_replace", methods=["POST"])
+def upload_replace(name):
+    """The answer to "Replace the open reconciliation?": replace it with the statement already read, or
+    keep it (the statement is dropped). Nothing is uploaded again."""
+    session.pop("detail_ok", None)
+    job = upload_job(name)
+    if job and job.get("state") == "running":
+        session["detail_msg"] = "A statement for this account is still being read and matched. Wait for it to finish."
+        return redirect(url_for("detail", name=name))
+    p = pending_upload(name, take=True)
+    if not p:
+        session["detail_msg"] = "That statement is no longer waiting (it was answered, or it's over a day old). Upload it again."
+        return redirect(url_for("detail", name=name))
+    if request.form.get("answer") != "replace":
+        session["detail_msg"] = "Kept the open reconciliation. The new statement wasn't uploaded."
+        return redirect(url_for("detail", name=name))
+    kept = pickle.loads(p["data"])
+    _start_upload(name, dict(name=name, data=b"", filename=None, is_pdf=kept["fmt"] == "pdf", password=None,
+                             opening=kept["opening"], closing=kept["closing"], p_start=kept["p_start"],
+                             p_end=kept["p_end"], replace_ok=True, parsed=(kept["rows"], kept["fmt"]),
+                             user={k: session.get(k) for k in ("name", "username", "is_admin")}))
+    return redirect(url_for("detail", name=name))
+
+
 @app.route("/account/<name>/upload_status")
 def upload_status(name):
     job = upload_job(name) or {}
@@ -7596,32 +7680,39 @@ def pdf_check(data, password=None):
 
 
 def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None,
-                replace_ok=True):
+                replace_ok=False, parsed=None):
     """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
-    context (the background job has none), as the user who uploaded it. Returns (ok, message)."""
+    context (the background job has none), as the user who uploaded it. Returns (ok, message).
+    parsed: (rows, format) already read -- a statement kept while the user was asked whether to replace."""
     with app.test_request_context():
         session.update({k: v for k, v in user.items() if v is not None})
         step = progress or (lambda m: None)
         try:
-            checked = ""
-            if is_pdf:
+            if parsed:
+                rows, fmt = parsed
+            elif is_pdf:
                 step("Reading the PDF")
                 # A typed opening is the period's; it's only the file's first balance when no start is chosen.
-                pdf_rows = parse_pdf(data, password, opening if not p_start else None, progress=step)
-                wrong = account_mismatch(name, pdf_rows.account_number)
+                rows, fmt = parse_pdf(data, password, opening if not p_start else None, progress=step), "pdf"
+                wrong = account_mismatch(name, rows.account_number)
                 if wrong:
                     return False, wrong
-                step(f"Saving {len(pdf_rows)} statement lines")
-                sid = _save_statement(pdf_rows, name, "pdf", opening, closing, p_start, p_end, replace_ok)
-                n, skipped = getattr(g, "kept", len(pdf_rows)), pdf_rows.skipped
-                checked = (" Read from the PDF; every running balance checks out." if pdf_rows.pdf_checked else
-                           " Read from the PDF. It has no running balance to check against, so compare the totals with "
-                           "the statement before signing off.")
             else:
                 step("Reading the statement")
-                sid, n, skipped = ingest_file(data.decode("utf-8-sig", errors="ignore"), filename, name, opening, closing,
-                                              p_start, p_end, replace_ok)
-                n = getattr(g, "kept", n)
+                text = data.decode("utf-8-sig", errors="ignore")
+                fmt = "ofx" if (filename or "").lower().endswith(".ofx") or "<OFX>" in text[:3000].upper() else "csv"
+                rows = parse_ofx(text) if fmt == "ofx" else parse_csv(text)
+            step(f"Saving {len(rows)} statement lines")
+            try:
+                sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
+            except ReplaceNeeded as e:
+                _keep_pending(name, rows, fmt, opening, closing, p_start, p_end, str(e), user)
+                return False, ""
+            n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
+            checked = "" if fmt != "pdf" else (
+                " Read from the PDF; every running balance checks out." if rows.pdf_checked else
+                " Read from the PDF. It has no running balance to check against, so compare the totals with "
+                "the statement before signing off.")
             step(f"Matching {n} lines against your books")
             note = run_matcher(sid)
         except ValueError as e:
