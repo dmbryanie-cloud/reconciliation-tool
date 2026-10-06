@@ -4194,10 +4194,17 @@ def _pdf_header(line):
             col = None
         if t in ("reference", "ref", "references") and i > 0:
             col = "_ref"        # not money: a transaction reference printed after the balance (KCB)
+        if t in ("cheque", "chq", "check"):
+            col = "_chq"        # not money: a cheque number ("117", or "0" when none) beside the debits (DTB)
         if col and col not in cols:
             x0 = line[i - 1]["x0"] if t in ("out", "in") and prev in ("money", "paid") else w["x0"]
             cols[col] = (x0, w["x1"])
     if "balance" in cols and len(cols) == 1:
+        return None
+    # "DEPOSIT TXN CHG" wrapped under a DTB description isn't a header: without the word Date, a header
+    # names at least two money columns.
+    if not any(t == "date" or t.endswith("date") for t in texts) and \
+            sum(1 for k in cols if not k.startswith("_")) < 2:
         return None
     return cols if cols and ("debit" in cols or "credit" in cols or "amount" in cols) else None
 
@@ -4207,12 +4214,15 @@ def _pdf_col(w, cols):
     c = (w["x0"] + w["x1"]) / 2
     best = None
     for name, (x0, x1) in cols.items():
-        if name.startswith("_"):
-            continue
         dist = min(abs(c - (x0 + x1) / 2), abs(w["x1"] - x1))
         if best is None or dist < best[0]:
             best = (dist, name)
-    return best[1] if best and best[0] <= 60 else None
+    # How near counts scales with the page: some banks (DTB) draw it at three times the usual size.
+    mids = sorted((x0 + x1) / 2 for x0, x1 in cols.values())
+    near = max([60] + [0.6 * min(b - a for a, b in zip(mids, mids[1:]))] if len(mids) > 1 else [60])
+    if not best or best[0] > near or best[1].startswith("_"):   # a reference or cheque number isn't money
+        return None
+    return best[1]
 
 
 def _pdf_money_tail(words, cols):
@@ -4227,6 +4237,8 @@ def _pdf_money_tail(words, cols):
         # A bare number ("500") is money only when it stands apart from the text before it, under a
         # money column -- not "INV 2231" at the end of a description.
         gap = words[i - 1]["x0"] - words[i - 2]["x1"] if i >= 2 else 99
+        if t in ("-", "–", "—") and cols and _pdf_col(words[i - 1], cols):
+            i -= 1; continue        # an empty money cell printed as a dash (DTB): nothing in that column
         if _MONEY_STRICT.match(t) or (cols and re.match(r"^\d+$", t) and gap > 12 and _pdf_col(words[i - 1], cols)):
             money.insert(0, words[i - 1]); i -= 1; continue
         break
@@ -4345,13 +4357,19 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 while words and words[-1]["x0"] >= cols["_ref"][0] - 15 and not _MONEY_STRICT.match(words[-1]["text"]):
                     words = words[:-1]
             body, money = _pdf_money_tail(words, cols)
+            if d and cols and "_chq" in cols:      # the cheque number ("0", "-") isn't part of the description
+                body = [w for w in body if w["x1"] < cols["_chq"][0] - 10]
             if d:
                 d2, k2 = _pdf_date(body, dayfirst)       # a value date next to the transaction date
                 if d2:
                     body = body[k2:]
             desc = " ".join(w["text"] for w in body).strip()
             if money and (_PDF_OPENING.search(text) or _PDF_CLOSING.search(text)):
-                v = parse_amount(money[-1]["text"])
+                # The figure after the words, not the line's last one: "Opening Balance as at 01-Feb-2025 :
+                # 27,145,965.00 Available balance : 18,615,913.00" (DTB) opens at 27,145,965.00.
+                mm = (_PDF_OPENING.search(text) or _PDF_CLOSING.search(text))
+                after = re.search(r"\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?(?:CR|DR)?(?=\s|$)", text[mm.end():], re.I)
+                v = parse_amount(after.group(0) if after else money[-1]["text"])
                 if _PDF_OPENING.search(text):
                     opening = v if opening is None else opening
                 else:
@@ -4481,7 +4499,7 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
 
     for r in raw:
         if r["amount"] != 0:
-            rows.append({"date": r["date"], "amount": r["amount"], "desc": r["desc"],
+            rows.append({"date": r["date"], "amount": r["amount"], "desc": re.sub(r"(?:\s+[-–])+$", "", r["desc"]),
                          **({"balance": r["balance"]} if r["balance"] is not None else {})})
     run_o, run_c = _balances_from_running(rows) if have_bal and len(rows) >= 2 else (None, None)
     if have_bal and len(rows) == 1:

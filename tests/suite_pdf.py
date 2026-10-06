@@ -14,7 +14,8 @@ from pdfgen import make_pdf, encrypt
 ACCT = "00000000-0000-0000-0000-0000000000a1"
 ACCT2 = "00000000-0000-0000-0000-0000000000a2"
 A, c = H.setup(H.account_sql((ACCT, "35", "Stanbic", "bank"), (ACCT2, "36", "DFCU USD 12477", "bank"),
-                              ("00000000-0000-0000-0000-0000000000a3", "37", "KCB 09708", "bank")))
+                              ("00000000-0000-0000-0000-0000000000a3", "37", "KCB 09708", "bank"),
+                              ("00000000-0000-0000-0000-0000000000a4", "38", "DTB UGX 76001", "bank")))
 cur = c.cursor()
 T = H.Checker()
 check = T.check
@@ -305,4 +306,35 @@ check("…opening from BALANCE B/FWD", q("""SELECT opening_balance FROM statemen
 check("…'Account: 2321509708' read as its account number",
       A.parse_pdf(KCB).account_number == "2321509708")
 
+# ---- DTB layout: "-" in empty Debits/Credits cells, a Cheque Number column ("0", "117"), wrapped transaction
+# types such as "DEPOSIT TXN CHG" (not a header), and a summary line with two figures after "Opening Balance".
+TQ, TD, TC, TB = 350, 420, 490, 585          # right edges: Cheque Number, Debits, Credits, Running Balance
+def trow(y, d, typ, det, chq, deb, cre, bal, more=()):
+    it = [(15, y, d), (75, y, d), (135, y, typ), (225, y, det), (TQ, y, chq, "r"), (TD, y, deb, "r"), (TC, y, cre, "r"),
+          (TB, y, bal, "r")]
+    return it + [(135, y + 11 * (i + 1), t) for i, t in enumerate(more)]
+DTB = make_pdf([[(20, 30, "STATEMENT OF ACCOUNT"), (20, 45, "Account Number : 0096476001 - UGX"),
+    (20, 60, "Statement Period : 01-Feb-2025 To 16-Apr-2025"),
+    (15, 90, "Transaction"), (75, 90, "Value Date"), (135, 90, "Type"), (225, 90, "Details"),
+    (TQ, 90, "Cheque", "r"), (TD, 90, "Debits", "r"), (TC, 90, "Credits", "r"), (TB, 90, "Running Balance", "r"),
+    (15, 100, "Date"), (TQ, 100, "Number", "r"),
+    *trow(120, "01-Feb-2025", "AGENT CASH", "S PATRICK", "-", "-", "5,890,000.00", "33,035,965.00", ("DEPOSIT",)),
+    *trow(150, "01-Feb-2025", "AGENT BANKING", "S PATRICK", "-", "2,400.00", "-", "33,033,565.00",
+          ("DEPOSIT TXN CHG",)),
+    *trow(180, "05-Feb-2025", "EFT CHARGE", "INWARD EFT", "0", "3,500.00", "-", "33,030,065.00"),
+    *trow(200, "28-Mar-2025", "CASH WDL", "Cheque WDL", "117", "30,000,000.00", "-", "3,030,065.00"),
+    *trow(220, "31-Mar-2025", "CREDIT INTEREST", "-", "-", "-", "54,647.00", "3,084,712.00"),
+    (20, 250, "UGX- Opening Balance as at 01-Feb-2025 : 27,145,965.00 Available balance : 3,084,712.00"),
+    (20, 262, "UGX- Closing Balance as at 16-Apr-2025 : 3,084,712.00 Current balance : 3,084,712.00")]])
+r, page = upload(DTB, acct="DTB UGX 76001")
+got = q("""SELECT sl.posted_date::text, sl.amount, sl.description FROM statement_line sl JOIN statement s USING (statement_id)
+           JOIN account a USING (account_id) WHERE a.name='DTB UGX 76001' ORDER BY sl.posted_date, sl.amount DESC""")
+check("DTB: every line read, dashes taken as empty cells", [g[:2] for g in got] == [
+      ("2025-02-01", D("5890000.00")), ("2025-02-01", D("-2400.00")), ("2025-02-05", D("-3500.00")),
+      ("2025-03-28", D("-30000000.00")), ("2025-03-31", D("54647.00"))] and "every running balance checks out" in page)
+check("…the cheque number isn't an amount or part of the description",
+      got[2][2] == "EFT CHARGE INWARD EFT" and got[3][2] == "CASH WDL Cheque WDL")
+check("…'DEPOSIT TXN CHG' stays in its description", got[1][2] == "AGENT BANKING S PATRICK DEPOSIT TXN CHG")
+check("…opening is the figure after 'Opening Balance', not the line's last", q("""SELECT opening_balance FROM statement s
+      JOIN account a USING (account_id) WHERE a.name='DTB UGX 76001'""")[0][0] == D("27145965.00"))
 sys.exit(T.summary())
