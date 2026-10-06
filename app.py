@@ -1414,6 +1414,77 @@ def sync_from_quickbooks(full=False, progress=None):
     return total, detail, mode, timing
 
 
+# Improvements from the review of 06/10/2026, in order of payoff: (key, title, how, done by an app update).
+ADMIN_TODO = [
+    ("staging", "A test copy of the app",
+     "A second Render service on its own Supabase branch, to try each change before the team sees it: no more "
+     "deploys interrupting uploads or recordings, and no surprises like the 502 on adding a user.", False),
+    ("backups", "Backups you've checked",
+     "Turn on and check Supabase's daily backups (or a paid plan's point-in-time restore), and download a backup "
+     "from this page weekly. Try restoring one once.", False),
+    ("login_limit", "Limit wrong sign-ins",
+     "5 wrong passwords in 15 minutes pause that username for 15 minutes (20 from one internet address); "
+     "recovery-password sign-ins are written to the activity log.", True),
+    ("recovery_pw", "Change the recovery password",
+     "The recovery password (APP_PASSWORD in Render's Environment) signs in as an admin with no username. Change it to "
+     "a long new one, keep it somewhere safe, and change it whenever someone who knew it leaves.", False),
+    ("split_code", "Split the code into parts",
+     "app.py is one 10,000-line file. Splitting it (PDF reading, matching, QuickBooks, pages) changes nothing for "
+     "users but makes it far easier for anyone to maintain.", False),
+    ("speed", "Faster account pages",
+     "Open long statements one month at a time by default, and consider Render's Starter plan ($7/month: always on, "
+     "more processing power).", False),
+    ("email_domain", "Invitations to school addresses",
+     "Authenticate northgreen.ac.ug in Brevo (Senders, Domains → Domains → Add): the domain's administrator adds the "
+     "DNS records Brevo lists. Until then, invite to personal addresses or use Copy link.", False),
+    ("failed_records", "Look into the failed recordings",
+     "About 5% of lines sent to QuickBooks failed (67 of 1,407 by 06/10/2026). Find what they have in common.", False),
+]
+LOGIN_MAX_USER, LOGIN_MAX_IP, LOGIN_MINUTES = 5, 20, 15
+
+
+def _client_ip():
+    return ((request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0]).strip()
+
+
+def login_wait(*keys_limits):
+    """Minutes before these can try again (0: now). keys_limits: (key, how many wrong tries are allowed)."""
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        wait = 0
+        for key, limit in keys_limits:
+            cur.execute("""SELECT at FROM login_fail WHERE key=%s AND at > now() - %s * interval '1 minute'
+                           ORDER BY at DESC OFFSET %s LIMIT 1;""", (key, LOGIN_MINUTES, limit - 1))
+            r = cur.fetchone()
+            if r:
+                left = LOGIN_MINUTES * 60 - (datetime.now(timezone.utc) - r[0]).total_seconds()
+                wait = max(wait, int(left // 60) + 1)
+        cur.close(); conn.close()
+        return wait
+    except Exception:
+        return 0
+
+
+def login_failed(*keys):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        for key in keys:
+            cur.execute("INSERT INTO login_fail (key) VALUES (%s);", (key,))
+        cur.execute("DELETE FROM login_fail WHERE at < now() - interval '1 day';")
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+
+
+def login_cleared(key):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("DELETE FROM login_fail WHERE key=%s;", (key,))
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+
+
 # Make sure sign-off columns exist (runs once at startup)
 try:
     _c = get_conn(); _cur = _c.cursor()
@@ -1466,6 +1537,16 @@ try:
     # read on each sync: bank lines up to then are already in QuickBooks, so they're never offered to record.
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_rec_point (account_id uuid PRIMARY KEY, as_of date,
                     checked_at timestamptz NOT NULL DEFAULT now());""")
+    # Wrong sign-ins, to slow down guessing: a username (or an address) is paused after too many.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS login_fail (key text NOT NULL, at timestamptz NOT NULL DEFAULT now());""")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_login_fail ON login_fail (key, at);")
+    # The admins' list of improvements to make, ticked off as they're done.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS admin_todo (key text PRIMARY KEY, sort integer NOT NULL, title text NOT NULL,
+                    detail text, done_at timestamptz, done_by text);""")
+    for _i, (_k, _t, _d, _done) in enumerate(ADMIN_TODO):
+        _cur.execute("""INSERT INTO admin_todo (key, sort, title, detail, done_at, done_by) VALUES (%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (key) DO UPDATE SET sort=EXCLUDED.sort, title=EXCLUDED.title, detail=EXCLUDED.detail;""",
+                     (_k, _i, _t, _d, datetime.now(timezone.utc) if _done else None, "ReconBook update" if _done else None))
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
     # from posting the same line twice to the company file.
     _cur.execute("""CREATE TABLE IF NOT EXISTS writeback_log (line_id uuid PRIMARY KEY, status text NOT NULL,
@@ -3368,6 +3449,12 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <div style="padding:12px 14px" class=muted>A copy of every reconciliation, statement, match and user, as one file.</div>
 <div class=ptools><a href="{{ url_for('backup') }}" class=btn-sm>Download a backup now</a></div>
 </div>
+<div class="panel wide" id=todo>
+<div class=panel-h><h2>Improvements to do <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>From the review of the app on 06/10/2026, most useful first. Tick one when it's done; untick to reopen it.</span></span></h2><span class="r faint">{{ todo|selectattr('done')|list|length }} of {{ todo|length }} done</span></div>
+{% for t in todo %}<form method=post action="{{ url_for('settings') }}" class="todo{{ ' done' if t.done else '' }}"><input type=hidden name=action value=todo><input type=hidden name=key value="{{ t.key }}"><input type=hidden name=on value="{{ '0' if t.done else '1' }}">
+<button type=submit class="tick{{ ' on' if t.done else '' }}" aria-pressed="{{ 'true' if t.done else 'false' }}" aria-label="{{ 'Reopen' if t.done else 'Mark done' }}: {{ t.title }}">{% if t.done %}&#10003;{% endif %}</button>
+<div><b>{{ loop.index }}. {{ t.title }}</b><div class=muted>{{ t.detail }}</div>{% if t.done %}<div class=faint>Done {{ t.at }}{% if t.by %} · {{ t.by }}{% endif %}</div>{% endif %}</div></form>{% endfor %}
+</div>
 <div class="panel wide">
 <div class=panel-h><h2>Problems log</h2></div>
 <div style="padding:10px 14px 0" class=muted>Pages that failed with an error, or took longer than {{ slow_s }} seconds. Newest first, last 30 days.</div>
@@ -3389,6 +3476,10 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 .opt input[type=checkbox]{width:16px;height:16px;accent-color:var(--navy)}
 details.adv{padding:8px 14px 12px;border-top:1px solid var(--line-soft)}details.adv summary{cursor:pointer;color:var(--muted);font-size:12.5px}
 .advf{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:8px}.advf .fld{flex:1;min-width:160px}
+.todo{display:flex;gap:12px;align-items:flex-start;padding:10px 14px;border-bottom:1px solid var(--line-soft);margin:0}
+.todo .muted{font-size:13px;margin-top:2px}.todo .faint{font-size:12px;margin-top:3px}.todo.done b{color:var(--muted);text-decoration:line-through}
+.todo .tick{flex:none;margin-top:2px;width:18px;height:18px;border-radius:4px;border:1.5px solid #c3c9d4;display:inline-grid;place-items:center;cursor:pointer;background:var(--panel);color:#fff;padding:0;font-size:11px;font-weight:700}
+.todo .tick.on{background:var(--navy);border-color:var(--navy)}
 @media (max-width:1000px){.setgrid{grid-template-columns:minmax(0,1fr)}.kv{grid-template-columns:minmax(0,1fr)}}</style>
 </div>""" + SHELL_END + """</body></html>"""
 
@@ -3398,6 +3489,16 @@ def settings():
     if not can("settings"):
         return "Admins only. <a href='/'>Back</a>", 403
     msg = session.pop("sync_msg", None)
+    if request.method == "POST" and request.form.get("action") == "todo":
+        on = request.form.get("on") == "1"
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""UPDATE admin_todo SET done_at=%s, done_by=%s WHERE key=%s RETURNING title;""",
+                    (datetime.now(timezone.utc) if on else None, session.get("name") if on else None, request.form.get("key")))
+        t = cur.fetchone()
+        conn.commit(); cur.close(); conn.close()
+        if t:
+            log_activity(f"{'ticked off' if on else 'reopened'} the improvement '{t[0]}'")
+        return redirect(url_for("settings") + "#todo")
     if request.method == "POST":
         keys = {"rules": ("charges_exact", "date_days", "clear_days", "group_days", "transfer_days"),
                 "signoff": ("two_person", "close_day")}.get(request.form.get("action"), ())
@@ -3435,8 +3536,11 @@ def settings():
     except Exception:
         conn.rollback()
         problems = []
+    cur.execute("SELECT key, title, detail, done_at, done_by FROM admin_todo ORDER BY sort;")
+    todo = [{"key": k, "title": t, "detail": d, "done": bool(at), "by": by,
+             "at": at.astimezone(EAT).strftime("%d/%m/%Y") if at else None} for k, t, d, at, by in cur.fetchall()]
     cur.close(); conn.close()
-    return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(),
+    return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(), todo=todo,
                                   company=get_config("company_name"), home=home, last_sync=last_sync_label(),
                                   n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES},
                                   problems=problems, slow_s=SLOW_MS // 1000)
@@ -4125,8 +4229,13 @@ def change_password():
         cur_pw = request.form.get("current", "")
         new_pw = request.form.get("new", "")
         confirm = request.form.get("confirm", "")
-        ok = bool(u and u[2] and check_password_hash(u[2], cur_pw)) or (APP_PASSWORD and cur_pw == APP_PASSWORD)
-        if not ok:
+        pkey = "pw:" + (uname or "")
+        wait = login_wait((pkey, LOGIN_MAX_USER))
+        ok = not wait and (bool(u and u[2] and check_password_hash(u[2], cur_pw)) or (APP_PASSWORD and cur_pw == APP_PASSWORD))
+        if wait:
+            error = f"Too many wrong passwords. Wait {wait} minute{'' if wait == 1 else 's'} and try again."
+        elif not ok:
+            login_failed(pkey)
             error = "Current password is incorrect."
         elif len(new_pw) < 6:
             error = "New password must be at least 6 characters."
@@ -4149,8 +4258,15 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip().lower()
         password = request.form.get("password") or ""
+        ukey, ikey = "user:" + username, "ip:" + _client_ip()
+        wait = login_wait(*(((ukey, LOGIN_MAX_USER),) if username else ()), (ikey, LOGIN_MAX_IP))
+        if wait:
+            return render_template_string(LOGIN_PAGE, company=get_config("company_name"),
+                                          error=f"Too many wrong passwords. Wait {wait} minute{'' if wait == 1 else 's'} "
+                                                f"and try again, or ask an admin."), 429
         u = get_user(username) if username else None
         if u and u[2] and check_password_hash(u[2], password):
+            login_cleared(ukey)
             row = user_row(u[0])
             if row and (not row[5] or (row[6] and row[6] < date.today())):
                 return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error="This sign-in has been switched off or has expired. Ask an admin.")
@@ -4165,7 +4281,9 @@ def login():
             session["csrf"] = secrets.token_urlsafe(32)
             session["authed"] = True; session["username"] = "admin"
             session["name"] = "Admin"; session["is_admin"] = True; session["perms"] = None; session["title"] = ""
+            log_activity(f"signed in with the recovery password (from {_client_ip() or 'an unknown address'})")
             return redirect(url_for("dashboard"))
+        login_failed(*((ukey, ikey) if username else (ikey,)))
         return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error="Incorrect username or password")
     return render_template_string(LOGIN_PAGE, company=get_config("company_name"), error=None)
 
