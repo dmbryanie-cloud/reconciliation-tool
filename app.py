@@ -1389,7 +1389,11 @@ def _similarity(a, b):
     """Two-way token overlap (Dice), counting prefix matches like SUPERMKT ~ SUPERMARKET."""
     if not a or not b:
         return 0.0
-    hits = sum(1 for x in a if any(_tok_match(x, y) for y in b)) + sum(1 for y in b if any(_tok_match(x, y) for x in a))
+    sa, sb = set(a), set(b)
+    la, lb = [y for y in sa if len(y) >= 3], [y for y in sb if len(y) >= 3]
+    def hit(x, same, longer):   # _tok_match against any of the other side, the exact case first
+        return x in same or (len(x) >= 3 and any(x.startswith(y) or y.startswith(x) for y in longer))
+    hits = sum(1 for x in a if hit(x, sb, lb)) + sum(1 for y in b if hit(y, sa, la))
     return hits / (len(a) + len(b))
 
 
@@ -1408,7 +1412,7 @@ class PostingMemory:
     def __init__(self, cur, currency=None):
         """currency: learn only from postings on accounts in this currency, so a USD bank
         charge is suggested from USD postings and a UGX one from UGX postings."""
-        self.entries, self.index = [], {}
+        self.entries, self.index, self.by_words, self._seen, self._memo = [], {}, {}, {}, {}
         ccy_ok = "(%(ccy)s::text IS NULL OR a.currency = %(ccy)s)"
         args = {"ccy": currency}
         cur.execute("""SELECT payee, category, money_out, vendor, vendor_ref FROM payee_correction
@@ -1435,26 +1439,48 @@ class PostingMemory:
         toks = _mtokens(text)
         if not toks or not cat:
             return
-        i = len(self.entries)
+        # The same wording posted the same way (a bank fee matched a thousand times) is one entry with
+        # its count: scored once per line instead of once per occurrence -- the votes come out the same.
+        key = (tier, tuple(toks), out, cat, payee, ref)
+        j = self._seen.get(key)
+        if j is not None:
+            e = self.entries[j]
+            self.entries[j] = e[:6] + (e[6] + n,) + e[7:]
+            return
+        self._seen[key] = i = len(self.entries)
         self.entries.append((tier, toks, out, cat, payee, ref, n, text))
-        for t in set(toks):
-            self.index.setdefault(t[:3], []).append(i)
+        words = tuple(toks)
+        if words not in self.by_words:
+            self.by_words[words] = []
+            for t in set(toks):
+                self.index.setdefault(t[:3], []).append(words)
+        self.by_words[words].append(i)
 
     def suggest(self, desc, money_out):
         toks = _mtokens(desc)
         if not toks:
             return None
+        key = (tuple(toks), money_out)
+        if key not in self._memo:
+            self._memo[key] = self._suggest(toks, money_out)
+        r = self._memo[key]
+        return dict(r) if r else None
+
+    def _suggest(self, toks, money_out):
         cands = set()
         for t in toks:
             cands.update(self.index.get(t[:3], ()))
-        tiers = {}
-        for i in cands:
-            tier, etoks, out, cat, payee, ref, n, text = self.entries[i]
-            if out is not None and out != money_out:
-                continue
-            sc = _similarity(toks, etoks)
+        found = []
+        for words in cands:            # each wording scored once, for all the entries that share it
+            sc = _similarity(toks, words)
             if sc >= LEARN_MIN_SCORE:
-                tiers.setdefault(tier, []).append((sc, self.entries[i]))
+                found.extend((i, sc) for i in self.by_words[words])
+        tiers = {}
+        for i, sc in sorted(found):
+            e = self.entries[i]
+            if e[2] is not None and e[2] != money_out:
+                continue
+            tiers.setdefault(e[0], []).append((sc, e))
         for tier in (1, 2, 3):
             hits = tiers.get(tier)
             if not hits:
@@ -1994,6 +2020,21 @@ def taken_elsewhere(cur, acct_uuid, line_ids):
                      AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
                                      WHERE msl.line_id=w.line_id AND m.status='confirmed');""",
                 (acct_uuid, [str(x) for x in line_ids]))
+    return {r[0] for r in cur.fetchall()}
+
+
+def deleted_in_qbo(cur, acct_uuid, line_ids):
+    """Lines logged as recorded whose QuickBooks entry has since been deleted there (the sync flagged it):
+    they will never match it, so they show as such instead of waiting for a refresh."""
+    if not line_ids:
+        return set()
+    cur.execute("""SELECT w.line_id::text FROM writeback_log w
+                   WHERE w.line_id = ANY(%s::uuid[]) AND w.status='done'
+                     AND EXISTS (SELECT 1 FROM book_txn bt WHERE bt.account_id=%s AND bt.source_txn_id=w.qbo_id
+                                 AND bt.source_txn_type=w.qbo_type AND bt.is_deleted)
+                     AND NOT EXISTS (SELECT 1 FROM book_txn bt WHERE bt.account_id=%s AND bt.source_txn_id=w.qbo_id
+                                     AND bt.source_txn_type=w.qbo_type AND NOT bt.is_deleted);""",
+                ([str(x) for x in line_ids], acct_uuid, acct_uuid))
     return {r[0] for r in cur.fetchall()}
 
 
@@ -4861,6 +4902,8 @@ def period_copies(cur, sid, upto):
                           coalesce(w.account_fqn,'')
                    FROM writeback_log w JOIN statement_line sl ON sl.line_id=w.line_id
                    WHERE sl.statement_id=%s AND w.status='done' AND sl.posted_date <= %s AND w.qbo_id IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM book_txn bt WHERE bt.source_txn_id=w.qbo_id AND bt.source_txn_type=w.qbo_type
+                                     AND bt.is_deleted)
                    ORDER BY sl.posted_date, sl.amount;""", (sid, upto))
     out = {"rows": [], "transfers": []}
     for lid, d, a, desc, ty, qid, fqn in cur.fetchall():
@@ -5524,7 +5567,10 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <tr><td></td><td><b>{{ pcopies.rows|length }} entries</b></td><td class=a><b>{{ pcopies.total|money }}</b></td><td></td></tr></table>
 <form method=post action="{{ url_for('period_copies_fix', name=name) }}" class=btnrow style="margin:10px 0" data-confirm="Delete these {{ pcopies.rows|length }} entries recorded from here in QuickBooks? QuickBooks keeps its own entries for these dates. This changes QuickBooks.">
 <input type=hidden name=upto value="{{ qrec.isoformat() }}">{% for r in pcopies.rows %}<input type=hidden name=line value="{{ r.line_id }}">{% endfor %}
-<button type=submit class="btn-sm pri" data-busy="Deleting the copies in QuickBooks...">Delete these {{ pcopies.rows|length }} copies</button></form>{% else %}<div class=muted style="margin:6px 0 14px">Nothing recorded from here on or before that date.</div>{% endif %}
+<button type=submit class="btn-sm pri" data-busy="Deleting the copies in QuickBooks...">Delete these {{ pcopies.rows|length }} copies</button></form>{% else %}<div class=muted style="margin:6px 0 8px">Nothing recorded from here on or before that date.</div>
+<form method=post action="{{ url_for('period_copies_fix', name=name) }}" class=btnrow style="margin:0 0 14px">
+<input type=hidden name=upto value="{{ qrec.isoformat() }}"><input type=hidden name=months value=1>
+<button type=submit class=btn-sm data-busy="Matching...">Match each month's bank charges to QuickBooks' combined entries</button></form>{% endif %}
 {% if pcopies.transfers %}<div class="recnote warn">{{ pcopies.transfers|length }} transfer{{ '' if pcopies.transfers|length == 1 else 's' }} recorded for those dates ({% for r in pcopies.transfers %}{{ r.date }} {{ r.amount|money }} #{{ r.qbo_id }}{{ ', ' if not loop.last }}{% endfor %}): use Undo under Recorded transfers — it removes both sides.</div>{% endif %}
 {% endif %}
 {% if twice %}<h2 id=sec-twice style="font-size:15px" data-sec data-state=attn data-note="{{ twice|length }} to put right">Recorded twice? — {{ twice|length }} to check</h2>
@@ -5568,6 +5614,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <td class=a>{{ w.amount|money }}</td>
 {% if w.wb == 'pending' %}<td colspan=3 style="white-space:normal"><span class=bad>Recording was interrupted — check QuickBooks before trying again.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">I checked — it's not in QuickBooks</button> <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td>
 {% elif w.wb == 'taken' %}<td colspan=3 style="white-space:normal"><span class=bad>The entry recorded for this line{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was paired with another identical line, so this one isn't in QuickBooks yet.</span><br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">Record this one again</button> <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td>
+{% elif w.wb == 'gone' %}<td colspan=3 style="white-space:normal"><span class=bad>The entry recorded for this line{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was deleted in QuickBooks, so it won't match.</span> If QuickBooks has this money in another entry, match the line to it by hand (or Ignore it); otherwise record it again.<br><button type=submit name=reset value="{{ w.line_id }}" formaction="{{ url_for('record_reset', name=name) }}" class=btn-sm style="margin-top:6px" data-busy="Resetting...">Record it again</button> <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td>
 {% elif w.wb == 'done' %}<td colspan=3 class=muted style="white-space:normal">Recorded in QuickBooks{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} — it will match on the next refresh.</td>
 {% elif not w.recordable %}<td colspan=3 class=muted style="white-space:normal">{{ w.why_not }}</td>
 {% else %}
@@ -6466,7 +6513,7 @@ def reconcile(cur, acct_uuid, stmt):
 def _record_rank(w):
     """Order of the 'record them' list: problems first (interrupted, taken), then lines to record,
     then lines that can't be recorded here, and lines already recorded (awaiting a refresh) last."""
-    if w["wb"] in ("pending", "taken"):
+    if w["wb"] in ("pending", "taken", "gone"):
         return 0
     if w["wb"] in ("done", "ignored"):
         return 3
@@ -6557,6 +6604,8 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                 ign_by[str(l_id)] = (err or "").replace("ignored by ", "", 1)
         for l_id in taken_elsewhere(cur, acct_uuid, [k for k, v in wb.items() if v[0] == "done"]):
             wb[l_id] = ("taken", wb[l_id][1])
+        for l_id in deleted_in_qbo(cur, acct_uuid, [k for k, v in wb.items() if v[0] == "done"]):
+            wb[l_id] = ("gone", wb[l_id][1])
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
     pool_ids = {str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
@@ -6579,7 +6628,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
         status, qbo_id = wb.get(str(lid), (None, None))
         item = {"line_id": lid, "date": dd, "amount": a, "who": who, "out": out, "sug": sug,
                 "acct_id": acct["id"] if acct else None, "payee": (sug or {}).get("payee"),
-                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done", "taken", "ignored") else None, "ign_by": ign_by.get(str(lid)),
+                "payee_ref": (sug or {}).get("payee_ref"), "wb": status if status in ("pending", "done", "taken", "gone", "ignored") else None, "ign_by": ign_by.get(str(lid)),
                 "qbo_id": qbo_id, "recordable": why_not is None, "why_not": why_not, "xfer_only": xfer_only,
                 "is_xfer": bool(acct and acct.get("xfer")),
                 "dups": dups.get(str(lid), [])[:3]}
@@ -8725,6 +8774,18 @@ def period_copies_fix(name):
         session["detail_msg"] = "Nothing changed: give the date, on an open (not signed-off) reconciliation."
         return back
     rows = [r for r in period_copies(cur, s[0], upto)["rows"] if r["line_id"] in wanted]
+    if not rows and request.form.get("months"):
+        # Nothing to delete: just match each month's bank charges to QuickBooks' combined entries.
+        who = session.get("name") or "user"
+        months = match_charges_by_month(cur, row[0], s, upto, who)
+        conn.commit(); cur.close(); conn.close()
+        if months:
+            _after_review(s[0])
+            log_activity(f"matched bank charges by month on or before {upto:%d/%m/%Y} ({', '.join(months)})", name)
+        session["detail_msg"] = (f"Matched the bank charges for {', '.join(months)} to QuickBooks' combined charge entries."
+                                 if months else "No month's bank charges added up to QuickBooks' charge entries for "
+                                 "that month, so nothing was matched. Match them by hand.")
+        return back
     cur.close(); conn.close()
     if not rows:
         session["detail_msg"] = "Nothing to delete (or it has changed since the check — check again)."
@@ -8945,7 +9006,8 @@ def record_reset(name):
         conn = get_conn(); cur = conn.cursor()
         cur.execute("SELECT account_id FROM account WHERE name=%s LIMIT 1;", (name,))
         a = cur.fetchone()
-        again = bool(a and taken_elsewhere(cur, a[0], [lid]))   # its entry went to an identical line
+        # its entry went to an identical line, or was deleted in QuickBooks
+        again = bool(a and (taken_elsewhere(cur, a[0], [lid]) or deleted_in_qbo(cur, a[0], [lid])))
         cur.execute("""UPDATE writeback_log SET status='failed', error='cleared by ' || %s
                        WHERE line_id=%s AND (status='pending' OR (status='done' AND %s));""",
                     (session.get("name") or "user", lid, again))

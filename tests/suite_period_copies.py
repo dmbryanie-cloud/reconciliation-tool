@@ -93,6 +93,27 @@ check("…the copies are gone from the books here", q("""SELECT count(*) FROM bo
 check("checking again: nothing left to delete", "Nothing recorded from here on or before that date." in page("?qrec=2025-11-10"))
 check("activity log records it", q("SELECT 1 FROM activity_log WHERE action LIKE 'deleted 6 entries recorded from here on or before 10/11/2025%%'"))
 
+# ---- an entry recorded from here, then deleted in QuickBooks directly ----------------------------------------
+NOV_Q = q("SELECT qbo_id FROM writeback_log WHERE line_id=%s", (NOV,))[0][0]
+q("UPDATE book_txn SET is_deleted=true WHERE source_txn_id=%s RETURNING 1", (NOV_Q,))   # what the sync does,
+A.run_matcher(q("SELECT statement_id FROM statement")[0][0])                            # then it re-matches
+p = page()
+row = p.split("MONTHLY MANAGEMENT FEE")[-1].split("</tr>")[0]
+check("its line says the entry was deleted in QuickBooks, instead of 'will match on the next refresh'",
+      f"(#{NOV_Q}) was deleted in QuickBooks, so it won't match" in row and "next refresh" not in row
+      and "Record it again" in row and "Ignore — it's in QuickBooks" in row)
+check("…and it isn't ticked for recording", f'name=sel value="{NOV}"' not in p)
+check("the period check doesn't offer to delete it again",
+      "Nothing recorded from here on or before that date." in page("?qrec=2025-11-30"))
+NOVQ = book("50390", "2025-11-28", -36000, "Bank charges November", CH)
+cl.post(f"/account/{NAME}/period_copies", data={"upto": "2025-11-30", "months": "1"})
+check("with nothing to delete, the charges can still be matched by month", "Matched the bank charges for 11/2025" in msg()
+      and q("""SELECT count(*) FROM match m JOIN match_statement_line x USING (match_id) JOIN match_book_txn y USING (match_id)
+               WHERE m.status='confirmed' AND x.line_id=%s AND y.txn_id=%s::uuid""", (NOV, NOVQ))[0][0] == 1)
+check("…no QuickBooks change for that", len(DELETES) == 6)
+cl.post(f"/account/{NAME}/period_copies", data={"upto": "2025-11-30", "months": "1"})
+check("…again: nothing left to match, says so", "nothing was matched" in msg())
+
 # ---- limits ------------------------------------------------------------------------------------------------
 q("UPDATE statement SET signed_off_at=now() RETURNING 1")
 n = len(DELETES)
