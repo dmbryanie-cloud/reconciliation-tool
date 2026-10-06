@@ -8,7 +8,6 @@ import itertools
 import time
 import re
 import uuid
-import pickle
 import psycopg2
 from collections import Counter
 from difflib import SequenceMatcher
@@ -1362,10 +1361,6 @@ try:
                     posted_date date NOT NULL, PRIMARY KEY (account_id, source_txn_id, posted_date));""")
     # How far QuickBooks itself is reconciled in an open statement's period (its latest entry marked R),
     # read on each sync: bank lines up to then are already in QuickBooks, so they're never offered to record.
-    # A statement read but not saved, waiting for "Replace the open reconciliation?" (the rows as read,
-    # never the file or its password). One per account; a new upload or an answer clears it.
-    _cur.execute("""CREATE TABLE IF NOT EXISTS pending_upload (account text PRIMARY KEY, data bytea NOT NULL,
-                    question text NOT NULL, by_name text, created_at timestamptz NOT NULL DEFAULT now());""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_rec_point (account_id uuid PRIMARY KEY, as_of date,
                     checked_at timestamptz NOT NULL DEFAULT now());""")
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
@@ -3843,7 +3838,7 @@ def require_login():
 
 # Which tick each action needs (anything not listed: any signed-in user).
 PERM_BY_ENDPOINT = {
-    "upload": "upload", "upload_status": "upload", "upload_replace": "upload", "qbo_start": "users", "import_books": "upload", "balances": "upload",
+    "upload": "upload", "upload_status": "upload", "qbo_start": "users", "import_books": "upload", "balances": "upload",
     "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
@@ -4171,11 +4166,6 @@ PDF_MAX_PAGES = 300
 
 
 class PdfPasswordError(ValueError):
-    pass
-
-
-class ReplaceNeeded(ValueError):
-    """An upload would replace an open reconciliation that has work in it: the user is asked first."""
     pass
 
 
@@ -4726,8 +4716,40 @@ def delete_statements(cur, ids):
     cur.execute("DELETE FROM statement WHERE statement_id = ANY(%s::uuid[]);", (ids,))   # lines go with it
 
 
+def _continue_statement(cur, st, rows, p_end, closing, currency):
+    """Add a newer statement's later lines to the open reconciliation it overlaps, instead of replacing it:
+    the lines dated after its end go in, its period runs on to p_end, and the matches and work on it stay.
+    Returns its statement_id."""
+    dmy = lambda d: d.strftime("%d/%m/%Y")
+    sid, eps, epe = st[:3]
+    if p_end <= epe:
+        raise ValueError(f"Nothing new: the open reconciliation for {dmy(eps)} to {dmy(epe)} already covers this file's "
+                         f"dates up to {dmy(p_end)}. It's unchanged.")
+    add = [r for r in rows if epe < r["date"] <= p_end]
+    post = [r for r in rows if r["date"] > p_end]
+    Z = Decimal(0)
+    c_src = "user" if closing is not None else None
+    if closing is None and getattr(rows, "closing", None) is not None:
+        closing, c_src = rows.closing - sum((r["amount"] for r in post), Z), "file"
+    seen = {}
+    for r, key in zip(add, _dedupe_keys(add)):
+        seen.setdefault(key, (ORG_ID, sid, r["date"], r["amount"], currency, r.get("desc") or "", key))
+    if seen:
+        execute_values(cur, """INSERT INTO statement_line (org_id, statement_id, posted_date, amount, currency, description,
+                                 dedupe_key) VALUES %s ON CONFLICT (statement_id, dedupe_key) DO NOTHING;""", list(seen.values()))
+    # The closing balance and the book balance were for the old end date.
+    cur.execute("""UPDATE statement SET period_end=%s, closing_balance=%s, closing_source=%s,
+                     book_balance=NULL, book_balance_source=NULL, signed_off_at=NULL, signed_off_by=NULL
+                   WHERE statement_id=%s;""", (p_end, closing or 0, c_src, sid))
+    if has_request_context():
+        g.kept, g.left_out = len(add), (0, len(post))
+        g.continued = (f" Added to the open reconciliation, which now runs {dmy(eps)} to {dmy(p_end)}: the lines up to "
+                       f"{dmy(epe)} were already in it, and the matches and work on them are kept.")
+    return sid
+
+
 def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None,
-                    replace_ok=True):
+                    replace_ok=False):
     if not rows: raise ValueError("No transactions found in the file.")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
@@ -4736,6 +4758,58 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
         cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
     acct_uuid, currency = arow
     p_start, p_end = _resolve_period(cur, acct_uuid, rows, p_start, p_end)
+    dmy = lambda d: d.strftime("%d/%m/%Y")
+    cur.execute("SELECT as_of FROM qbo_baseline WHERE account_id=%s AND as_of >= %s;", (acct_uuid, p_start))
+    base = cur.fetchone()
+    if base:
+        cur.close(); conn.close()
+        raise ValueError(f"Not uploaded: this account starts from QuickBooks' reconciliation to {base[0]:%d/%m/%Y}, so "
+                         f"ReconBook reconciles it only after that. Upload the statement from "
+                         f"{base[0] + timedelta(days=1):%d/%m/%Y} on, or remove the starting point (⋯ menu → "
+                         f"QuickBooks starting point) first. Nothing was changed.")
+    cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at FROM statement
+                   WHERE account_id=%s AND period_start <= %s AND period_end >= %s ORDER BY period_start;""",
+                (acct_uuid, p_end, p_start))
+    overlap = cur.fetchall()
+    signed = [o for o in overlap if o[3]]
+    periods = lambda os_: "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in os_)
+    if replace_ok:
+        # Asked to replace: one reconciliation per period, and a signed-off one is never replaced.
+        if signed:
+            cur.close(); conn.close()
+            n = len(signed)
+            raise ValueError(f"Not uploaded: this account already has {'a signed-off reconciliation' if n == 1 else f'{n} signed-off reconciliations'} "
+                             f"inside these dates ({dmy(p_start)} to {dmy(p_end)}): {periods(signed)}. Only one reconciliation per "
+                             f"period is kept, and a signed-off one is never replaced. Undo {'its' if n == 1 else 'their'} "
+                             f"sign-off under Reports (⋯ menu on {'its row' if n == 1 else 'each row'} → Undo sign-off), "
+                             f"then upload again; or upload only the months after {dmy(max(o[2] for o in signed))}. "
+                             f"Nothing was changed.")
+        if overlap:
+            delete_statements(cur, [o[0] for o in overlap])
+            if has_request_context():
+                g.replaced = periods(overlap)
+    else:
+        # An overlapping statement continues what's here: the dates already reconciled are kept as they are.
+        if signed:
+            after = max(o[2] for o in signed) + timedelta(days=1)
+            if p_end < after:
+                cur.close(); conn.close()
+                raise ValueError(f"Nothing new: everything in this file ({dmy(p_start)} to {dmy(p_end)}) is in the "
+                                 f"signed-off reconciliation{'s' if len(signed) > 1 else ''} for {periods(signed)}. "
+                                 f"Nothing was changed.")
+            if p_start < after:
+                p_start = after
+                if has_request_context():
+                    g.continued = (f" The lines up to {dmy(after - timedelta(days=1))} are in the signed-off reconciliation "
+                                   f"for {periods(signed)}, so this one starts on {dmy(after)}.")
+        open_ov = [o for o in overlap if not o[3] and o[2] >= p_start]
+        if open_ov:
+            try:
+                sid = _continue_statement(cur, max(open_ov, key=lambda o: o[2]), rows, p_end, closing, currency)
+            except ValueError:
+                cur.close(); conn.close(); raise
+            conn.commit(); cur.close(); conn.close()
+            return sid
     try:
         rows, n_pre, n_post = _period_rows(rows, p_start, p_end)
     except ValueError:
@@ -4750,51 +4824,6 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
     if closing is None and getattr(rows, "closing", None) is not None:
         closing, c_src = rows.closing, "file"
     opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src)
-    cur.execute("SELECT as_of FROM qbo_baseline WHERE account_id=%s AND as_of >= %s;", (acct_uuid, p_start))
-    base = cur.fetchone()
-    if base:
-        cur.close(); conn.close()
-        raise ValueError(f"Not uploaded: this account starts from QuickBooks' reconciliation to {base[0]:%d/%m/%Y}, so "
-                         f"ReconBook reconciles it only after that. Upload the statement from "
-                         f"{base[0] + timedelta(days=1):%d/%m/%Y} on, or remove the starting point (⋯ menu → "
-                         f"QuickBooks starting point) first. Nothing was changed.")
-    # One reconciliation per account per period: a statement whose dates overlap this one is replaced,
-    # unless it's signed off (then the upload is refused until it's reopened or deleted).
-    cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at FROM statement
-                   WHERE account_id=%s AND period_start <= %s AND period_end >= %s ORDER BY period_start;""",
-                (acct_uuid, p_end, p_start))
-    overlap = cur.fetchall()
-    signed = [o for o in overlap if o[3]]
-    if signed:
-        cur.close(); conn.close()
-        dmy = lambda d: d.strftime("%d/%m/%Y")
-        periods = "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in signed)
-        n = len(signed)
-        raise ValueError(f"Not uploaded: this account already has {'a signed-off reconciliation' if n == 1 else f'{n} signed-off reconciliations'} "
-                         f"inside these dates ({dmy(p_start)} to {dmy(p_end)}): {periods}. Only one reconciliation per "
-                         f"period is kept, and a signed-off one is never replaced. Undo {'its' if n == 1 else 'their'} "
-                         f"sign-off under Reports (⋯ menu on {'its row' if n == 1 else 'each row'} → Undo sign-off), "
-                         f"then upload again; or upload only the months after {dmy(max(o[2] for o in signed))}. "
-                         f"Nothing was changed.")
-    if overlap and not replace_ok:
-        # Replacing loses the review work done on it (QuickBooks keeps what was recorded): only when asked.
-        cur.execute("""SELECT 1 FROM match WHERE statement_id = ANY(%s::uuid[])
-                         AND (created_by = 'user' OR confirmed_by IS NOT NULL)
-                       UNION ALL SELECT 1 FROM writeback_log w JOIN statement_line sl ON sl.line_id = w.line_id
-                         WHERE sl.statement_id = ANY(%s::uuid[]) LIMIT 1;""",
-                    ([str(o[0]) for o in overlap], [str(o[0]) for o in overlap]))
-        if cur.fetchone():
-            cur.close(); conn.close()
-            dmy = lambda d: d.strftime("%d/%m/%Y")
-            periods = "; ".join(f"{dmy(o[1])} to {dmy(o[2])}" for o in overlap)
-            raise ReplaceNeeded(f"This statement ({dmy(p_start)} to {dmy(p_end)}) overlaps the open reconciliation for "
-                                f"{periods}, which has work in it: matches confirmed or made by hand, lines recorded or "
-                                f"ignored. Only one reconciliation per period is kept, so replacing it means redoing that "
-                                f"work (anything recorded stays in QuickBooks).")
-    if overlap:
-        delete_statements(cur, [o[0] for o in overlap])
-        if has_request_context():
-            g.replaced = "; ".join(f"{o[1]} to {o[2]}" for o in overlap)
     cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end,
                    opening_balance, closing_balance, opening_source, closing_source, currency, source_format, prepared_by)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
@@ -5661,11 +5690,6 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
   else if(dirty){b.innerHTML='The statement is ready. <a href="" onclick="location.reload();return false">Reload to see it</a>'}
   else location.reload()}).catch(function(){setTimeout(tick,6000)})}
 setTimeout(tick,3000)})();</script>{% endif %}
-{% if pending %}<div class="recnote warn" id=replaceq role=alertdialog aria-labelledby=replaceq-t style="margin:0 0 14px">
-<b id=replaceq-t>Replace the open reconciliation?</b> {{ pending.question }}{% if pending.by %} (uploaded by {{ pending.by }}){% endif %}
-<form method=post action="{{ url_for('upload_replace', name=name) }}" style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-<button type=submit name=answer value=replace class=btn data-busy="Replacing...">Replace it with the new statement</button>
-<button type=submit name=answer value=keep class=btn-sm>Keep the open reconciliation</button></form></div>{% endif %}
 {% if detail_msg %}{% if detail_ok %}<div id=flash role=status class=ok data-stay><b>Statement uploaded.</b> {{ detail_msg }}</div>{% else %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}{% endif %}
 {% if not has_results %}<div class="panel empty"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M12 11v6"/><path d="m9.5 13.5 2.5-2.5 2.5 2.5"/></svg>
 <div><b>No statement yet.</b> Upload this account's bank statement (PDF, CSV or OFX) to start the reconciliation.</div>
@@ -7546,8 +7570,7 @@ def detail(name):
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
-                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None,
-                                  pending=pending_upload(name) if can("upload") else None, **d)
+                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None, **d)
 
 
 def _form_amount(field):
@@ -7621,7 +7644,6 @@ def upload(name):
     except ValueError as e:
         session["detail_msg"] = f"PDF not imported: {e}" if is_pdf else str(e)
         return redirect(url_for("detail", name=name) + ("?pdfpw=1" if isinstance(e, PdfPasswordError) else ""))
-    pending_upload(name, take=True)        # a new upload replaces any statement still waiting for an answer
     _start_upload(name, dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password,
                              opening=opening, closing=closing, p_start=_form_date("period_start"),
                              p_end=_form_date("period_end"), replace_ok=bool(request.form.get("replace")),
@@ -7685,30 +7707,6 @@ def qbo_start(name):
     return redirect(url_for("detail", name=name))
 
 
-def _keep_pending(name, rows, fmt, opening, closing, p_start, p_end, question, user):
-    blob = pickle.dumps({"rows": rows, "fmt": fmt, "opening": opening, "closing": closing,
-                         "p_start": p_start, "p_end": p_end})
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""INSERT INTO pending_upload (account, data, question, by_name) VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (account) DO UPDATE SET data=EXCLUDED.data, question=EXCLUDED.question,
-                     by_name=EXCLUDED.by_name, created_at=now();""",
-                (name, psycopg2.Binary(blob), question, (user or {}).get("name")))
-    conn.commit(); cur.close(); conn.close()
-
-
-def pending_upload(name, take=False):
-    """The statement waiting for "Replace the open reconciliation?" on this account: {question, by, at,
-    data}, or None. Kept a day. take: remove it as it's read."""
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute(("DELETE FROM pending_upload WHERE account=%s RETURNING question, by_name, created_at, data;" if take else
-                 "SELECT question, by_name, created_at, data FROM pending_upload WHERE account=%s;"), (name,))
-    r = cur.fetchone()
-    conn.commit(); cur.close(); conn.close()
-    if not r or r[2] < datetime.now(timezone.utc) - timedelta(days=1):
-        return None
-    return {"question": r[0], "by": r[1], "at": r[2], "data": bytes(r[3])}
-
-
 def _start_upload(name, args):
     """Run an upload: inline under the tests, otherwise as a background job the page follows."""
     if not SYNC_IN_BACKGROUND:                      # the tests run it inline
@@ -7736,30 +7734,6 @@ def _start_upload(name, args):
     threading.Thread(target=run, daemon=True, name="upload").start()
 
 
-@app.route("/account/<name>/upload_replace", methods=["POST"])
-def upload_replace(name):
-    """The answer to "Replace the open reconciliation?": replace it with the statement already read, or
-    keep it (the statement is dropped). Nothing is uploaded again."""
-    session.pop("detail_ok", None)
-    job = upload_job(name)
-    if job and job.get("state") == "running":
-        session["detail_msg"] = "A statement for this account is still being read and matched. Wait for it to finish."
-        return redirect(url_for("detail", name=name))
-    p = pending_upload(name, take=True)
-    if not p:
-        session["detail_msg"] = "That statement is no longer waiting (it was answered, or it's over a day old). Upload it again."
-        return redirect(url_for("detail", name=name))
-    if request.form.get("answer") != "replace":
-        session["detail_msg"] = "Kept the open reconciliation. The new statement wasn't uploaded."
-        return redirect(url_for("detail", name=name))
-    kept = pickle.loads(p["data"])
-    _start_upload(name, dict(name=name, data=b"", filename=None, is_pdf=kept["fmt"] == "pdf", password=None,
-                             opening=kept["opening"], closing=kept["closing"], p_start=kept["p_start"],
-                             p_end=kept["p_end"], replace_ok=True, parsed=(kept["rows"], kept["fmt"]),
-                             user={k: session.get(k) for k in ("name", "username", "is_admin")}))
-    return redirect(url_for("detail", name=name))
-
-
 @app.route("/account/<name>/upload_status")
 def upload_status(name):
     job = upload_job(name) or {}
@@ -7785,17 +7759,15 @@ def pdf_check(data, password=None):
 
 
 def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None,
-                replace_ok=False, parsed=None):
+                replace_ok=False):
     """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
     context (the background job has none), as the user who uploaded it. Returns (ok, message).
-    parsed: (rows, format) already read -- a statement kept while the user was asked whether to replace."""
+    An overlapping statement continues the reconciliations already here (replace_ok: replaces them)."""
     with app.test_request_context():
         session.update({k: v for k, v in user.items() if v is not None})
         step = progress or (lambda m: None)
         try:
-            if parsed:
-                rows, fmt = parsed
-            elif is_pdf:
+            if is_pdf:
                 step("Reading the PDF")
                 # A typed opening is the period's; it's only the file's first balance when no start is chosen.
                 rows, fmt = parse_pdf(data, password, opening if not p_start else None, progress=step), "pdf"
@@ -7808,11 +7780,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
                 fmt = "ofx" if (filename or "").lower().endswith(".ofx") or "<OFX>" in text[:3000].upper() else "csv"
                 rows = parse_ofx(text) if fmt == "ofx" else parse_csv(text)
             step(f"Saving {len(rows)} statement lines")
-            try:
-                sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
-            except ReplaceNeeded as e:
-                _keep_pending(name, rows, fmt, opening, closing, p_start, p_end, str(e), user)
-                return False, ""
+            sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
             n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
             checked = "" if fmt != "pdf" else (
                 " Read from the PDF; every running balance checks out." if rows.pdf_checked else
@@ -7837,6 +7805,10 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
         if replaced:
             checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
         n_pre, n_post = getattr(g, "left_out", (0, 0))
+        continued = getattr(g, "continued", None)
+        if continued:      # it says itself which lines were already here
+            checked += continued
+            n_pre = 0
         if n_pre or n_post:
             conn = get_conn(); cur = conn.cursor()
             cur.execute("SELECT period_start, period_end FROM statement WHERE statement_id=%s;", (sid,))
