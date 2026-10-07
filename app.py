@@ -4602,92 +4602,47 @@ def _pdf_group(words, tol=3, by_middle=False):
     return _pdf_unwrap_amounts(lines)
 
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-SCAN_MODEL = os.environ.get("SCAN_MODEL", "claude-sonnet-5-5")
-SCAN_PAGES_PER_CALL = 8        # pages sent to Claude at a time: keeps each answer well inside its output limit
-SCAN_SCALE = 2                 # pages rendered at 144 dpi: statement print stays legible
-
-SCAN_PROMPT = """These are pages of a scanned bank statement. Transcribe its transactions exactly as printed.
-
-Answer with JSON only, no other text:
-{"account_number": "the account number as printed, or null",
- "opening_balance": "the opening / brought-forward balance as printed (e.g. \"2,442,435.00 CR\"), or null if these pages don't show it",
- "closing_balance": "the closing / book balance as printed, or null",
- "period_start": "YYYY-MM-DD or null", "period_end": "YYYY-MM-DD or null",
- "transactions": [{"date": "YYYY-MM-DD (the transaction / posting date, not the value date)",
-                   "description": "the full description, wrapped lines joined with spaces",
-                   "debit": "money out as printed, or null", "credit": "money in as printed, or null",
-                   "amount": "only if the statement has a single signed amount column instead of debit/credit, else null",
-                   "balance": "the running balance as printed, with any CR/DR, or null"}]}
-
-Rules: copy every figure digit for digit -- never calculate, round or correct one. A 0 or dash in a debit or credit
-column means empty (null). Keep the order the statement prints them in. Include every transaction row on these pages;
-leave out opening/closing balance rows, page totals and summaries. Dates on this statement are day-first unless it
-clearly shows otherwise."""
+OCR_MAX_BYTES = 30_000_000     # the words' JSON for one statement
+OCR_MAX_WORDS = 400000         # words a browser may send for one scanned statement
+ZERO_LOOKALIKES = ("U", "O", "o", "D", "Q")   # a lone zero in a money column, misread as a letter
 
 
-def _scan_call(images):
-    """One Messages API call: page images in, the statement's JSON out."""
-    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": im}} for im in images]
-    content.append({"type": "text", "text": SCAN_PROMPT})
-    body = json.dumps({"model": SCAN_MODEL, "max_tokens": 16000,
-                       "messages": [{"role": "user", "content": content}]}).encode()
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST", headers={
-        "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            resp = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = json.loads(e.read()).get("error", {}).get("message", "")
-        except Exception:
-            pass
-        raise ValueError(f"Claude couldn't read the scanned PDF ({e.code}{': ' + detail if detail else ''}).")
-    except Exception as e:
-        raise ValueError(f"Claude couldn't be reached to read the scanned PDF ({e}). Try again in a minute.")
-    if resp.get("stop_reason") == "max_tokens":
-        raise ValueError("The scanned PDF has too many lines on its pages to read in one go. Split it and upload the parts.")
-    text = "".join(c.get("text", "") for c in resp.get("content", []) if c.get("type") == "text")
-    m = re.search(r"\{.*\}", text, re.S)
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        raise ValueError("Claude's reading of the scanned PDF couldn't be understood. Try uploading it again.")
-
-
-def _scan_transcribe(data, password=None, progress=None):
-    """A scanned statement read by Claude (Anthropic's API): its transactions and balances as printed, or None
-    when no API key is set. Pages go as images, a few at a time; the running-balance check afterwards catches
-    any figure read wrongly."""
-    if not ANTHROPIC_API_KEY:
+def _ocr_upload():
+    """The words the browser read from a scanned PDF, sent with the upload as a small JSON file (a form
+    field that size would be refused), or None."""
+    f = request.files.get("ocr_words")
+    if not f:
         return None
-    import pypdfium2 as pdfium
-    doc = pdfium.PdfDocument(data, password=password or None)
-    out = {"transactions": []}
+    raw = f.read(OCR_MAX_BYTES + 1)
+    return raw.decode("utf-8", "ignore") if raw and len(raw) <= OCR_MAX_BYTES else None
+
+
+def ocr_pages(raw):
+    """The words a browser read from a scanned PDF (the upload form's ocr_words): per page, [text, x0, top, x1,
+    bottom] in PDF points. Returned in pdfplumber's shape for the PDF reader, or None if absent or malformed."""
     try:
-        n = len(doc)
-        for start in range(0, n, SCAN_PAGES_PER_CALL):
-            end = min(n, start + SCAN_PAGES_PER_CALL)
-            if progress:
-                progress(f"Reading the scanned PDF with Claude: page{'s' if end - start > 1 else ''} "
-                         f"{start + 1}{'-' + str(end) if end - start > 1 else ''} of {n}")
-            images = []
-            for i in range(start, end):
-                buf = io.BytesIO()
-                doc[i].render(scale=SCAN_SCALE).to_pil().convert("L").save(buf, format="PNG", optimize=True)
-                images.append(base64.b64encode(buf.getvalue()).decode())
-            part = _scan_call(images)
-            for k in ("account_number", "opening_balance", "period_start"):
-                out.setdefault(k, None)
-                if out[k] is None:
-                    out[k] = part.get(k)
-            for k in ("closing_balance", "period_end"):
-                if part.get(k) is not None:
-                    out[k] = part.get(k)
-            out["transactions"] += part.get("transactions") or []
-    finally:
-        doc.close()
+        pages = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(pages, list) or not pages or len(pages) > PDF_MAX_PAGES:
+        return None
+    out, n = [], 0
+    for pg in pages:
+        if not isinstance(pg, list):
+            return None
+        words = []
+        for w in pg:
+            n += 1
+            if n > OCR_MAX_WORDS or not isinstance(w, list) or len(w) != 5:
+                return None
+            t = str(w[0]).strip()[:200]
+            try:
+                x0, top, x1, bottom = (float(v) for v in w[1:])
+            except (TypeError, ValueError):
+                return None
+            if t:
+                words.append({"text": "0" if t in ZERO_LOOKALIKES else t, "x0": x0, "x1": x1, "top": top, "bottom": bottom})
+        out.append(words)
     return out
 
 
@@ -4847,33 +4802,7 @@ def _pdf_breaks(seq, start):
     return bad, out
 
 
-def _scan_raw(scan):
-    """Claude's transcription of a scan as the PDF reader's rows (raw), opening and closing balances."""
-    def amt(v):
-        v = ("" if v is None else str(v)).strip()
-        return None if v in ("", "-", "0", "0.00", "null") else parse_amount(v)
-    raw = []
-    for t in scan.get("transactions") or []:
-        try:
-            d = date.fromisoformat((t.get("date") or "")[:10])
-            deb, cre, one = amt(t.get("debit")), amt(t.get("credit")), amt(t.get("amount"))
-            bal = amt(t.get("balance")) if str(t.get("balance") or "").strip() not in ("0", "0.00") else Decimal(0)
-        except (ValueError, ArithmeticError):
-            raise ValueError(f"A line of the scanned PDF couldn't be read: {json.dumps(t)[:120]}. Nothing was imported.")
-        if deb is None and cre is None and one is None:
-            continue
-        a = one if one is not None else (abs(cre or 0) - abs(deb or 0))
-        raw.append({"date": d, "amount": a, "desc": " ".join(str(t.get("description") or "").split()),
-                    "balance": bal, "known": True})
-    def bal_of(k):
-        try:
-            return amt(scan.get(k))
-        except (ValueError, ArithmeticError):
-            return None
-    return raw, bal_of("opening_balance"), bal_of("closing_balance")
-
-
-def parse_pdf(data, password=None, opening_hint=None, progress=None):
+def parse_pdf(data, password=None, opening_hint=None, progress=None, ocr_words=None):
     """Statement lines from a bank's PDF statement. Returns _Rows like the CSV/OFX parsers."""
     try:
         import pdfplumber
@@ -4904,13 +4833,16 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 progress(f"Reading the PDF: page {i + 1} of {len(pages)}")
     finally:
         pdf.close()
-    scan = None
+    scan = False
     if not any(page_lines):
-        scan = _scan_transcribe(data, password, progress)
-        if not scan:
-            raise ValueError("This PDF has no readable text — it's probably a scan or photo. Download the statement "
-                             "from online banking as a PDF, CSV or Excel file instead.")
-    scanned = scan is not None
+        # A scan: its words were read in the browser before the upload (rbScanWords).
+        ocr = ocr_pages(ocr_words)
+        if not ocr or not any(ocr):
+            raise ValueError("This PDF has no readable text — it's a scan or photo, and it wasn't read on your "
+                             "computer before uploading. Reload the page and upload it again (it needs the internet "
+                             "the first time), or download the statement from online banking instead.")
+        page_lines, scan = [_pdf_group(ws, tol=4, by_middle=True) for ws in ocr], True
+    scanned = scan
     all_text = "\n".join(" ".join(w["text"] for w in l) for pl in page_lines for l in pl)
     dayfirst = _detect_dayfirst([l[0]["text"] for pl in page_lines for l in pl if l])
 
@@ -5025,9 +4957,6 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 prev = None; continue       # a balance-only line (e.g. a dated "balance b/f")
             raw.append(r); prev = r
 
-    if scan:
-        raw, opening, closing = _scan_raw(scan)
-        all_text = f"Account Number: {scan.get('account_number') or ''}"
     if not raw:
         raise ValueError("No transactions found in the PDF. If it's a statement, upload the CSV or OFX export instead.")
 
@@ -5095,14 +5024,6 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
             rows.period_start, rows.period_end = a, b
             break
     rows.account_number = _statement_account_number(all_text)
-    if scan:
-        for k in ("period_start", "period_end"):
-            try:
-                setattr(rows, k, date.fromisoformat(scan.get(k) or ""))
-            except ValueError:
-                pass
-        if not (rows.period_start and rows.period_end and rows.period_start <= first and rows.period_end >= last):
-            rows.period_start = rows.period_end = None
     rows.scanned = scanned
     return rows
 
@@ -6179,6 +6100,79 @@ def dashboard():
                                   sync_msg=sync_msg, now=datetime.now(EAT).strftime("%d %b, %H:%M"))
 
 
+SCAN_JS = r"""// Reads a scanned PDF in the browser (pdf.js renders each page, Tesseract reads it) -- free, and the statement
+// never leaves this computer except to ReconBook itself. Resolves to null for a PDF that has text of its own
+// (the server reads those), else to the words of each page: [text, x0, top, x1, bottom] in PDF points.
+window.rbScanWords = function (buf, password, say) {
+  var PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  var TESS = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+  var SCALE = 3;
+  function load(src) {
+    return new Promise(function (ok, bad) {
+      if (document.querySelector('script[src="' + src + '"]')) return ok();
+      var s = document.createElement('script'); s.src = src; s.onload = ok;
+      s.onerror = function () { bad(new Error('Couldn’t load the scan reader (' + src.split('/')[2] + '). Check the internet connection.')); };
+      document.head.appendChild(s);
+    });
+  }
+  say = say || function () {};
+  var pdf, worker;
+  return load(PDFJS + 'pdf.min.js').then(function () {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js';
+    return window.pdfjsLib.getDocument({data: new Uint8Array(buf), password: password || undefined}).promise;
+  }).then(function (d) {
+    pdf = d;
+    var n = Math.min(pdf.numPages, 3), chars = 0, p = Promise.resolve();
+    for (var i = 1; i <= n; i++) (function (i) {
+      p = p.then(function () { return pdf.getPage(i); }).then(function (pg) { return pg.getTextContent(); })
+           .then(function (tc) { tc.items.forEach(function (it) { chars += (it.str || '').trim().length; }); });
+    })(i);
+    return p.then(function () { return chars; });
+  }).then(function (chars) {
+    if (chars > 40) return null;                       // a PDF with text: nothing to do here
+    say('This PDF is a scan: reading it on this computer (the first time takes a little longer)...');
+    return load(TESS).then(function () {
+      return window.Tesseract.createWorker('eng');
+    }).then(function (w) {
+      worker = w;
+      // Sparse text: a statement is a table, and the default (paragraphs) skips lone words like column headings.
+      return worker.setParameters({tessedit_pageseg_mode: '11', preserve_interword_spaces: '1'});
+    }).then(function () {
+      var pages = [], p = Promise.resolve();
+      for (var i = 1; i <= pdf.numPages; i++) (function (i) {
+        p = p.then(function () {
+          say('Reading the scan on this computer: page ' + i + ' of ' + pdf.numPages + '...');
+          return pdf.getPage(i);
+        }).then(function (pg) {
+          var vp = pg.getViewport({scale: SCALE}), c = document.createElement('canvas');
+          c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+          var ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+          return pg.render({canvasContext: ctx, viewport: vp}).promise.then(function () {
+            return worker.recognize(c);
+          });
+        }).then(function (r) {
+          var words = r.data.words;
+          if (!words) {                                   // older/newer output shapes: words under blocks
+            words = [];
+            (r.data.blocks || []).forEach(function (b) { (b.paragraphs || []).forEach(function (pa) {
+              (pa.lines || []).forEach(function (l) { (l.words || []).forEach(function (w) { words.push(w); }); }); }); });
+          }
+          pages.push(words.filter(function (w) { return /[0-9A-Za-z]/.test(w.text || ''); }).map(function (w) {
+            var b = w.bbox;
+            return [w.text.trim(), +(b.x0 / SCALE).toFixed(1), +(b.y0 / SCALE).toFixed(1),
+                    +(b.x1 / SCALE).toFixed(1), +(b.y1 / SCALE).toFixed(1)];
+          }));
+        });
+      })(i);
+      return p.then(function () { return pages; });
+    });
+  }).finally(function () {
+    if (worker) worker.terminate();
+    if (pdf) pdf.destroy();
+  });
+};
+"""
+
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · ReconBook</title>""" + CSS + """</head><body>
 """ + SHELL_TOP + """<style>
 .secnav{position:sticky;top:var(--navh,53px);z-index:4;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:8px 24px;background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
@@ -6241,9 +6235,10 @@ setTimeout(tick,3000)})();</script>{% endif %}
 {% if can('upload') %}<button type=button class=btn data-drawer=upload>Upload statement</button>{% endif %}</div>{% endif %}
 
 <aside class=drawer id=dr-upload {% if not open_upload %}hidden{% endif %} aria-label="Upload a statement"><form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
-<div class=drawer-h><h2>Upload a statement <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}<br><br>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A PDF must be the one downloaded from online banking, not a scan. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-h><h2>Upload a statement <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}<br><br>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A scanned PDF is read on your computer first (free; it needs the internet the first time), then checked against its running balance. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b>
-<label class=drop for=up-file><b>Choose the bank statement</b><span>PDF from online banking, CSV or OFX · <a href="{{ url_for('template', kind='bank') }}">CSV template</a></span><input id=up-file type=file name=statement accept=.pdf,.csv,.ofx required></label>
+<input type=file name=ocr_words id=up-ocr hidden tabindex=-1 aria-hidden=true>
+<label class=drop for=up-file><b>Choose the bank statement</b><span>PDF (from online banking, or a scan), CSV or OFX · <a href="{{ url_for('template', kind='bank') }}">CSV template</a></span><input id=up-file type=file name=statement accept=.pdf,.csv,.ofx required></label>
 <div class=two>
 <div class=fld><label for=up-ps>Reconcile from <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Empty: the day after the last reconciliation</span></span></label><input id=up-ps type=date name=period_start></div>
 <div class=fld><label for=up-pe>Reconcile to (statement date) <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Empty: the last transaction</span></span></label><input id=up-pe type=date name=period_end></div>
@@ -6251,10 +6246,33 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
 <div class=fld><label for=up-pw>PDF password <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Used once to open the file; never stored.</span></span></label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}></div>
-
-
+<div class=recnote id=up-scan hidden aria-live=polite></div>
 </div>
 <div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Uploading the file...">Upload &amp; reconcile</button></div></form></aside>
+<script>{% raw %}""" + SCAN_JS + """
+(function(){var f=document.getElementById('up-file');if(!f)return;var form=f.form,box=document.getElementById('up-scan'),
+ocr=document.getElementById('up-ocr');
+function say(t){box.hidden=false;box.className='recnote';box.textContent=t;var m=document.getElementById('loadingmsg'),
+ov=document.getElementById('loadingov');if(m)m.textContent=t;if(ov)ov.classList.add('on');}
+form.addEventListener('submit',function(e){
+  var file=f.files&&f.files[0];
+  if(form.dataset.scanned||!file||!/[.]pdf$/i.test(file.name)||!window.Promise||!window.DataTransfer)return;
+  e.preventDefault();
+  var pw=(form.elements['pdf_password']||{}).value||'';
+  file.arrayBuffer().then(function(buf){return window.rbScanWords(buf,pw,say);}).then(function(words){
+    if(words){var dt=new DataTransfer();dt.items.add(new File([JSON.stringify(words)],'ocr.json',{type:'application/json'}));
+      ocr.files=dt.files;say('Read on this computer. Uploading...');}
+    form.dataset.scanned='1';form.requestSubmit?form.requestSubmit():form.submit();
+  },function(err){
+    if(!box.hidden&&/scan/.test(box.textContent)){       // it is a scan, and reading it failed: say so, don't upload
+      var ov=document.getElementById('loadingov');if(ov)ov.classList.remove('on');
+      box.className='recnote warn';box.textContent='The scan couldn\u2019t be read on this computer: '+((err&&err.message)||err)+
+        ' Try again, or download the statement from online banking instead.';return;}
+    form.dataset.scanned='1';form.requestSubmit?form.requestSubmit():form.submit();   // couldn't check: the server reads it
+  });
+});
+f.addEventListener('change',function(){delete form.dataset.scanned;ocr.value='';box.hidden=true;});
+})();{% endraw %}</script>
 {% if can('settings') and qbo_connected and qbo_linked %}<aside class=drawer id=dr-qbostart hidden aria-label="QuickBooks starting point"><form action="{{ url_for('qbo_start', name=name) }}" method=post style="display:contents">
 <div class=drawer-h><h2>Start from QuickBooks' reconciliation <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Already reconciled in QuickBooks? Start here from where it left off, without uploading older statements. ReconBook reads which entries QuickBooks has marked reconciled up to the date below; their total becomes the opening balance of the next statement, and every entry up to then that QuickBooks hasn't reconciled is brought forward as outstanding. QuickBooks isn't changed.</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b>
@@ -8233,6 +8251,7 @@ def upload(name):
     _start_upload(name, dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password,
                              opening=opening, closing=closing, p_start=_form_date("period_start"),
                              p_end=_form_date("period_end"), replace_ok=bool(request.form.get("replace")),
+                             ocr_words=_ocr_upload(),
                              user={k: session.get(k) for k in ("name", "username", "is_admin")}))
     return redirect(url_for("detail", name=name))
 
@@ -8345,7 +8364,7 @@ def pdf_check(data, password=None):
 
 
 def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None,
-                replace_ok=False):
+                replace_ok=False, ocr_words=None):
     """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
     context (the background job has none), as the user who uploaded it. Returns (ok, message).
     An overlapping statement continues the reconciliations already here (replace_ok: replaces them)."""
@@ -8356,7 +8375,8 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             if is_pdf:
                 step("Reading the PDF")
                 # A typed opening is the period's; it's only the file's first balance when no start is chosen.
-                rows, fmt = parse_pdf(data, password, opening if not p_start else None, progress=step), "pdf"
+                rows, fmt = parse_pdf(data, password, opening if not p_start else None, progress=step,
+                                      ocr_words=ocr_words), "pdf"
                 wrong = account_mismatch(name, rows.account_number)
                 if wrong:
                     return False, wrong
@@ -8369,8 +8389,8 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
             n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
             checked = "" if fmt != "pdf" else (
-                " Read from the scanned PDF by Claude; every running balance checks out, so the amounts are right "
-                "(check the descriptions)." if rows.pdf_checked and getattr(rows, "scanned", False) else
+                " Read from the scanned PDF on your computer; every running balance checks out, so the amounts are "
+                "right (descriptions may have the odd misread letter)." if rows.pdf_checked and getattr(rows, "scanned", False) else
                 " Read from the PDF; every running balance checks out." if rows.pdf_checked else
                 " Read from the PDF. It has no running balance to check against, so compare the totals with "
                 "the statement before signing off.")
