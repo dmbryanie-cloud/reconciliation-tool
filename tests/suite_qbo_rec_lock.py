@@ -84,6 +84,20 @@ p = page()
 check("ignoring one moves it to the ignored list", "In QuickBooks' reconciled period — match, don't record (1)" in p
       and "FEE ACH INWD CR" in p.split("id=ignored")[1].split("</details>")[0])
 
+# ---- not in QuickBooks after all: released to record ------------------------------------------------------
+check("a locked line has Not in QuickBooks", "Not in QuickBooks</button>" in locked_part(page()))
+cl.post(f"/account/{NAME}/record/unlock", data={"unlock": SEP2})
+p = page()
+check("Not in QuickBooks moves it to the list to record", "SERVICE CHARGE SEPT" not in locked_part(p)
+      and f'name=sel value="{SEP2}"' in p and "checked it isn't in QuickBooks" in p and "Put back" in p)
+check("…logged", q("SELECT count(*) FROM activity_log WHERE action LIKE 'released the line of 20/09/2025%%'")[0][0] == 1)
+cl.post(f"/account/{NAME}/record", data={"bulk": "1", "sel": [SEP2], f"acct_{SEP2}": "83"})
+check("…and it records", len(POSTS) == 2 and q("SELECT status FROM writeback_log WHERE line_id=%s", (SEP2,)) == [("done",)])
+q("DELETE FROM writeback_log WHERE line_id=%s RETURNING 1", (SEP2,))     # as if never recorded
+q("DELETE FROM match WHERE match_id IN (SELECT match_id FROM match_statement_line WHERE line_id=%s) RETURNING 1", (SEP2,))
+cl.post(f"/account/{NAME}/record/unlock?undo=1", data={"unlock": SEP2})
+check("Put back: it's to be matched again", "SERVICE CHARGE SEPT" in locked_part(page()))
+
 # ---- a failed read is reported, and keeps what was known -----------------------------------------------------
 def broken(*a, **k):
     raise RuntimeError("QuickBooks is down")

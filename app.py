@@ -1550,6 +1550,9 @@ try:
                      (_k, _i, _t, _d, datetime.now(timezone.utc) if _done else None, "ReconBook update" if _done else None))
     # One row per statement line ever sent to QuickBooks: stops a double click or a retry
     # from posting the same line twice to the company file.
+    # Lines someone checked aren't in QuickBooks, though dated in its reconciled period: recordable after all.
+    _cur.execute("""CREATE TABLE IF NOT EXISTS qbo_unlock (line_id uuid PRIMARY KEY, unlocked_by text,
+                    unlocked_at timestamptz NOT NULL DEFAULT now());""")
     _cur.execute("""CREATE TABLE IF NOT EXISTS writeback_log (line_id uuid PRIMARY KEY, status text NOT NULL,
                     qbo_type text, qbo_id text, account_fqn text, payee text, error text,
                     created_by text, created_at timestamptz NOT NULL DEFAULT now());""")
@@ -4126,7 +4129,7 @@ PERM_BY_ENDPOINT = {
     "review_match": "review", "review_all": "review", "review_bulk": "review", "manual_match": "review", "unmatch": "review",
     "transfer_dismiss": "review", "transfer_restore": "review",
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
-    "transfer_change": "record", "record_reset": "record", "record_ignore": "record",
+    "transfer_change": "record", "record_reset": "record", "record_ignore": "record", "record_unlock": "record",
     "transfer_undo": "undo", "recorded_twice_fix": "undo", "period_copies_fix": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
     "signoff": "signoff", "qbo_reconcile": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
@@ -5732,6 +5735,16 @@ def refresh_qbo_rec_points(token):
     return bad
 
 
+def qbo_unlocked(cur, line_ids):
+    """{line id: who} of these lines released from QuickBooks' reconciled period: someone checked QuickBooks
+    hasn't got them, so they can be recorded."""
+    ids = [str(x) for x in line_ids]
+    if not ids:
+        return {}
+    cur.execute("SELECT line_id::text, unlocked_by FROM qbo_unlock WHERE line_id = ANY(%s::uuid[]);", (ids,))
+    return dict(cur.fetchall())
+
+
 def qbo_rec_to(cur, acct_uuid):
     """The date QuickBooks is known to be reconciled up to for this account (or None): from the last
     sync, or the starting point taken from QuickBooks' reconciliation."""
@@ -6326,6 +6339,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <td>{% if w.recordable and not w.wb %}<input type=checkbox name=sel value="{{ w.line_id }}" class=rsel data-amt="{{ w.amount }}" {% if w.sel %}checked{% endif %}><input type=hidden name=rowid value="{{ w.line_id }}">{% endif %}</td>
 <td>{{ w.date }}</td>
 <td class=desc>{{ w.who }}{% if w.sug %}<div class=hint>&#8627; {{ w.sug.because }}</div>{% endif %}
+{% if w.unlocked and not w.wb %}<div class=hint>Dated in QuickBooks' reconciled period; {{ w.unlocked_by or 'someone' }} checked it isn't in QuickBooks. <button type=submit name=unlock value="{{ w.line_id }}" formaction="{{ url_for('record_unlock', name=name, undo=1) }}" class=btn-sm data-busy="Putting it back...">Put back</button></div>{% endif %}
 {% if w.dups and not w.wb %}<div class=dupwarn>&#9888; QuickBooks may already have this: {% for x in w.dups %}{{ x.date }} · {{ x.amount|money }}{% if x.who %} · {{ x.who }}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}.
 {% if w.dup_matchable %}<br><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable }}">Match it instead</button>
 {% else %}<br>It's dated outside this statement period. If it's the same money, don't record it again — correct its date in QuickBooks, then refresh, or ignore it.<br>{% endif %} <button type=submit name=ignore value="{{ w.line_id }}" formaction="{{ url_for('record_ignore', name=name) }}" class=btn-sm style="margin-top:6px" title="It's already in QuickBooks: take it off this list without recording it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></div>{% endif %}</td>
@@ -6363,7 +6377,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=hint style="margin:6px 0">QuickBooks is reconciled to {{ q_to.strftime('%d/%m/%Y') }}, so every bank line up to then is already in QuickBooks, perhaps combined with others or on another date. Match each to its QuickBooks entry by hand, or ignore it. Nothing is suggested for recording here.</div>
 <form method=post action="{{ url_for('record_ignore', name=name) }}"><table class=rectbl><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th></th></tr>
 {% for w in locked %}<tr><td>{{ w.date }}</td><td class=desc>{{ w.who }}{% if w.wb == 'gone' %}<div class=hint>The entry recorded from here{% if w.qbo_id %} (#{{ w.qbo_id }}){% endif %} was deleted in QuickBooks.</div>{% endif %}</td><td class=a>{{ w.amount|money }}</td>
-<td style="white-space:nowrap"><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable or '' }}">Match by hand</button> <button type=submit name=ignore value="{{ w.line_id }}" class=btn-sm title="It's already in QuickBooks: take it off this list without matching it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button></td></tr>{% endfor %}</table></form></details>{% endif %}
+<td style="white-space:nowrap"><button type=button class="btn-sm mm-open" data-line="{{ w.line_id }}" data-txn="{{ w.dup_matchable or '' }}">Match by hand</button> <button type=submit name=ignore value="{{ w.line_id }}" class=btn-sm title="It's already in QuickBooks: take it off this list without matching it" data-busy="Ignoring...">Ignore — it's in QuickBooks</button>{% if can('record') %} <button type=submit name=unlock value="{{ w.line_id }}" formaction="{{ url_for('record_unlock', name=name) }}" class=btn-sm title="You've checked QuickBooks hasn't got it: move it to the list to record" data-confirm="Record this line although QuickBooks is reconciled to {{ q_to.strftime('%d/%m/%Y') }}? Only if you've checked QuickBooks hasn't got it, or it'll be in QuickBooks twice. Once recorded, tick it in QuickBooks' next reconciliation." data-busy="Moving it...">Not in QuickBooks</button>{% endif %}</td></tr>{% endfor %}</table></form></details>{% endif %}
 {% if ignored %}<details class=ignlist id=ignored><summary>Ignored — already in QuickBooks ({{ ignored|length }})</summary>
 <div class=hint style="margin:6px 0">Taken off the list to record. Each stays on the statement but not in the books until it's matched.</div>
 <table><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Ignored by</th><th></th></tr>
@@ -7331,6 +7345,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             wb[l_id] = ("gone", wb[l_id][1])
     dups = possible_duplicates(cur, acct_uuid, [l for l in unmatched_lines if l[2] != 0])
     q_to = qbo_rec_to(cur, acct_uuid) if unmatched_lines and not signed else None
+    unlocked = qbo_unlocked(cur, [l[0] for l in unmatched_lines if q_to and l[1] <= q_to]) if q_to else {}
     pool_ids ={str(t[0]) for t in rec["un_books"]}
     writebacks, deposits, on_stmt_in = [], [], []
     # A line in a suggested match still to review is already in QuickBooks if the suggestion is right:
@@ -7408,7 +7423,9 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
             item["vend"] = dr.get("cust") or ""
         # Dated in a period QuickBooks has reconciled: the money is in QuickBooks already, so it's to be
         # matched (or ignored), never recorded -- no account is suggested.
-        item["locked"] = bool(q_to and dd <= q_to and item["wb"] in (None, "taken", "gone"))
+        item["unlocked_by"] = unlocked.get(str(lid)) if str(lid) in unlocked else None
+        item["unlocked"] = str(lid) in unlocked
+        item["locked"] = bool(q_to and dd <= q_to and item["wb"] in (None, "taken", "gone") and not item["unlocked"])
         if item["locked"]:
             item.update(sug=None, acct_id=None, sel=False, recordable=False, split="", hedge=None,
                         why_not=f"QuickBooks is reconciled to {q_to:%d/%m/%Y}")
@@ -8673,8 +8690,9 @@ def _record_run(name, form, ids, user, progress=None):
     lines = [l for l in lines if str(l[0]) not in waiting]
     # Never into a period QuickBooks has reconciled: the money is there already.
     q_to = qbo_rec_to(cur, acct_uuid)
-    n_locked = sum(1 for l in lines if q_to and l[1] <= q_to)
-    lines = [l for l in lines if not (q_to and l[1] <= q_to)]
+    freed = qbo_unlocked(cur, [l[0] for l in lines]) if q_to else {}
+    n_locked = sum(1 for l in lines if q_to and l[1] <= q_to and str(l[0]) not in freed)
+    lines = [l for l in lines if not (q_to and l[1] <= q_to and str(l[0]) not in freed)]
     dups = possible_duplicates(cur, acct_uuid, lines)
     pool = book_pool(cur, acct_uuid, s[0], s[1], s[2])
     cur.execute("""SELECT mbt.txn_id::text FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
@@ -9230,7 +9248,7 @@ def _record_transfer_pair(name, lid, other):
     else:
         for r in (me, them):
             q_to = qbo_rec_to(cur, r[6])
-            if q_to and r[1] <= q_to:
+            if q_to and r[1] <= q_to and str(r[0]) not in qbo_unlocked(cur, [r[0]]):
                 problem = (f"QuickBooks is reconciled to {q_to:%d/%m/%Y} on {r[10]}, so this transfer is in "
                            f"QuickBooks already. Match it instead of recording it.")
                 break
@@ -9846,6 +9864,38 @@ def record_ignore(name):
                                  f"Ignored {what}: it won't be recorded from here.")
     else:
         session["detail_msg"] = "Nothing changed: that line was already done, or its reconciliation is signed off."
+    return redirect(url_for("detail", name=name) + "#sec-record")
+
+
+@app.route("/account/<name>/record/unlock", methods=["POST"])
+def record_unlock(name):
+    """A line dated in QuickBooks' reconciled period that someone checked isn't in QuickBooks: release it so it
+    can be recorded (or put it back)."""
+    lid, undo = request.form.get("unlock") or "", bool(request.args.get("undo"))
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT sl.posted_date, sl.amount FROM statement_line sl JOIN statement s ON s.statement_id=sl.statement_id
+                   JOIN account a ON a.account_id=s.account_id
+                   WHERE a.name=%s AND sl.line_id::text=%s AND s.signed_off_at IS NULL;""", (name, lid))
+    row = cur.fetchone()
+    who = session.get("name") or session.get("username") or "user"
+    n = 0
+    if row and undo:
+        cur.execute("DELETE FROM qbo_unlock WHERE line_id=%s RETURNING 1;", (lid,))
+        n = len(cur.fetchall())
+    elif row:
+        cur.execute("""INSERT INTO qbo_unlock (line_id, unlocked_by) VALUES (%s,%s) ON CONFLICT (line_id) DO NOTHING
+                       RETURNING 1;""", (lid, who))
+        n = len(cur.fetchall())
+    conn.commit(); cur.close(); conn.close()
+    if n:
+        what = f"the line of {row[0].strftime('%d/%m/%Y')}, {row[1]:,.2f}"
+        log_activity((f"put back {what} as already in QuickBooks" if undo else
+                      f"released {what} from QuickBooks' reconciled period to record it (checked it isn't in QuickBooks)"), name)
+        session["detail_msg"] = (f"Put back {what}: it's to be matched, not recorded." if undo else
+                                 f"Moved {what} to the list to record. Pick its account and record it; then tick it in "
+                                 f"QuickBooks' next reconciliation.")
+    else:
+        session["detail_msg"] = "Nothing changed: that line was already moved, or its reconciliation is signed off."
     return redirect(url_for("detail", name=name) + "#sec-record")
 
 
