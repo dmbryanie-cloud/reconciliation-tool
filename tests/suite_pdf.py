@@ -338,27 +338,37 @@ check("…'DEPOSIT TXN CHG' stays in its description", got[1][2] == "AGENT BANKI
 check("…opening is the figure after 'Opening Balance', not the line's last", q("""SELECT opening_balance FROM statement s
       JOIN account a USING (account_id) WHERE a.name='DTB UGX 76001'""")[0][0] == D("27145965.00"))
 
-# ---- scanned PDFs: read by OCR (the worker is stood in for by the words a text PDF of the same layout gives) ----------
-import pdfplumber
-SCAN = make_pdf([[(40, 40, "DEMAND DEPOSIT STATEMENT"), (40, 60, "Account Number: 3100087148 UGX"),
-                  (40, 100, "Transaction Date"), (130, 100, "Value Date"), (200, 100, "Transaction Description"),
-                  (400, 100, "Debits", "r"), (470, 100, "Credits", "r"), (550, 100, "Balance", "r"),
-                  (200, 115, "OPENING BALANCE"), (550, 115, "5,224,125.00 CR", "r"),
-                  (40, 130, "10-09-2025"), (130, 130, "10-09-2025"), (200, 130, "JOURNAL CREDIT STP NO SNI"),
-                  (400, 130, "0", "r"), (470, 130, "37,000,000.00", "r"), (550, 130, "42,224,125.00 CR", "r"),
-                  (200, 142, "EFT-ORDER THE NORTH GREEN"),
-                  (40, 160, "26-09-2025"), (130, 160, "26-09-2025"), (200, 160, "STANDING ORDER PAYMENT"),
-                  (400, 160, "36,535,555.00", "r"), (470, 160, "0", "r"), (550, 160, "5,688,570.00 CR", "r")]])
-with pdfplumber.open(io.BytesIO(SCAN)) as pdf_:
-    OCR_WORDS = [[{k: w[k] for k in ("text", "x0", "x1", "top", "bottom")} for w in pg.extract_words()] for pg in pdf_.pages]
+# ---- scanned PDFs: read by Claude (its API call is stood in for here) ----------------------------------------------
+import json as _json
 BLANK = make_pdf([[]])
-A._ocr_words = lambda data, password=None, progress=None: None
+A.ANTHROPIC_API_KEY = ""
 r, p = upload(BLANK, acct="DTB UGX 76001")
-check("a scan, where OCR isn't available: says it can't be read", "no readable text" in p)
-A._ocr_words = lambda data, password=None, progress=None: OCR_WORDS
-r, p = upload(BLANK, acct="DTB UGX 76001", period_start="2025-09-01", period_end="2025-09-30")
-got = q("""SELECT sl.posted_date::text, sl.amount FROM statement_line sl JOIN statement s USING (statement_id)
+check("a scan, with no Claude API key set: says it can't be read", "no readable text" in p)
+READ = {"account_number": "3100087148 UGX", "opening_balance": "5,224,125.00 CR", "closing_balance": "5,688,570.00",
+        "period_start": "2025-09-01", "period_end": "2025-09-30",
+        "transactions": [{"date": "2025-09-10", "description": "JOURNAL CREDIT STP NO SNI  EFT-ORDER", "debit": "0",
+                          "credit": "37,000,000.00", "amount": None, "balance": "42,224,125.00 CR"},
+                         {"date": "2025-09-26", "description": "STANDING ORDER PAYMENT", "debit": "36,535,555.00",
+                          "credit": None, "amount": None, "balance": "5,688,570.00 CR"}]}
+SENT = []
+def fake_call(images):
+    SENT.append(len(images)); return _json.loads(_json.dumps(READ))
+A.ANTHROPIC_API_KEY = "test-key"
+A._scan_call = fake_call
+r, p = upload(BLANK, acct="DTB UGX 76001")
+got = q("""SELECT sl.posted_date::text, sl.amount, sl.description FROM statement_line sl JOIN statement s USING (statement_id)
            JOIN account a USING (account_id) WHERE a.name='DTB UGX 76001' AND s.period_start='2025-09-01' ORDER BY 1""")
-check("a scan, read by OCR: its lines are loaded", got == [("2025-09-10", D("37000000.00")), ("2025-09-26", D("-36535555.00"))])
-check("…saying it was a scan and the running balances check out", "Read from the scanned PDF by OCR; every running balance checks out" in p)
+check("a scan, read by Claude: its pages are sent as images", SENT == [1])
+check("…its lines are loaded, in and out the right way round", [(d_, a_) for d_, a_, _ in got] ==
+      [("2025-09-10", D("37000000.00")), ("2025-09-26", D("-36535555.00"))] and got[0][2] == "JOURNAL CREDIT STP NO SNI EFT-ORDER")
+check("…with the statement's own period and balances", q("""SELECT period_end::text, opening_balance, closing_balance FROM statement s
+      JOIN account a USING (account_id) WHERE a.name='DTB UGX 76001' AND s.period_start='2025-09-01'""")
+      == [("2025-09-30", D("5224125.00"), D("5688570.00"))])
+check("…saying it was a scan and the running balances check out", "Read from the scanned PDF by Claude; every running balance checks out" in p)
+READ["transactions"][1]["debit"] = "36,535,355.00"       # a figure misread
+r, p = upload(BLANK, acct="DTB UGX 76001", period_start="2025-09-01", period_end="2025-09-30")
+import html as _html
+p = _html.unescape(p)
+check("a figure read wrongly: the running balance catches it, nothing imported", "running balance doesn't add up on 1 line" in p
+      and "upload it again (each upload is read afresh)" in p)
 sys.exit(T.summary())

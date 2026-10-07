@@ -4602,31 +4602,93 @@ def _pdf_group(words, tol=3, by_middle=False):
     return _pdf_unwrap_amounts(lines)
 
 
-OCR_TIMEOUT = int(os.environ.get("OCR_TIMEOUT", "900"))     # seconds for a whole scanned statement
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+SCAN_MODEL = os.environ.get("SCAN_MODEL", "claude-sonnet-5-5")
+SCAN_PAGES_PER_CALL = 8        # pages sent to Claude at a time: keeps each answer well inside its output limit
+SCAN_SCALE = 2                 # pages rendered at 144 dpi: statement print stays legible
+
+SCAN_PROMPT = """These are pages of a scanned bank statement. Transcribe its transactions exactly as printed.
+
+Answer with JSON only, no other text:
+{"account_number": "the account number as printed, or null",
+ "opening_balance": "the opening / brought-forward balance as printed (e.g. \"2,442,435.00 CR\"), or null if these pages don't show it",
+ "closing_balance": "the closing / book balance as printed, or null",
+ "period_start": "YYYY-MM-DD or null", "period_end": "YYYY-MM-DD or null",
+ "transactions": [{"date": "YYYY-MM-DD (the transaction / posting date, not the value date)",
+                   "description": "the full description, wrapped lines joined with spaces",
+                   "debit": "money out as printed, or null", "credit": "money in as printed, or null",
+                   "amount": "only if the statement has a single signed amount column instead of debit/credit, else null",
+                   "balance": "the running balance as printed, with any CR/DR, or null"}]}
+
+Rules: copy every figure digit for digit -- never calculate, round or correct one. A 0 or dash in a debit or credit
+column means empty (null). Keep the order the statement prints them in. Include every transaction row on these pages;
+leave out opening/closing balance rows, page totals and summaries. Dates on this statement are day-first unless it
+clearly shows otherwise."""
 
 
-def _ocr_words(data, password=None, progress=None):
-    """A scanned PDF's words, read by OCR (ocr_worker.py, on this server -- nothing is sent anywhere): per
-    page, in pdfplumber's shape and units, so the PDF reader treats them like a text PDF's. It runs in a
-    process of its own, so its memory is given back when it ends. None when OCR isn't available here."""
-    import subprocess, sys
-    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_worker.py")
-    if not os.path.exists(worker):
-        return None
-    if progress:
-        progress("Reading the scanned PDF (about half a minute a page)")
-    env = dict(os.environ, PDF_PASSWORD=password or "")
+def _scan_call(images):
+    """One Messages API call: page images in, the statement's JSON out."""
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": im}} for im in images]
+    content.append({"type": "text", "text": SCAN_PROMPT})
+    body = json.dumps({"model": SCAN_MODEL, "max_tokens": 16000,
+                       "messages": [{"role": "user", "content": content}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST", headers={
+        "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
     try:
-        r = subprocess.run([sys.executable, worker], input=data, capture_output=True, env=env, timeout=OCR_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise ValueError("Reading the scanned PDF took too long. Split it into fewer pages, or download the "
-                         "statement from online banking instead.")
-    if r.returncode != 0:
-        return None
+        with urllib.request.urlopen(req, timeout=300) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read()).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise ValueError(f"Claude couldn't read the scanned PDF ({e.code}{': ' + detail if detail else ''}).")
+    except Exception as e:
+        raise ValueError(f"Claude couldn't be reached to read the scanned PDF ({e}). Try again in a minute.")
+    if resp.get("stop_reason") == "max_tokens":
+        raise ValueError("The scanned PDF has too many lines on its pages to read in one go. Split it and upload the parts.")
+    text = "".join(c.get("text", "") for c in resp.get("content", []) if c.get("type") == "text")
+    m = re.search(r"\{.*\}", text, re.S)
     try:
-        return json.loads(r.stdout or b"[]")
-    except ValueError:
+        return json.loads(m.group(0))
+    except Exception:
+        raise ValueError("Claude's reading of the scanned PDF couldn't be understood. Try uploading it again.")
+
+
+def _scan_transcribe(data, password=None, progress=None):
+    """A scanned statement read by Claude (Anthropic's API): its transactions and balances as printed, or None
+    when no API key is set. Pages go as images, a few at a time; the running-balance check afterwards catches
+    any figure read wrongly."""
+    if not ANTHROPIC_API_KEY:
         return None
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(data, password=password or None)
+    out = {"transactions": []}
+    try:
+        n = len(doc)
+        for start in range(0, n, SCAN_PAGES_PER_CALL):
+            end = min(n, start + SCAN_PAGES_PER_CALL)
+            if progress:
+                progress(f"Reading the scanned PDF with Claude: page{'s' if end - start > 1 else ''} "
+                         f"{start + 1}{'-' + str(end) if end - start > 1 else ''} of {n}")
+            images = []
+            for i in range(start, end):
+                buf = io.BytesIO()
+                doc[i].render(scale=SCAN_SCALE).to_pil().convert("L").save(buf, format="PNG", optimize=True)
+                images.append(base64.b64encode(buf.getvalue()).decode())
+            part = _scan_call(images)
+            for k in ("account_number", "opening_balance", "period_start"):
+                out.setdefault(k, None)
+                if out[k] is None:
+                    out[k] = part.get(k)
+            for k in ("closing_balance", "period_end"):
+                if part.get(k) is not None:
+                    out[k] = part.get(k)
+            out["transactions"] += part.get("transactions") or []
+    finally:
+        doc.close()
+    return out
 
 
 _AMT_CUT = re.compile(r"^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d?$")     # e.g. 1,488,000,000.0 (a digit short)
@@ -4785,6 +4847,32 @@ def _pdf_breaks(seq, start):
     return bad, out
 
 
+def _scan_raw(scan):
+    """Claude's transcription of a scan as the PDF reader's rows (raw), opening and closing balances."""
+    def amt(v):
+        v = ("" if v is None else str(v)).strip()
+        return None if v in ("", "-", "0", "0.00", "null") else parse_amount(v)
+    raw = []
+    for t in scan.get("transactions") or []:
+        try:
+            d = date.fromisoformat((t.get("date") or "")[:10])
+            deb, cre, one = amt(t.get("debit")), amt(t.get("credit")), amt(t.get("amount"))
+            bal = amt(t.get("balance")) if str(t.get("balance") or "").strip() not in ("0", "0.00") else Decimal(0)
+        except (ValueError, ArithmeticError):
+            raise ValueError(f"A line of the scanned PDF couldn't be read: {json.dumps(t)[:120]}. Nothing was imported.")
+        if deb is None and cre is None and one is None:
+            continue
+        a = one if one is not None else (abs(cre or 0) - abs(deb or 0))
+        raw.append({"date": d, "amount": a, "desc": " ".join(str(t.get("description") or "").split()),
+                    "balance": bal, "known": True})
+    def bal_of(k):
+        try:
+            return amt(scan.get(k))
+        except (ValueError, ArithmeticError):
+            return None
+    return raw, bal_of("opening_balance"), bal_of("closing_balance")
+
+
 def parse_pdf(data, password=None, opening_hint=None, progress=None):
     """Statement lines from a bank's PDF statement. Returns _Rows like the CSV/OFX parsers."""
     try:
@@ -4816,13 +4904,13 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 progress(f"Reading the PDF: page {i + 1} of {len(pages)}")
     finally:
         pdf.close()
-    scanned = False
+    scan = None
     if not any(page_lines):
-        ocr = _ocr_words(data, password, progress)
-        if not ocr or not any(ocr):
+        scan = _scan_transcribe(data, password, progress)
+        if not scan:
             raise ValueError("This PDF has no readable text — it's probably a scan or photo. Download the statement "
                              "from online banking as a PDF, CSV or Excel file instead.")
-        page_lines, scanned = [_pdf_group(ws, tol=4, by_middle=True) for ws in ocr], True
+    scanned = scan is not None
     all_text = "\n".join(" ".join(w["text"] for w in l) for pl in page_lines for l in pl)
     dayfirst = _detect_dayfirst([l[0]["text"] for pl in page_lines for l in pl if l])
 
@@ -4937,6 +5025,9 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 prev = None; continue       # a balance-only line (e.g. a dated "balance b/f")
             raw.append(r); prev = r
 
+    if scan:
+        raw, opening, closing = _scan_raw(scan)
+        all_text = f"Account Number: {scan.get('account_number') or ''}"
     if not raw:
         raise ValueError("No transactions found in the PDF. If it's a statement, upload the CSV or OFX export instead.")
 
@@ -4976,8 +5067,10 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
         if bad:
             eg = "; ".join(f"{r['date']} {r['desc'][:30]} {_money(r['amount'])} (balance {_money(r['balance'])})" for r in bad[:3])
             raise ValueError(f"The running balance doesn't add up on {len(bad)} line{'' if len(bad) == 1 else 's'} of "
-                             f"the PDF, so it may have been read wrongly: {eg}. Nothing was imported — upload the CSV "
-                             f"or OFX export instead, or send this PDF to support.")
+                             f"the PDF, so it may have been read wrongly: {eg}. Nothing was imported — "
+                             + ("upload it again (each upload is read afresh), or download the statement from online "
+                                "banking instead." if scan else "upload the CSV or OFX export instead, or send this PDF "
+                                "to support."))
         rows.pdf_checked = True
     else:
         rows.pdf_checked = False
@@ -5002,6 +5095,14 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
             rows.period_start, rows.period_end = a, b
             break
     rows.account_number = _statement_account_number(all_text)
+    if scan:
+        for k in ("period_start", "period_end"):
+            try:
+                setattr(rows, k, date.fromisoformat(scan.get(k) or ""))
+            except ValueError:
+                pass
+        if not (rows.period_start and rows.period_end and rows.period_start <= first and rows.period_end >= last):
+            rows.period_start = rows.period_end = None
     rows.scanned = scanned
     return rows
 
@@ -8268,8 +8369,8 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
             n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
             checked = "" if fmt != "pdf" else (
-                " Read from the scanned PDF by OCR; every running balance checks out, so the amounts are right "
-                "(descriptions may have the odd misread letter)." if rows.pdf_checked and getattr(rows, "scanned", False) else
+                " Read from the scanned PDF by Claude; every running balance checks out, so the amounts are right "
+                "(check the descriptions)." if rows.pdf_checked and getattr(rows, "scanned", False) else
                 " Read from the PDF; every running balance checks out." if rows.pdf_checked else
                 " Read from the PDF. It has no running balance to check against, so compare the totals with "
                 "the statement before signing off.")
