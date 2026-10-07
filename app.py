@@ -4584,16 +4584,49 @@ def _pdf_date(words, dayfirst):
 
 def _pdf_lines(page):
     """Words grouped into visual lines, top to bottom, left to right."""
-    words = sorted(page.extract_words(keep_blank_chars=False, x_tolerance=1.5, y_tolerance=2),
-                   key=lambda w: (round(w["top"]), w["x0"]))
+    return _pdf_group(page.extract_words(keep_blank_chars=False, x_tolerance=1.5, y_tolerance=2))
+
+
+def _pdf_group(words, tol=3, by_middle=False):
+    """Words (pdfplumber's shape: text, x0, x1, top, bottom) into visual lines. Words read from a scan don't
+    share a top exactly, so those go by their middles."""
+    key = (lambda w: (w["top"] + w["bottom"]) / 2) if by_middle else (lambda w: w["top"])
+    words = sorted(words, key=lambda w: (round(key(w)), w["x0"]))
     lines = []
     for w in words:
-        if lines and abs(lines[-1][0]["top"] - w["top"]) <= 3:
+        if lines and abs(key(lines[-1][0]) - key(w)) <= tol:
             lines[-1].append(w)
         else:
             lines.append([w])
     lines = [sorted(l, key=lambda w: w["x0"]) for l in lines]
     return _pdf_unwrap_amounts(lines)
+
+
+OCR_TIMEOUT = int(os.environ.get("OCR_TIMEOUT", "900"))     # seconds for a whole scanned statement
+
+
+def _ocr_words(data, password=None, progress=None):
+    """A scanned PDF's words, read by OCR (ocr_worker.py, on this server -- nothing is sent anywhere): per
+    page, in pdfplumber's shape and units, so the PDF reader treats them like a text PDF's. It runs in a
+    process of its own, so its memory is given back when it ends. None when OCR isn't available here."""
+    import subprocess, sys
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_worker.py")
+    if not os.path.exists(worker):
+        return None
+    if progress:
+        progress("Reading the scanned PDF (about half a minute a page)")
+    env = dict(os.environ, PDF_PASSWORD=password or "")
+    try:
+        r = subprocess.run([sys.executable, worker], input=data, capture_output=True, env=env, timeout=OCR_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Reading the scanned PDF took too long. Split it into fewer pages, or download the "
+                         "statement from online banking instead.")
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout or b"[]")
+    except ValueError:
+        return None
 
 
 _AMT_CUT = re.compile(r"^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d?$")     # e.g. 1,488,000,000.0 (a digit short)
@@ -4783,9 +4816,13 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
                 progress(f"Reading the PDF: page {i + 1} of {len(pages)}")
     finally:
         pdf.close()
+    scanned = False
     if not any(page_lines):
-        raise ValueError("This PDF has no readable text — it's probably a scan or photo. Download the statement "
-                         "from online banking as a PDF, CSV or Excel file instead.")
+        ocr = _ocr_words(data, password, progress)
+        if not ocr or not any(ocr):
+            raise ValueError("This PDF has no readable text — it's probably a scan or photo. Download the statement "
+                             "from online banking as a PDF, CSV or Excel file instead.")
+        page_lines, scanned = [_pdf_group(ws, tol=4, by_middle=True) for ws in ocr], True
     all_text = "\n".join(" ".join(w["text"] for w in l) for pl in page_lines for l in pl)
     dayfirst = _detect_dayfirst([l[0]["text"] for pl in page_lines for l in pl if l])
 
@@ -4965,6 +5002,7 @@ def parse_pdf(data, password=None, opening_hint=None, progress=None):
             rows.period_start, rows.period_end = a, b
             break
     rows.account_number = _statement_account_number(all_text)
+    rows.scanned = scanned
     return rows
 
 
@@ -8230,6 +8268,8 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
             sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
             n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
             checked = "" if fmt != "pdf" else (
+                " Read from the scanned PDF by OCR; every running balance checks out, so the amounts are right "
+                "(descriptions may have the odd misread letter)." if rows.pdf_checked and getattr(rows, "scanned", False) else
                 " Read from the PDF; every running balance checks out." if rows.pdf_checked else
                 " Read from the PDF. It has no running balance to check against, so compare the totals with "
                 "the statement before signing off.")
