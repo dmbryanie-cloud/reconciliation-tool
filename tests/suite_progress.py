@@ -137,6 +137,8 @@ A._upload_run, A.SYNC_IN_BACKGROUND = real_run, False
 
 # Amount boxes show thousands separators (Edit balances, the upload panel, split amounts...)
 import json, os, shutil, subprocess, tempfile
+# Not straight after August's sign-off (that would carry its closing in as the opening): these check typed amounts.
+q("UPDATE statement SET period_start='2026-09-02' WHERE statement_id=%s RETURNING 1", (sid,))
 cl.post("/account/Stanbic UGX/balances", data={"opening": "1234567.5", "closing": "-2500000", "book": "178221410.00"})
 node = shutil.which("node")
 if not node or not os.path.isdir(os.path.join(H.HERE, "node_modules", "jsdom")):

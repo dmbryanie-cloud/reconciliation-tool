@@ -1498,7 +1498,7 @@ try:
                        ("book_balance_source", "text"), ("signoff_note", "text"),
                        ("saved_later_at", "timestamptz"), ("saved_later_by", "text"),
                        ("snap_exact", "int"), ("snap_fuzzy", "int"), ("snap_m2o", "int"),
-                       ("snap_exc", "int"), ("snap_diff", "numeric")):
+                       ("snap_exc", "int"), ("snap_diff", "numeric"), ("file_opening", "numeric")):
         _cur.execute(f"ALTER TABLE statement ADD COLUMN IF NOT EXISTS {_col} {_typ};")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_book_txn_amt_date ON book_txn (amount, posted_date);")
     _cur.execute("ALTER TABLE book_txn ADD COLUMN IF NOT EXISTS counterparty_ref text;")   # e.g. 'Vendor:56'
@@ -5010,14 +5010,34 @@ def _prev_signed_closing(cur, acct_uuid, before, exclude_sid=None):
 
 def _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src, exclude_sid=None):
     """Fill in whatever balance wasn't supplied. Closing is never derived from movements -- that
-    would make the statement add up by construction and hide a missing line."""
+    would make the statement add up by construction and hide a missing line. A reconciliation that starts the
+    day after the last one (signed off, or QuickBooks' starting point) opens at that one's closing balance,
+    whatever was typed or read from the file."""
+    prev = _prev_signed_closing(cur, acct_uuid, p_start, exclude_sid)
+    if prev and prev[1] == p_start - timedelta(days=1):
+        if opening is not None and _D(opening) != _D(prev[0]) and has_request_context():
+            g.opening_note = (f" The opening balance is the last reconciliation's closing balance on {prev[1]:%d/%m/%Y}, "
+                              f"{_money(prev[0])}; the {'typed' if o_src == 'user' else 'statement' + chr(39) + 's'} "
+                              f"{_money(opening)} wasn't used. They differ by {_money(_D(opening) - _D(prev[0]))}: check "
+                              f"the statement continues from the last one, with no line missing between them.")
+        return prev[0], "carried", closing, c_src
     if opening is None:
-        prev = _prev_signed_closing(cur, acct_uuid, p_start, exclude_sid)
         if prev:
             opening, o_src = prev[0], "carried"
         elif closing is not None:
             opening, o_src = closing - moves, "derived"
     return opening, o_src, closing, c_src
+
+
+def opening_mismatch_note(cur, acct_uuid, p_start, opening, file_open):
+    """Why a typed opening balance looks wrong: it isn't the statement's own balance on the start date."""
+    note = (f"Check the opening balance: {_money(opening)} was typed, but the statement's own balance going into "
+            f"{p_start:%d/%m/%Y} is {_money(file_open)} (a difference of {_money(_D(opening) - _D(file_open))}).")
+    q_to = qbo_rec_to(cur, acct_uuid)
+    if q_to and q_to >= p_start:
+        note += (f" QuickBooks is reconciled to {q_to:%d/%m/%Y} on this account: if that was its reconciled balance, it "
+                 f"belongs to a reconciliation starting {q_to + timedelta(days=1):%d/%m/%Y}, not {p_start:%d/%m/%Y}.")
+    return note
 
 
 def _resolve_period(cur, acct_uuid, rows, p_start=None, p_end=None):
@@ -5181,12 +5201,16 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
         opening, o_src = rows.opening, "file"
     if closing is None and getattr(rows, "closing", None) is not None:
         closing, c_src = rows.closing, "file"
+    file_open = getattr(rows, "opening", None)      # the bank's own running balance going into p_start
     opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, moves, opening, o_src, closing, c_src)
+    if o_src == "user" and file_open is not None and _D(opening) != _D(file_open) and has_request_context():
+        g.opening_note = " " + opening_mismatch_note(cur, acct_uuid, p_start, opening, file_open)
     cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end,
-                   opening_balance, closing_balance, opening_source, closing_source, currency, source_format, prepared_by)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
+                   opening_balance, closing_balance, opening_source, closing_source, currency, source_format, prepared_by,
+                   file_opening)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
                 (ORG_ID, acct_uuid, p_start, p_end, opening or 0, closing or 0, o_src, c_src, currency, source_format,
-                 session.get("name") if has_request_context() else None))
+                 session.get("name") if has_request_context() else None, file_open))
     sid = cur.fetchone()[0]
     seen = {}
     for r, key in zip(rows, _dedupe_keys(rows)):
@@ -6186,6 +6210,8 @@ f.querySelector('button[type=submit]').click()})})();</script>
 </div>
 {% if rec.foot_diff %}<div class="recnote bad">The statement doesn't add up: opening {{ rec.opening|money }} + {{ rec.n_lines }} lines ({{ rec.moves|money }}) = {{ (rec.opening + rec.moves)|money }}, but the closing balance is {{ rec.closing|money }} (out by {{ rec.foot_diff|money }}). A line is probably missing from the upload, or a balance was mistyped.</div>
 {% elif rec.foot_diff is not none and rec.opening_src != 'derived' %}<div class=sub style="margin:4px 0 8px;font-size:13px">&#10003; Statement adds up: opening {{ rec.opening|money }} + movements {{ rec.moves|money }} = closing {{ rec.closing|money }}</div>{% endif %}
+{% if opening_check %}<div class="recnote warn" id=opening-check>{{ opening_check.note }}
+<form method=post action="{{ url_for('balances', name=name) }}" style="margin-top:8px"><input type=hidden name=period_start value="{{ p_start }}"><input type=hidden name=period_end value="{{ p_end }}"><input type=hidden name=opening value="{{ opening_check.file }}"><input type=hidden name=closing value="{{ '' if rec.closing is none else rec.closing }}"><input type=hidden name=book value="{{ '' if rec.book is none else rec.book }}"><button type=submit class=btn-sm data-busy="Saving...">Use the statement's {{ opening_check.file|money }}</button></form></div>{% endif %}
 {% if rec.prev_closing is not none and rec.opening is not none and rec.opening_src != 'carried' and rec.prev_closing != rec.opening %}<div class="recnote warn">This opening balance ({{ rec.opening|money }}) doesn't match the last signed-off closing balance ({{ rec.prev_closing|money }} at {{ rec.prev_end }}). Check for a missing statement between the two periods.</div>{% endif %}
 {% if rec.n_gone %}<div class="recnote bad">{{ rec.n_gone }} book transaction{{ '' if rec.n_gone==1 else 's' }} matched in this reconciliation {{ 'has' if rec.n_gone==1 else 'have' }} since been deleted, voided or moved in QuickBooks.{% if signed_off %} Undo the sign-off and re-upload the statement to re-match.{% endif %}</div>{% endif %}
 {% if rec.bf_count %}<div class=sub style="margin:4px 0 8px;font-size:13px">Includes {{ rec.bf_count }} item{{ '' if rec.bf_count==1 else 's' }} brought forward from earlier periods, still not cleared by the bank.</div>{% endif %}
@@ -6195,7 +6221,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <form method=post action="{{ url_for('balances', name=name) }}" class=balform>
 <div><label>Period start</label><input type=date name=period_start value="{{ p_start }}"{% if focus %} readonly title="Choose Whole statement to change the period"{% endif %}></div>
 <div><label>Period end</label><input type=date name=period_end value="{{ p_end }}"{% if focus %} readonly title="Choose Whole statement to change the period"{% endif %}></div>
-<div><label>Opening balance{{ ' (whole statement)' if focus else '' }}</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening|money }}"></div>
+<div><label>Opening balance{{ ' (whole statement)' if focus else '' }}</label><input name=opening inputmode=decimal value="{{ '' if rec.opening is none else rec.opening|money }}"{% if rec.opening_src == 'carried' %} readonly title="The last reconciliation's closing balance on {{ rec.prev_end }}" style="background:var(--bg);color:var(--muted)"{% endif %}></div>
 <div><label>Closing balance ({{ 'whole statement' if focus else 'statement' }})</label><input name=closing inputmode=decimal value="{{ '' if rec.closing is none else rec.closing|money }}"></div>
 <div><label>Book balance at {{ p_end }}</label><input name=book inputmode=decimal value="{{ '' if rec.book is none else rec.book|money }}"></div>
 <button type=submit class=btn-sm>Save balances</button>
@@ -7882,6 +7908,12 @@ def detail(name):
     if qrec and st and not st[3]:
         pcopies = period_copies(cur, st[0], qrec)
     n_lines = n_matched_lines = 0
+    opening_check = None
+    if st and not st[3]:
+        cur.execute("SELECT opening_balance, opening_source, file_opening FROM statement WHERE statement_id=%s;", (st[0],))
+        ob, osrc, fo = cur.fetchone()
+        if osrc == "user" and fo is not None and _D(ob) != _D(fo):
+            opening_check = {"note": opening_mismatch_note(cur, acct_uuid, st[1], ob, fo), "file": fo}
     focus = focus_window(name, st[0], st[1], st[2]) if st and d.get("has_results") else None
     if st:
         cur.execute("SELECT prepared_by, signed_off_by, saved_later_at, saved_later_by FROM statement WHERE statement_id=%s;", (st[0],))
@@ -7928,7 +7960,8 @@ def detail(name):
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
                                   mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
-                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None, **d)
+                                  focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None,
+                                  opening_check=opening_check, **d)
 
 
 def _form_amount(field):
@@ -8163,6 +8196,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
         if replaced:
             checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
         n_pre, n_post = getattr(g, "left_out", (0, 0))
+        checked += getattr(g, "opening_note", "")
         continued = getattr(g, "continued", None)
         if continued:      # it says itself which lines were already here
             checked += continued
@@ -9843,12 +9877,13 @@ def balances(name):
             cur.execute("""UPDATE statement SET opening_balance=%s, opening_source=%s, closing_balance=%s, closing_source=%s,
                            book_balance=%s, book_balance_source=%s WHERE statement_id=%s;""",
                         (opening or 0, o_src, closing or 0, c_src, book, book_src, sid))
-            session["detail_msg"] = "Balances saved."
+            session["detail_msg"] = "Balances saved." + getattr(g, "opening_note", "")
             if rematch:
                 conn.commit(); cur.close(); conn.close()
                 note = run_matcher(sid)
                 conn = get_conn(); cur = conn.cursor()
-                session["detail_msg"] = "Balances and period saved; matching re-run." + (f" {note}" if note else "")
+                session["detail_msg"] = ("Balances and period saved; matching re-run." + (f" {note}" if note else "")
+                                         + getattr(g, "opening_note", ""))
         cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
         conn.commit()
     except urllib.error.HTTPError as e:
