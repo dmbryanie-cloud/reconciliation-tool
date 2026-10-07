@@ -5512,8 +5512,9 @@ def run_matcher(statement_id):
 
     # pass 3c: bank charges booked as totals on other dates. The bank takes each fee and its excise
     # duty as its own line; QuickBooks often has them added up per batch, a day or two out. From each
-    # day with charges, add both sides day by day for up to CHARGE_GROUP_DAYS (never into the next
-    # month) and close a group at the first day the totals agree: the smallest groups that tie. A day
+    # day with charges, add both sides day by day for up to CHARGE_GROUP_DAYS (into the next month only
+    # within the date tolerance: month-end fees QuickBooks has on their value date, the 1st or 2nd) and
+    # close a group at the first day the totals agree: the smallest groups that tie. A day
     # that never ties is left alone, so one stray charge doesn't hold up the rest of the month.
     # Suggested only, for review.
     ch_lines = [(l, d, a) for (l, d, a, w) in lines if l in charges and l not in matched_lines]
@@ -5534,7 +5535,8 @@ def run_matcher(statement_id):
             gl, gt, sl, st, closed = [], [], Decimal(0), Decimal(0), None
             for j in range(k, len(order)):
                 d = order[j]
-                if (d - d0).days > min(CHARGE_GROUP_DAYS, group_days) or (d.year, d.month) != (d0.year, d0.month):
+                if (d - d0).days > min(CHARGE_GROUP_DAYS, group_days) or (
+                        (d.year, d.month) != (d0.year, d0.month) and (d - d0).days > date_days):
                     break
                 ls_, ts_ = days[d]
                 gl += [i for i, _ in ls_]; gt += [i for i, _ in ts_]

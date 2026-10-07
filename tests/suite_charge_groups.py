@@ -8,6 +8,8 @@ QuickBooks isn't called. Run on its own with `python tests/suite_charge_groups.p
 import io, re, sys
 from decimal import Decimal as D
 
+from datetime import date
+
 import harness as H
 
 UGX = "00000000-0000-0000-0000-0000000000a1"
@@ -38,7 +40,8 @@ book("2026-02-04", -600, "GOVERNMENT EXCISE DUTY CHARGE", CH)
 book("2026-02-05", -4000, "FEE  ACH INWD CR", CH)
 book("2026-02-05", -600, "GOVERNMENT EXCISE DUTY CHARGE", CH)
 book("2026-03-04", -2500, "FEE ACH INWD CR", CH)                      # March doesn't tie: left alone
-book("2026-04-01", -300, "GOVERNMENT EXCISE DUTY CHARGE", CH)         # next month: no group across months
+book("2026-04-01", -300, "GOVERNMENT EXCISE DUTY CHARGE", CH)         # 31/03's, on its value date in the next month
+book("2026-05-01", -2000, "FEE ACH INWD CR", CH)                       # a month after 03/03's: never paired with it
 book("2026-03-24", -36000, "MONTHLY MANAGEMENT FEE", CH)               # a day before the bank, after a stray charge
 book("2026-02-10", -2300, "EFT BOL FEES INST ID 86116882 Fee Collection", CH)   # same wording as the bank's fee line
 
@@ -89,7 +92,10 @@ check("every February charge line is in a suggestion", q("""SELECT count(*) FROM
 check("rent (not a charge) stays out of every group", not q("""SELECT 1 FROM match_book_txn y JOIN book_txn b USING (txn_id)
       WHERE b.description='Rent store'"""))
 check("a charge with nothing to tie to: nothing suggested", not q("""SELECT 1 FROM match_statement_line x
-      JOIN statement_line sl USING (line_id) WHERE sl.posted_date IN ('2026-03-03', '2026-03-31')"""))
+      JOIN statement_line sl USING (line_id) WHERE sl.posted_date = '2026-03-03'"""))
+cross = [x for x in groups() if x[5] == date(2026, 4, 1)]
+check("a month-end charge QuickBooks has on the 1st of the next month: suggested across the month end",
+      len(cross) == 1 and cross[0][3] == [D("-300")] and cross[0][4] == [D("-300")])
 fee10 = q("""SELECT m.match_type, m.confidence, (SELECT count(*) FROM match_statement_line x WHERE x.match_id=m.match_id)
              FROM match m JOIN match_book_txn y USING (match_id) JOIN book_txn b USING (txn_id)
              WHERE b.posted_date='2026-02-10' AND b.amount=-2300""")
@@ -104,7 +110,7 @@ check("a failed payment and its reversal suggested as a pair, with no QuickBooks
 check("opposite amounts that don't say reversal aren't paired", not q("""SELECT 1 FROM match_statement_line x
       JOIN statement_line sl USING (line_id) WHERE sl.description LIKE '%%OKELLO%%'"""))
 p = cl.get("/account/Stanbic 7994").data.decode()
-check("labelled on the page as bank charges with different dates", p.count("bank charges, dates differ") == 3)
+check("labelled on the page as bank charges with different dates", p.count("bank charges, dates differ") == 4)
 check("…and the reversal as a payment and its reversal", "payment and its reversal" in p)
 
 # Confirming keeps it through a re-match; rejecting stops it being suggested again.
