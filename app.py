@@ -6217,7 +6217,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if can('settings') %}<div class=sep></div><div class=dh>Admin</div>
 {% if qbo_connected and qbo_linked %}<button type=button data-drawer=qbostart>QuickBooks starting point</button>{% endif %}
 <form method=post action="{{ url_for('set_currency', name=name) }}" class=ccyf><label for=ccy-in>Currency</label><input id=ccy-in name=currency value="{{ ccy or '' }}" maxlength=8 placeholder="UGX"><button type=submit class=btn-sm>Set</button></form>
-<form method=post action="{{ url_for('clear_account', name=name) }}" data-confirm="Clear this account's data? All statements and book transactions for it are removed here, to start fresh. QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Clear this account's data</button></form>
+<form method=post action="{{ url_for('clear_account', name=name) }}" data-confirm="Clear this account's data? All its statements, matches and work are removed here, to start fresh, and its books are re-read from QuickBooks (a full sync). QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Clear this account's data</button></form>
 <form method=post action="{{ url_for('delete_account', name=name) }}" data-confirm="Delete this account entirely? It and all its statements and transactions are removed here (for old sandbox accounts). QuickBooks is not changed. This cannot be undone."><button type=submit class=danger>Delete account</button></form>{% endif %}
 </div></span>
 </div></div>
@@ -10524,6 +10524,7 @@ def delete_account(name):
         cur.execute("DELETE FROM account WHERE account_id=%s;", (acct,))
         conn.commit()
         session["sync_msg"] = "Removed account '" + name + "' and all its data."
+        log_activity("deleted the account and all its data", name)
     cur.close(); conn.close()
     return redirect(url_for("dashboard"))
 
@@ -10546,7 +10547,18 @@ def clear_account(name):
         cur.execute("DELETE FROM qbo_reconciled WHERE account_id=%s;", (acct,))
         cur.execute("DELETE FROM qbo_baseline WHERE account_id=%s;", (acct,))
         conn.commit()
-        session["detail_msg"] = "Cleared all data for this account. Import your books and upload a statement to start fresh."
+        log_activity("cleared the account's data (statements, matches and its copy of the books)", name)
+        # Its copy of the books is gone, and a normal sync only fetches changes: re-read everything.
+        set_config("sync_force_full", "1")
+        again = ""
+        if qbo_is_connected():
+            try:
+                again = (" The books are being re-read from QuickBooks (a full sync, a few minutes)."
+                         if start_sync(True, session.get("username")) else
+                         " The next sync re-reads all the books from QuickBooks.")
+            except Exception:
+                again = " The next sync re-reads all the books from QuickBooks."
+        session["detail_msg"] = "Cleared all data for this account." + (again or " Import your books and upload a statement to start fresh.")
     cur.close(); conn.close()
     return redirect(url_for("detail", name=name))
 

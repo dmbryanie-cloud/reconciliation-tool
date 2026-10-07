@@ -57,4 +57,13 @@ q("UPDATE statement SET book_balance=700 RETURNING 1")
 q("UPDATE match SET status='proposed', match_type='fuzzy', created_by='matcher' RETURNING 1")
 page()
 check("something still to do (a match to review): no refresh", SYNCS == [False])
+# ---- clearing an account: its books are re-read in full, and it's logged ----------------------------------------------
+q("UPDATE app_config SET value='{}' WHERE key='sync_job' RETURNING 1")
+FULLS = []
+A.sync_from_quickbooks = lambda full=False, progress=None: (FULLS.append(A._sync_plan()[0] is None), (0, "none", "full", "0s"))[1]
+cl.post(f"/account/{NAME}/clear")
+check("clearing removes the account's books", q("SELECT count(*) FROM book_txn WHERE account_id=%s", (ACCT,))[0][0] == 0)
+check("…and starts a full re-read of them from QuickBooks", FULLS == [True])
+check("…saying so", "The books are being re-read from QuickBooks" in page())
+check("…logged", q("SELECT count(*) FROM activity_log WHERE action LIKE 'cleared the account%%'")[0][0] == 1)
 sys.exit(T.summary())
