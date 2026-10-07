@@ -370,10 +370,11 @@ def _claim_sync(full, by):
         conn.rollback(); cur.close(); conn.close()
         return False
     now = time.time()
-    cur.execute("UPDATE app_config SET value=%s WHERE key='sync_job';",
-                (json.dumps({"state": "running", "full": bool(full), "by": by, "started": now, "beat": now,
-                             "step": "Starting"}),))
+    val = json.dumps({"state": "running", "full": bool(full), "by": by, "started": now, "beat": now, "step": "Starting"})
+    cur.execute("UPDATE app_config SET value=%s WHERE key='sync_job';", (val,))
     conn.commit(); cur.close(); conn.close()
+    if has_request_context() and "_cfg" in g:
+        g._cfg["sync_job"] = val     # this page's cached settings: it shows the sync it started
     return True
 
 
@@ -2462,6 +2463,8 @@ tr:hover>td{background:var(--row)}
 .balform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:10px 0 4px}
 .balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600}
 .balform input{width:170px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;font-variant-numeric:tabular-nums}
+.balform input,.balform .btn-sm,.balform .btn,.balform button{height:32px}
+.balform .dp input,.balform input[type=date]{height:32px;padding-top:0;padding-bottom:0}
 .tag.bf{background:var(--none-soft);color:var(--none)}
 .tag.pending{background:var(--warn-soft);color:var(--warn)}
 .hint{color:var(--faint);font-size:11.5px;line-height:1.4;white-space:normal}
@@ -2552,7 +2555,7 @@ td.a{white-space:nowrap}
 /* ---- shell ---- */
 .app{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
 .side{background:var(--navy);color:var(--navy-text);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto;z-index:50}
-.side .brand{display:flex;gap:10px;align-items:center;padding:16px 18px 13px;border-bottom:1px solid var(--navy-line);color:#fff}
+.side .brand{display:flex;gap:10px;align-items:center;height:56px;flex:none;padding:0 18px;border-bottom:1px solid var(--navy-line);color:#fff}
 .side .brand svg{flex:none;color:var(--gold);width:28px;height:28px}
 .side .brand b{display:block;font:600 19px/1.1 var(--f-brand);color:#fff;letter-spacing:.2px}
 .side .brand small{display:block;font-size:10px;letter-spacing:.9px;text-transform:uppercase;color:var(--navy-text);margin-top:3px;line-height:1.3}
@@ -2566,6 +2569,7 @@ td.a{white-space:nowrap}
 .snav a .nm small.upto{display:block;font-size:10.5px;line-height:1.3;opacity:.62;font-weight:400;overflow:hidden;text-overflow:ellipsis}
 .snav a .cnt{margin-left:auto;font-size:11px;color:#8d99b1;font-variant-numeric:tabular-nums}
 .sdot{width:7px;height:7px;border-radius:50%;flex:none;background:#6b7790}
+.snav a .sdot{margin:0 4.5px}
 .sdot.attn{background:#f08a3c}.sdot.ok{background:#4cc38a}
 .sfoot{margin-top:auto;padding:12px;border-top:1px solid var(--navy-line);display:flex;flex-direction:column;gap:10px}
 .qbo{background:var(--navy-2);border-radius:8px;padding:9px 10px;font-size:12px}
@@ -2581,12 +2585,14 @@ td.a{white-space:nowrap}
 .me .av{width:28px;height:28px;border-radius:50%;background:var(--gold);color:var(--navy);display:grid;place-items:center;font-weight:700;font-size:12px;flex:none}
 .me b{color:#fff;font-weight:600;display:block;font-size:12.5px}.me small{font-size:11px;color:#8d99b1}
 .app>.main{min-width:0;display:flex;flex-direction:column;min-height:100vh}
-.topbar{display:flex;align-items:center;gap:12px;padding:9px 24px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;min-height:46px}
+.topbar{display:flex;align-items:center;gap:12px;padding:0 24px;height:56px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;min-height:46px}
 .crumb{color:var(--muted);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.crumb b{color:var(--ink);font-weight:600}
 .crumb a:hover{color:var(--ink)}
 .topbar .sp{flex:1}
 .tsearch{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:6px;padding:4px 9px;color:var(--faint);width:280px;max-width:40vw;background:var(--bg);margin:0}
 .tsearch input{border:0;background:none;outline:none;width:100%;color:var(--ink);font-size:12.5px}
+.topbar .tsearch{padding:7px 10px;gap:8px}
+.topbar .tsearch input{padding:0;border:0;background:none;box-shadow:none;max-width:none;flex:1;min-width:0}
 .menu-btn{display:none}
 .kebab{position:relative;display:inline-block;vertical-align:middle}
 .dd{position:absolute;right:0;top:calc(100% + 4px);background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--lift);min-width:200px;padding:4px;z-index:45;color:var(--ink);text-align:left;white-space:normal}
@@ -6023,7 +6029,7 @@ def dashboard():
 
 DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} · ReconBook</title>""" + CSS + """</head><body>
 """ + SHELL_TOP + """<style>
-.secnav{position:sticky;top:var(--navh,53px);z-index:4;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:8px max(24px,calc(50% - 476px));background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
+.secnav{position:sticky;top:var(--navh,53px);z-index:4;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:8px 24px;background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)}
 .secnav[hidden]{display:none}
 .secnav::-webkit-scrollbar{display:none}
 .secnav a{flex:none;white-space:nowrap;font-size:13px;color:var(--muted);padding:4px 11px;border:1px solid var(--line);border-radius:999px;background:var(--panel);transition:background .15s,color .15s,border-color .15s}
@@ -7865,6 +7871,33 @@ def apply_focus(d, f0, f1):
     return d
 
 
+def auto_sync_if_settled(name, acct_qbo, st, d, rec):
+    """Everything reviewed, recorded and transferred, yet a difference left: it's usually entries just recorded
+    in QuickBooks that the synced books don't have yet. Refresh them now rather than waiting for a Sync -- but
+    only when something was recorded since the last sync began, so a difference a sync can't fix doesn't sync
+    on every visit. True if a sync was started."""
+    if not (acct_qbo and st and not st[3] and d.get("has_results") and rec.get("status") != "balanced"
+            and not d.get("n_pending") and not d.get("n_to_record") and not d.get("n_xfer") and not d.get("rec_job")):
+        return False
+    try:
+        if sync_running() or not qbo_is_connected():
+            return False
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT extract(epoch FROM max(created_at)) FROM writeback_log WHERE status='done';")
+        last_rec = (cur.fetchone() or [None])[0]
+        cur.close(); conn.close()
+        if not last_rec or float(last_rec) <= float(sync_job().get("started") or 0):
+            return False
+        if start_sync(False, session.get("username")):
+            session["detail_msg"] = ("Everything is matched, recorded and transferred, but a difference is left: refreshing the "
+                                     "books from QuickBooks to bring in what was just recorded. The page updates when it finishes.")
+            log_activity("started a QuickBooks refresh automatically: everything settled, a difference left", name)
+            return True
+    except Exception:
+        pass        # never stop the page over it
+    return False
+
+
 @app.route("/account/<name>")
 def detail(name):
     conn = get_conn(); cur = conn.cursor()
@@ -7942,6 +7975,7 @@ def detail(name):
                    "Balance the reconciliation first" if rec.get("status") != "balanced" else
                    "You prepared it: a second person (or an admin) signs off" if self_prepared else "")
     d["n_pending_all"] = d.get("n_pending")
+    d["auto_sync"] = auto_sync_if_settled(name, acct_qbo, st, d, rec)
     d["fbal"] = None
     if focus:
         apply_focus(d, *focus)
