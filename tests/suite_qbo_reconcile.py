@@ -1,4 +1,4 @@
-"""Reconcile in QuickBooks: once a reconciliation is signed off here, a page gives QuickBooks' Reconcile its
+"""QuickBooks reconciliation: once a reconciliation is signed off here, a page gives QuickBooks' Reconcile its
 figures (ending date and balance) and the entries to tick, and checks how far QuickBooks got. Only people who
 can sign off (admins, approvers) see it.
 
@@ -37,7 +37,7 @@ cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesI
 URL = f"/account/{NAME}/qbo-reconcile"
 
 p = text(f"/account/{NAME}")
-check("before sign-off: the button shows but is disabled", 'disabled title="Sign off this reconciliation first">Reconcile in QuickBooks' in p)
+check("before sign-off: the button shows but is disabled", 'disabled title="Sign off this reconciliation first">QuickBooks reconciliation' in p)
 r = cl.get(URL)
 check("…and the page sends you back", r.status_code == 302)
 
@@ -68,10 +68,10 @@ check("History links each signed-off reconciliation to it", f"qbo-reconcile?s={s
 A.add_user("viewer", "Viewer", "secret1", False)
 q("UPDATE app_users SET perms='upload,review,record' WHERE username='viewer' RETURNING 1")
 vc = H.browserlike(A.app.test_client()); vc.post("/login", data={"username": "viewer", "password": "secret1"})
-check("someone who can't sign off doesn't see the button", "Reconcile in QuickBooks" not in text(f"/account/{NAME}", vc))
+check("someone who can't sign off doesn't see the button", "QuickBooks reconciliation" not in text(f"/account/{NAME}", vc))
 check("…nor the page", vc.get(URL).status_code == 403)
 A.add_user("appr", "Approver", "secret1", False)
 q("UPDATE app_users SET perms='review,signoff,reopen' WHERE username='appr' RETURNING 1")
 ac = H.browserlike(A.app.test_client()); ac.post("/login", data={"username": "appr", "password": "secret1"})
-check("an approver does", "Reconcile in QuickBooks" in text(f"/account/{NAME}", ac) and ac.get(URL).status_code == 200)
+check("an approver does", "QuickBooks reconciliation" in text(f"/account/{NAME}", ac) and ac.get(URL).status_code == 200)
 sys.exit(T.summary())
