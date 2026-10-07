@@ -2455,6 +2455,7 @@ tr:hover>td{background:var(--row)}
 .recnote{font-size:12.5px;padding:8px 12px;border-radius:6px;margin:6px 0;line-height:1.5}
 .recnote.bad{background:var(--bad-soft);color:var(--bad)}
 .recnote.warn{background:var(--warn-soft);color:#8a3d08}
+.recnote.ok{background:var(--ok-soft);color:var(--ok)}
 .balform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:10px 0 4px}
 .balform label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600}
 .balform input{width:170px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;font-variant-numeric:tabular-nums}
@@ -4118,7 +4119,7 @@ PERM_BY_ENDPOINT = {
     "record": "record", "record_save": "record", "record_discard": "record", "record_transfer": "record",
     "transfer_change": "record", "record_reset": "record", "record_ignore": "record",
     "transfer_undo": "undo", "recorded_twice_fix": "undo", "period_copies_fix": "undo", "clear_account": "users", "delete_account": "users", "set_currency": "users",
-    "signoff": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
+    "signoff": "signoff", "qbo_reconcile": "signoff", "reopen": "reopen", "delete_reconciliation": "users",
     "users": "users", "settings": "users", "manage_accounts": "users", "backup": "users",
     "set_token": "users", "disconnect": "users", "check_connection": "users", "connect": "users",
     "schema_dump": "users", "qbo_info": "users"}
@@ -6050,6 +6051,7 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if can('upload') and has_results %}<button type=button class=btn-sm data-drawer=upload><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 16v4h16v-4"/></svg>Upload statement</button>{% endif %}
 <a href="{{ url_for('history', name=name) }}" class=btn-sm>History</a>
 {% if has_results %}<a href="{{ url_for('report', name=name) }}" class=btn-sm target=_blank rel=noopener title="Print reconciliation report">Report</a>{% endif %}
+{% if has_results and qbo_linked and can('signoff') %}{% if signed_off %}<a href="{{ url_for('qbo_reconcile', name=name) }}" class=btn-sm title="Finish the same reconciliation in QuickBooks">Reconcile in QuickBooks</a>{% else %}<button type=button class=btn-sm disabled title="Sign off this reconciliation first">Reconcile in QuickBooks</button>{% endif %}{% endif %}
 <span class=kebab><button type=button class=icon-btn data-dd aria-label="More for this account" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
 {% if has_results %}<a href="{{ url_for('exceptions_csv', name=name) }}">Download exceptions (CSV)</a><a href="{{ url_for('qbo_import_csv', name=name) }}">Download for QuickBooks (CSV)</a><div class=sep></div>{% endif %}
 {% if qbo_connected and qbo_linked %}<form method=post action="{{ url_for('sync') }}"><input type=hidden name=back value="{{ name }}"><button type=submit>Refresh books from QuickBooks</button></form>{% endif %}
@@ -10044,6 +10046,92 @@ def exceptions_csv(name):
                     headers={"Content-Disposition": f"attachment; filename={name}_exceptions.csv"})
 
 
+QBO_APP_URL = os.environ.get("QBO_APP_URL") or (
+    "https://app.sandbox.qbo.intuit.com" if "sandbox" in QBO_BASE else "https://qbo.intuit.com")
+
+QREC_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reconcile in QuickBooks · ReconBook</title>""" + CSS + """</head><body>
+""" + SHELL_TOP + """<div class=wrap>
+<h1>{{ name }} — reconcile in QuickBooks</h1>
+<div class=sub>Signed off here for {{ p_start.strftime('%d/%m/%Y') }} to {{ p_end.strftime('%d/%m/%Y') }}. QuickBooks doesn't let other apps mark entries reconciled, so finish it there with these figures; then press Check QuickBooks.</div>
+{% if msg %}<div class="recnote {{ msg_kind }}" id=qrec-msg>{{ msg }}</div>{% endif %}
+<div class=recnote style="line-height:1.7">
+<b>1.</b> In QuickBooks, open Reconcile and choose <b>{{ name }}</b>.<br>
+<b>2.</b> Statement ending date: <b>{{ p_end.strftime('%d/%m/%Y') }}</b> · Ending balance: <b>{{ closing|money }}</b>{% if atype == 'credit_card' %} <span class=muted>(the amount owed)</span>{% endif %}.<br>
+<b>3.</b> Tick the {{ rows|length }} entr{{ 'y' if rows|length == 1 else 'ies' }} below and nothing else: {{ n_in }} {{ 'credit' if atype == 'credit_card' else 'deposit' }}{{ '' if n_in == 1 else 's' }} totalling <b>{{ t_in|money }}</b>, {{ n_out }} {{ 'charge' if atype == 'credit_card' else 'payment' }}{{ '' if n_out == 1 else 's' }} totalling <b>{{ t_out|money }}</b>. The difference should be 0.00; then Finish now.
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<a class=btn href="{{ qbo_url }}" target=_blank rel=noopener>Open Reconcile in QuickBooks</a>
+{% if qbo_connected %}<form method=post style="display:inline"><input type=hidden name=action value=check>{% if sid_arg %}<input type=hidden name=s value="{{ sid_arg }}">{% endif %}<button type=submit class=btn-sm data-busy="Reading QuickBooks...">Check QuickBooks</button></form>{% endif %}
+<a class=btn-sm href="{{ url_for('detail', name=name) }}">Back to {{ name }}</a></div></div>
+<table id=qrec-list>
+<thead><tr><th>Date</th><th>Type</th><th>Ref</th><th>Payee / description</th><th class=a>Amount</th>{% if checked %}<th>In QuickBooks</th>{% endif %}</tr></thead>
+<tbody>{% for r in rows %}<tr>
+<td>{{ r.d.strftime('%d/%m/%Y') }}</td><td>{{ r.typ }}</td><td>{{ r.ref }}</td><td>{{ r.who }}</td><td class=a>{{ r.amt|money }}</td>
+{% if checked %}<td>{% if r.rec %}<span class="pill ok">Reconciled</span>{% else %}<span class="pill open">Not yet</span>{% endif %}</td>{% endif %}
+</tr>{% else %}<tr><td colspan=5 class=muted>No QuickBooks entries were matched on this reconciliation.</td></tr>{% endfor %}</tbody></table>
+</div>""" + SHELL_END + """</body></html>"""
+
+
+@app.route("/account/<name>/qbo-reconcile", methods=["GET", "POST"])
+def qbo_reconcile(name):
+    """What to tick in QuickBooks' own Reconcile for a signed-off reconciliation, and a check of how far it got."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT account_id, type, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
+        row = cur.fetchone()
+        if not row:
+            return "Unknown account", 404
+        acct_uuid, atype, acct_qbo = row
+        sid_arg = request.values.get("s") or ""
+        if _is_uuid(sid_arg):
+            cur.execute("""SELECT statement_id, period_start, period_end, closing_balance, signed_off_at FROM statement
+                           WHERE account_id=%s AND statement_id=%s;""", (acct_uuid, sid_arg))
+        else:
+            sid_arg = ""
+            cur.execute("""SELECT statement_id, period_start, period_end, closing_balance, signed_off_at FROM statement
+                           WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;""", (acct_uuid,))
+        st = cur.fetchone()
+        if not st or not st[4] or not acct_qbo:
+            session["detail_msg"] = ("Reconcile in QuickBooks opens once this reconciliation is signed off." if acct_qbo
+                                     else "This account isn't linked to QuickBooks.")
+            return redirect(url_for("detail", name=name))
+        sid, ps, pe, closing, _ = st
+        cur.execute("""SELECT bt.source_txn_id, max(bt.source_txn_type), min(bt.posted_date), sum(bt.amount),
+                              max(coalesce(nullif(bt.counterparty,''), bt.description, '')), max(coalesce(bt.reference,''))
+                       FROM match m JOIN match_book_txn mbt ON mbt.match_id = m.match_id
+                       JOIN book_txn bt ON bt.txn_id = mbt.txn_id
+                       WHERE m.statement_id=%s AND m.status='confirmed' AND bt.account_id=%s
+                       GROUP BY bt.source_txn_id ORDER BY 3, 4;""", (sid, acct_uuid))
+        rows = [{"id": str(i), "typ": t or "", "d": d, "amt": a, "who": w, "ref": r, "rec": False}
+                for i, t, d, a, w, r in cur.fetchall()]
+    finally:
+        cur.close(); conn.close()
+    out = [r for r in rows if _money_out(r["amt"], atype)]
+    msg, kind, checked = "", "", False
+    if request.method == "POST" and request.form.get("action") == "check" and rows:
+        try:
+            got = qbo_reconciled_lines(qbo_token(), acct_qbo, min(r["d"] for r in rows), pe)
+            for r in rows:
+                r["rec"] = (r["id"], r["d"]) in got
+            checked = True
+            left = [r for r in rows if not r["rec"]]
+            if not left:
+                msg, kind = (f"Done: all {len(rows)} entries are reconciled in QuickBooks, to {pe:%d/%m/%Y}."), "ok"
+            else:
+                msg, kind = (f"{len(left)} of {len(rows)} entr{'y is' if len(rows) == 1 else 'ies are'} not reconciled in "
+                             f"QuickBooks yet (marked Not yet below). Tick them in QuickBooks' Reconcile and finish, then "
+                             f"check again."), "warn"
+            log_activity(f"checked QuickBooks' reconciliation for {ps:%d/%m/%Y} to {pe:%d/%m/%Y}: "
+                         f"{len(rows) - len(left)} of {len(rows)} reconciled", name)
+        except Exception as e:
+            msg, kind = f"Couldn't read QuickBooks: {e}", "warn"
+    return render_template_string(QREC_TEMPLATE, name=name, atype=atype, p_start=ps, p_end=pe, closing=closing,
+                                  rows=rows, n_out=len(out), t_out=sum((r["amt"] for r in out), Decimal(0)),
+                                  n_in=len(rows) - len(out),
+                                  t_in=sum((r["amt"] for r in rows if r not in out), Decimal(0)),
+                                  qbo_url=QBO_APP_URL + "/app/reconcile", qbo_connected=qbo_is_connected(),
+                                  sid_arg=sid_arg, msg=msg, msg_kind=kind, checked=checked)
+
+
 HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{ name }} history · ReconBook</title>""" + CSS + """</head><body>
 """ + SHELL_TOP + """<div class=wrap>
 <h1>{{ name }} — reconciliation history</h1>
@@ -10059,7 +10147,7 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <td>{% if s.exc is not none %}{{ s.exc }}{% else %}—{% endif %}</td>
 <td class=a>{% if s.diff is not none %}{{ s.diff|money }}{% else %}—{% endif %}</td>
 <td>{% if s.signed %}<span class="pill signed">Signed off {{ s.signed.strftime('%Y-%m-%d') }}</span>{% if s.note %}<br><span class=bad style="font-size:12px;white-space:normal">Unbalanced — {{ s.note }}</span>{% endif %}{% else %}<span class="pill open">In progress</span>{% endif %}</td>
-<td><a href="{{ url_for('report', name=name, s=s.id) }}" target=_blank rel=noopener style="color:var(--accent);font-weight:600;font-size:13px">Report</a></td>
+<td><a href="{{ url_for('report', name=name, s=s.id) }}" target=_blank rel=noopener style="color:var(--accent);font-weight:600;font-size:13px">Report</a>{% if s.signed and qbo_linked and can('signoff') %} · <a href="{{ url_for('qbo_reconcile', name=name, s=s.id) }}" style="color:var(--accent);font-size:13px">Reconcile in QuickBooks</a>{% endif %}</td>
 </tr>{% endfor %}
 </tbody></table>
 <div class=sub style="font-size:12.5px;margin-top:6px">Match counts and difference are snapshots taken when each period was signed off.</div>
@@ -10072,11 +10160,11 @@ HISTORY_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 @app.route("/account/<name>/history")
 def history(name):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, type, currency FROM account WHERE name=%s LIMIT 1;", (name,))
+    cur.execute("SELECT account_id, type, currency, source_account_id FROM account WHERE name=%s LIMIT 1;", (name,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close(); return "Unknown account", 404
-    acct_uuid, atype, ccy = row
+    acct_uuid, atype, ccy, acct_qbo = row
     try:
         _ensure_snapshot_cols(cur); conn.commit()
     except Exception:
@@ -10089,7 +10177,7 @@ def history(name):
         stmts.append({"period_start": ps, "period_end": pe, "created": created, "signed": signed,
                       "exact": ex, "fuzzy": fz, "m2o": m2, "exc": exc, "diff": diff, "note": note, "id": sid})
     cur.close(); conn.close()
-    return render_template_string(HISTORY_TEMPLATE, name=name, ccy=ccy, stmts=stmts)
+    return render_template_string(HISTORY_TEMPLATE, name=name, ccy=ccy, stmts=stmts, qbo_linked=bool(acct_qbo))
 
 
 @app.route("/account/<name>/currency", methods=["POST"])
