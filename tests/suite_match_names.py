@@ -67,4 +67,23 @@ check("Unpair: that pair is taken apart, and the page opens at Match manually",
 A.run_matcher(q("SELECT statement_id FROM statement")[0][0])
 check("…and the matcher doesn't pair those two again (the other CASH entry may be paired instead)",
       paired("DEPOSIT A") != was and q("SELECT status FROM match WHERE match_id=%s", (mid,)) in ([("rejected",)], []))
+
+# Two identical lines, two equal entries: unpairing one mustn't just swap them round.
+q("UPDATE book_txn SET is_deleted=true WHERE source_txn_id IN ('50001','50002') RETURNING 1")
+book("60001", "2026-01-27", 420000, "EFT-NAKATUMBA JOYCE", "")
+book("60002", "2026-01-30", 420000, "EFT-ALFRED OKECH", "")
+body = "Date,Description,Amount" + chr(10) + ("2026-01-27,EFT-NAKATUMBA JOYCE,420000" + chr(10)) * 2
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"),
+        "period_start": "2026-01-01", "period_end": "2026-02-28", "closing_balance": "0"}, content_type="multipart/form-data")
+def okech_mid():
+    r = q("""SELECT m.match_id::text FROM match m JOIN match_book_txn mbt USING (match_id) JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+             WHERE bt.source_txn_id='60002' AND m.status='confirmed'""")
+    return r[0][0] if r else None
+m1 = okech_mid()
+check("(one Nakatumba line paired with Okech's entry by date)", m1 is not None)
+cl.post(f"/account/{NAME}/review/{m1}", data={"status": "rejected", "back": "matched"})
+check("unpaired: Okech's entry isn't given to the other identical line instead", okech_mid() is None)
+check("…and the unpaired line is left unmatched, for a match by hand",
+      q("""SELECT count(*) FROM statement_line sl WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
+           JOIN match m ON m.match_id=msl.match_id WHERE msl.line_id=sl.line_id AND m.status='confirmed')""")[0][0] == 1)
 sys.exit(T.summary())

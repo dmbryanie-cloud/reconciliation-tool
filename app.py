@@ -5452,6 +5452,10 @@ def run_matcher(statement_id):
     def tol(l_id):
         return 0 if l_id in charges else date_days
 
+    # Unpaired by hand (an automatic match rejected): those items are left to the user. Pairing them
+    # with something else of the same amount would just swap them round (two identical lines).
+    held = {i for (mt, ls, ts), v in rejected.items() if mt == "exact" and float(v[1] or 0) >= 1 for i in ls | ts}
+
     # pass 0: an entry between two of your accounts (a transfer) whose other side is confirmed on the other
     # account's reconciliation is confirmed here too, against the bank line of the same amount nearest the
     # other bank's line (the two sides of a transfer up to transfer_days apart) or the entry's own date (the
@@ -5475,12 +5479,12 @@ def run_matcher(statement_id):
         refused = {(ls, ts) for (_mt, ls, ts) in rejected}
         now, xfer_days = datetime.now(timezone.utc), rule("transfer_days")
         for t_id, td, ta, tw in txns:
-            if t_id not in other_side or t_id in used:
+            if t_id not in other_side or t_id in used or t_id in held:
                 continue
             od = other_side[t_id][1]
             near = sorted((min(abs((ld - td).days), abs((ld - od).days) if od else 999), l_id)
                           for l_id, ld, la, lw in lines
-                          if l_id not in matched_lines and la == ta
+                          if l_id not in matched_lines and l_id not in held and la == ta
                           and (abs((ld - td).days) <= clear_days or (od and abs((ld - od).days) <= xfer_days))
                           and (frozenset([l_id]), frozenset([t_id])) not in refused)
             if not near or (len(near) > 1 and near[0][0] == near[1][0]):
@@ -5501,10 +5505,10 @@ def run_matcher(statement_id):
     rare = {k: {w for w in ws if df[w] <= common} for k, ws in toks.items()}
     cand = []
     for l_id, ld, la, lw in lines:
-        if l_id in matched_lines or not rare.get(l_id):
+        if l_id in matched_lines or l_id in held or not rare.get(l_id):
             continue
         for t_id, td, ta, tw in txns:
-            if t_id in used or la != ta or abs((ld - td).days) > tol(l_id) or not ok("exact", [l_id], [t_id]):
+            if t_id in used or t_id in held or la != ta or abs((ld - td).days) > tol(l_id) or not ok("exact", [l_id], [t_id]):
                 continue
             n = len(rare[l_id] & rare.get(t_id, set()))
             if n:
@@ -5516,11 +5520,11 @@ def run_matcher(statement_id):
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
     for l_id, ld, la, lw in lines:
-        if l_id in matched_lines:
+        if l_id in matched_lines or l_id in held:
             continue
         best = None
         for t_id, td, ta, tw in txns:
-            if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
+            if t_id in used or t_id in held or la != ta or not ok("exact", [l_id], [t_id]):
                 continue
             gap = abs((ld - td).days)
             if gap <= tol(l_id) and (best is None or gap < best[0]):
