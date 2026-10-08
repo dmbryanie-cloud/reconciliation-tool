@@ -98,7 +98,7 @@ NOV_Q = q("SELECT qbo_id FROM writeback_log WHERE line_id=%s", (NOV,))[0][0]
 q("UPDATE book_txn SET is_deleted=true WHERE source_txn_id=%s RETURNING 1", (NOV_Q,))   # what the sync does,
 A.run_matcher(q("SELECT statement_id FROM statement")[0][0])                            # then it re-matches
 p = page()
-row = p.split("MONTHLY MANAGEMENT FEE")[-1].split("</tr>")[0]
+row = p.split("id=mmform")[0].split("MONTHLY MANAGEMENT FEE")[-1].split("</tr>")[0]
 check("its line says the entry was deleted in QuickBooks, instead of 'will match on the next refresh'",
       f"(#{NOV_Q}) was deleted in QuickBooks, so it won't match" in row and "next refresh" not in row
       and "Record it again" in row and "Ignore — it's in QuickBooks" in row)
