@@ -9474,15 +9474,17 @@ def record_transfer(name):
     back = redirect(url_for("detail", name=name) + "#sec-transfers")
     picks = [p.split("|", 1) for p in request.form.getlist("pick") if "|line:" in p]
     if picks:
-        done, problems, seen = [], [], set()
+        done, problems, seen, touched = [], [], set(), set()
         for lid, other in picks[:100]:
             other = other[len("line:"):]
             if lid in seen or other in seen:
                 continue      # a line ticked twice (two possible counterparts): only the first is recorded
-            ok, msg = _record_transfer_pair(name, lid, other)
+            ok, msg = _record_transfer_pair(name, lid, other, touched)
             (done if ok else problems).append(msg)
             if ok:
                 seen.update((lid, other))
+        for sid in touched:   # re-matched once, after the whole batch
+            _after_review(sid)
         skipped = len(request.form.getlist("pick")) - len(picks)
         parts = [f"Recorded {len(done)} transfer{'' if len(done) == 1 else 's'} in QuickBooks." if done else "Nothing recorded."]
         if problems:
@@ -9502,7 +9504,7 @@ def record_transfer(name):
     return back
 
 
-def _record_transfer_pair(name, lid, other):
+def _record_transfer_pair(name, lid, other, defer=None):
     """Record one Transfer for bank line `lid` (on `name`) and line `other` (another account).
     Returns (recorded?, message)."""
     try:
@@ -9599,8 +9601,11 @@ def _record_transfer_pair(name, lid, other):
         cur.execute("INSERT INTO match_book_txn (match_id, txn_id) VALUES (%s,%s);", (mid, tid))
         matched += 1
     conn.commit(); cur.close(); conn.close()
-    for sid in {me[4], them[4]}:
-        _after_review(sid)
+    if defer is not None:
+        defer.update({me[4], them[4]})
+    else:
+        for sid in {me[4], them[4]}:
+            _after_review(sid)
     what = f"{x_ccy} {_money(amount)} at {x_rate:,.2f}" if cross else _money(amount)
     return True, (f"Recorded a transfer of {what} from {names.get(frm)} to {names.get(to)} "
                              f"in QuickBooks" + (f" (#{new_id})" if new_id else "") +
@@ -9683,13 +9688,15 @@ def transfer_undo(name):
     if not many:
         session["detail_msg"] = _undo_transfer(name, (request.form.get("qbo_id") or "").strip())[1]
         return back
-    done, problems = 0, []
+    done, problems, touched = 0, [], set()
     for qid in list(dict.fromkeys(many))[:100]:
-        ok, msg = _undo_transfer(name, qid)
+        ok, msg = _undo_transfer(name, qid, touched)
         if ok:
             done += 1
         else:
             problems.append(f"#{qid}: {msg}")
+    for sid in touched:      # re-matched once at the end, not after each one (that ran past the time limit)
+        _after_review(sid)
     session["detail_msg"] = (f"Undone {done} transfer{'' if done == 1 else 's'}: deleted in QuickBooks, and their bank lines "
                              f"are back in the list to record again." if done else "Nothing undone.") + \
                             (f" {len(problems)} not undone. " + " ".join(problems) if problems else "")
@@ -9698,7 +9705,7 @@ def transfer_undo(name):
     return back
 
 
-def _undo_transfer(name, qid):
+def _undo_transfer(name, qid, defer=None):
     """Delete one app-recorded Transfer in QuickBooks, unpair its bank lines (they go back to the list)
     and take it out of the books here. Only while none of its statements is signed off.
     Returns (undone?, message)."""
@@ -9743,8 +9750,12 @@ def _undo_transfer(name, qid):
     cur.execute("""UPDATE writeback_log SET status='failed', error='undone by ' || %s
                    WHERE qbo_type='Transfer' AND qbo_id=%s AND status='done';""", (user, qid))
     conn.commit(); cur.close(); conn.close()
-    for sid in {l[1] for l in lines} | {m[2] for m in matches}:
-        _after_review(sid)
+    sids = {l[1] for l in lines} | {m[2] for m in matches}
+    if defer is not None:
+        defer.update(sids)      # the caller re-matches them once, after the whole batch
+    else:
+        for sid in sids:
+            _after_review(sid)
     return True, (f"Undone: transfer #{qid} was deleted in QuickBooks, and its bank line"
                              f"{'s are' if len(lines) > 1 else ' is'} back in the list to record again.")
 
