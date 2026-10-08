@@ -1990,6 +1990,53 @@ def hedge_accounts(cur, foreign):
             "gain": find(lambda n, t, c: "forex gain" in n.lower()), "home": home}
 
 
+def spot_rate(desc, foreign, home):
+    """The rate a bank's own conversion states: 'FXPLSP~1206232~SPOT~BUY~USD/UGX~3,733.000' -> 3733 (home per
+    foreign), or None."""
+    m = HEDGE_RE.search((desc or "").replace("\n", " "))
+    if not m or m.group(2).upper() != "SPOT" or {m.group(4).upper(), m.group(5).upper()} != {foreign, home}:
+        return None
+    try:
+        r = Decimal(re.sub(r"[ ,]", "", m.group(6)).rstrip("."))
+    except Exception:
+        return None
+    return (r if m.group(4).upper() == foreign else 1 / r) if r > 0 else None
+
+
+FX_SEEN_PCT = Decimal("0.05")   # a bank's own rate can differ this much from QuickBooks' rate for the day
+
+
+def fx_counterpart(other_qbo, amt, atype, d, guide_rate, here_is_home):
+    """A transfer between currencies, as the other account's statement shows it: an unmatched line there,
+    the money moving the other way, within transfer_days, at a rate (home per foreign) within FX_SEEN_PCT
+    of guide_rate -- the nearest by date, then by rate. Its amount (positive), or None. That amount is what
+    the transfer must carry for both statements to tie."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT account_id, type FROM account WHERE source_account_id=%s LIMIT 1;", (other_qbo,))
+        r = cur.fetchone()
+        st = _latest_statement(cur, r[0]) if r else None
+        if not st or st[3] or not guide_rate:
+            return None
+        days = rule("transfer_days")
+        cur.execute("""SELECT sl.posted_date, sl.amount FROM statement_line sl
+                       WHERE sl.statement_id=%s AND sl.posted_date BETWEEN %s AND %s
+                         AND NOT EXISTS (SELECT 1 FROM match_statement_line msl JOIN match m ON m.match_id=msl.match_id
+                                         WHERE msl.line_id=sl.line_id AND m.status='confirmed');""",
+                    (st[0], d - timedelta(days=days), d + timedelta(days=days)))
+        out, best = _money_out(amt, atype), None
+        for od, oa in cur.fetchall():
+            if not oa or _money_out(oa, r[1]) == out:
+                continue
+            rate = abs(amt) / abs(oa) if here_is_home else abs(oa) / abs(amt)
+            off = abs(rate / Decimal(str(guide_rate)) - 1)
+            if off <= FX_SEEN_PCT and (best is None or (abs((od - d).days), off) < best[0]):
+                best = ((abs((od - d).days), off), abs(oa))
+        return best[1] if best else None
+    finally:
+        cur.close(); conn.close()
+
+
 def month_rate(cur, ccy, d):
     cur.execute("SELECT value FROM app_config WHERE key=%s;", (f"fx_rate:{ccy}:{str(d)[:7]}",))
     r = cur.fetchone()
@@ -9045,6 +9092,8 @@ def _record_run(name, form, ids, user, progress=None):
                     assert rate > 0
                 except (ValueError, AssertionError):
                     problems.append(f"{label}: the rate '{typed}' isn't a number"); continue
+            elif spot_rate(desc, foreign, home):
+                rate = float(spot_rate(desc, foreign, home))
             else:
                 try:
                     token = token or qbo_token()
@@ -9053,21 +9102,30 @@ def _record_run(name, form, ids, user, progress=None):
                 except Exception:
                     problems.append(f"{label}: QuickBooks has no {foreign} rate for {d}. Type the rate "
                                     f"({home} per {foreign}) in the Rate box and record again"); continue
+        if foreign and is_xfer and acc.get("ccy") == home and rate:
+            seen = fx_counterpart(acc["id"], amt, atype, d, rate, False)
+            if seen:
+                rate = float(round(seen / abs(amt), 10))
         xfer_amt, xfer_ccy, xfer_rate = abs(amt), foreign, rate
         x_to = acc.get("ccy") if is_xfer else None
         if x_to and x_to != home:
             # From a home-currency bank to one in USD (say): QuickBooks records it in USD. The USD
             # account receives this bank's amount divided by the rate; the rate sent is the exact one
             # that turns that USD back into this line's amount, so both sides tie to the cent.
+            # The other bank's statement, when it shows the money, decides the foreign amount: QuickBooks' rate
+            # for the day is seldom the bank's, and a transfer at another amount never matches over there.
             typed = (form.get(f"rate_{lid}") or "").replace(",", "").strip()
             try:
                 if typed:
                     t_rate = Decimal(typed); assert t_rate > 0
+                elif spot_rate(desc, x_to, home):
+                    t_rate = spot_rate(desc, x_to, home)
                 else:
                     token = token or qbo_token()
                     t_rate = Decimal(str(rates[(x_to, d)] if (x_to, d) in rates else qbo_exchange_rate(token, x_to, d)))
                     rates[(x_to, d)] = t_rate
-                xfer_amt = (abs(amt) / t_rate).quantize(Decimal("0.01"))
+                xfer_amt = (fx_counterpart(acc["id"], amt, atype, d, t_rate, True)
+                            or (abs(amt) / t_rate).quantize(Decimal("0.01")))
                 assert xfer_amt > 0
             except Exception:
                 problems.append(f"{label}: type the rate ({ccy} per {x_to}) to transfer it to {acc['name']}"

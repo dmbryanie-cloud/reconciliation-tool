@@ -219,4 +219,33 @@ console.log(JSON.stringify({ before, usd, after: xr.hidden }));
           o == {"before": True, "usd": {"hidden": False, "ph": "UGX per USD"}, "after": True} or print(res.stdout, res.stderr))
 else:
     print("SKIP browser check (no node/jsdom)")
+# ---- the other bank's statement decides the foreign amount (QuickBooks' rate for the day isn't the bank's) --
+upload("Stanbic UGX", [("2026-09-24", "TO DFCU USD", -333000000), ("2026-09-25", '"FXPLSP~1206232~SPOT~BUY~USD/UGX~3,733.000"', 559950000),
+                       ("2026-09-23", "FROM USD SIDE", 3690000)])
+upload("Stanbic USD", [("2026-09-24", "IN FROM UGX", 90000), ("2026-09-23", "OUT TO UGX", -1000)])
+RATES.clear()
+L = lid("TO DFCU USD")
+cl.post("/account/Stanbic UGX/record", data={"only": L, f"acct_{L}": "37"})
+ent, body = POSTS[-1]
+TID = str(900 + len(POSTS))
+check("UGX -> USD, the USD statement shows 90,000: recorded as USD 90,000 at 3,700 (not 91,232.88 at QuickBooks' 3,650)",
+      body["Amount"] == 90000.0 and body["ExchangeRate"] == 3700.0 and book(USD, TID) == (D("90000.00"), "USD")
+      and book(UGX, TID) == (D("-333000000.00"), "UGX"))
+check("…so the USD bank's line is matched too", matched(L) and matched(lid("IN FROM UGX")))
+L = lid("FXPLSP~1206232~SPOT~BUY~USD/UGX~3,733.000")
+n_rates = len(RATES)
+cl.post("/account/Stanbic UGX/record", data={"only": L, f"acct_{L}": "37"})
+ent, body = POSTS[-1]
+check("no line on the USD statement: the bank's spot rate in the text (3,733) gives USD 150,000, to the shilling",
+      body["Amount"] == 150000.0 and body["ExchangeRate"] == 3733.0 and len(RATES) == n_rates
+      and body["FromAccountRef"]["value"] == "37")
+L = lid("OUT TO UGX")
+cl.post("/account/Stanbic USD/record", data={"only": L, f"acct_{L}": "35"})
+ent, body = POSTS[-1]
+TID = str(900 + len(POSTS))
+check("USD -> UGX, the UGX statement shows 3,690,000: the rate is 3,690, not QuickBooks' 3,650",
+      body["Amount"] == 1000.0 and body["ExchangeRate"] == 3690.0 and book(UGX, TID) == (D("3690000.00"), "UGX")
+      and matched(L) and matched(lid("FROM USD SIDE")))
+check("spot_rate reads the other way round too", A.spot_rate("FXPLSP~1206233~SPOT~SELL~UGX/USD~0.0002", "USD", "UGX") == 5000
+      and A.spot_rate("FXPLOU~1110179~FWD~BUY~USD/UGX~3,840", "USD", "UGX") is None)
 sys.exit(T.summary())
