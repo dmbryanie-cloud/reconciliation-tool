@@ -5393,6 +5393,8 @@ def ingest_books(text, account_name):
     return n, rows.skipped
 
 
+TEXT_RARE_MIN = 12      # a word or number in at most this many items (or TEXT_RARE_SHARE of them) names a payer
+TEXT_RARE_SHARE = 0.01
 MIRROR_CONF = 0.95    # a match confirmed because the other side of the same entry was confirmed on another account
 
 
@@ -5487,9 +5489,35 @@ def run_matcher(statement_id):
                 f"{other_side[t_id][0]} (the other side)", now)
             used.add(t_id); matched_lines.add(near[0][1])
 
+    # pass 1a: same amount within the tolerance AND the same payer or reference on both sides (a name or a
+    # number few items share). Paired first, so another payer's equal amount on a nearer date can't take it:
+    # parents paying the same fee in the same week used to be cross-paired by date alone.
+    cur.execute("""SELECT txn_id::text, coalesce(description,'') || ' ' || coalesce(counterparty,'')
+                   FROM book_txn WHERE txn_id = ANY(%s::uuid[]);""", ([t[0] for t in txns],))
+    toks = {k: set(re.findall(r"[a-z]{4,}|\d{6,}", (v or "").lower()))
+            for k, v in list(cur.fetchall()) + [(str(r[0]), r[4]) for r in rows]}
+    df = Counter(w for ws in toks.values() for w in ws)
+    common = max(TEXT_RARE_MIN, len(toks) * TEXT_RARE_SHARE)
+    rare = {k: {w for w in ws if df[w] <= common} for k, ws in toks.items()}
+    cand = []
+    for l_id, ld, la, lw in lines:
+        if l_id in matched_lines or not rare.get(l_id):
+            continue
+        for t_id, td, ta, tw in txns:
+            if t_id in used or la != ta or abs((ld - td).days) > tol(l_id) or not ok("exact", [l_id], [t_id]):
+                continue
+            n = len(rare[l_id] & rare.get(t_id, set()))
+            if n:
+                cand.append((-n, abs((ld - td).days), l_id, t_id))
+    for _n, _gap, l_id, t_id in sorted(cand):
+        if l_id not in matched_lines and t_id not in used:
+            add([l_id], [t_id], "exact", 1.0, 0); used.add(t_id); matched_lines.add(l_id)
+
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
     for l_id, ld, la, lw in lines:
+        if l_id in matched_lines:
+            continue
         best = None
         for t_id, td, ta, tw in txns:
             if t_id in used or la != ta or not ok("exact", [l_id], [t_id]):
