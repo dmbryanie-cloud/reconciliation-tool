@@ -5346,10 +5346,14 @@ def ingest_books(text, account_name):
     return n, rows.skipped
 
 
+MIRROR_CONF = 0.95    # a match confirmed because the other side of the same entry was confirmed on another account
+
+
 def run_matcher(statement_id):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT account_id, period_start, period_end FROM statement WHERE statement_id=%s;", (statement_id,))
-    acct_uuid, p_start, p_end = cur.fetchone()
+    cur.execute("SELECT account_id, period_start, period_end, signed_off_at FROM statement WHERE statement_id=%s;",
+                (statement_id,))
+    acct_uuid, p_start, p_end, signed = cur.fetchone()
     # Keep the user's decisions across re-runs (sync, write-back, books import):
     #   confirmed suggestions are pinned first, so nothing else can claim their lines;
     #   rejected pairings are never proposed again, and stay listed as rejected.
@@ -5362,6 +5366,8 @@ def run_matcher(statement_id):
     for mt, conf, st, delta, ls, ts, by, at, origin in cur.fetchall():
         if st == "rejected":
             rejected[(mt, frozenset(ls), frozenset(ts))] = (mt, conf, delta, ls, ts, by, at, origin)
+        elif mt == "exact" and conf is not None and float(conf) == MIRROR_CONF and not signed:
+            continue          # mirrored from another account: worked out afresh below (it may be undone there)
         elif mt != "exact" or (conf is not None and conf < 1):
             pinned.append((mt, conf, delta, ls, ts, by, at, origin))   # user-confirmed, or matched by hand
     cur.execute("DELETE FROM match_statement_line WHERE match_id IN (SELECT match_id FROM match WHERE statement_id=%s);", (statement_id,))
@@ -5396,6 +5402,43 @@ def run_matcher(statement_id):
 
     def tol(l_id):
         return 0 if l_id in charges else date_days
+
+    # pass 0: an entry between two of your accounts (a transfer) whose other side is confirmed on the other
+    # account's reconciliation is confirmed here too, against the bank line of the same amount nearest the
+    # other bank's line (the two sides of a transfer up to transfer_days apart) or the entry's own date (the
+    # clearing window), unless that pairing was rejected here. Mirrors don't count as the other side, so
+    # undoing the original undoes the mirror on the next match.
+    if not signed and txns:
+        cur.execute("""SELECT DISTINCT ON (bt.txn_id) bt.txn_id::text, a.name,
+                              (SELECT min(sl.posted_date) FROM match_statement_line msl
+                               JOIN statement_line sl ON sl.line_id=msl.line_id WHERE msl.match_id=m.match_id)
+                       FROM book_txn bt
+                       JOIN book_txn o ON o.source_txn_type=bt.source_txn_type AND o.source_txn_id=bt.source_txn_id
+                                      AND o.account_id<>bt.account_id
+                       JOIN match_book_txn mbt ON mbt.txn_id=o.txn_id
+                       JOIN match m ON m.match_id=mbt.match_id AND m.status='confirmed'
+                                   AND NOT (m.match_type='exact' AND m.confidence=%s)
+                       JOIN statement st ON st.statement_id=m.statement_id JOIN account a ON a.account_id=st.account_id
+                       WHERE bt.txn_id = ANY(%s::uuid[]) AND bt.source_txn_type <> 'CSV'
+                         AND coalesce(o.is_deleted,false)=false AND coalesce(o.is_void,false)=false;""",
+                    (MIRROR_CONF, [t[0] for t in txns if t[0] not in used]))
+        other_side = {t: (n, od) for t, n, od in cur.fetchall()}
+        refused = {(ls, ts) for (_mt, ls, ts) in rejected}
+        now, xfer_days = datetime.now(timezone.utc), rule("transfer_days")
+        for t_id, td, ta, tw in txns:
+            if t_id not in other_side or t_id in used:
+                continue
+            od = other_side[t_id][1]
+            near = sorted((min(abs((ld - td).days), abs((ld - od).days) if od else 999), l_id)
+                          for l_id, ld, la, lw in lines
+                          if l_id not in matched_lines and la == ta
+                          and (abs((ld - td).days) <= clear_days or (od and abs((ld - od).days) <= xfer_days))
+                          and (frozenset([l_id]), frozenset([t_id])) not in refused)
+            if not near or (len(near) > 1 and near[0][0] == near[1][0]):
+                continue      # nothing to pair, or two lines equally likely: left to the passes below
+            add([near[0][1]], [t_id], "exact", MIRROR_CONF, 0, "confirmed",
+                f"{other_side[t_id][0]} (the other side)", now)
+            used.add(t_id); matched_lines.add(near[0][1])
 
     # pass 1: exact (amount equal, date within tolerance). Take the closest date, not the
     # first hit, so two equal amounts a few days apart don't get cross-paired.
@@ -6429,7 +6472,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <table id=revtbl><tr><th class=bk>{% if n_pending %}<input type=checkbox class=bk-all data-for=revbulk title="Select all to review" aria-label="Select all suggestions to review">{% endif %}</th><th>Why suggested</th><th>Statement side</th><th>Books side</th><th>Status</th><th></th></tr>
 {% for r in reviewable %}<tr>
 <td class=bk>{% if r.status=='proposed' %}<input type=checkbox name=mid value="{{ r.id }}" form=revbulk class=bk-pick aria-label="Select this suggestion">{% endif %}</td>
-<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else ('cleared later' if r.type=='exact' else ('bank charges, dates differ' if r.charges else ('payment and its reversal' if r.reversal else 'batched total')))) }}</span>{% if r.gap is not none %}<div class=hint>{{ 'same day' if r.gap == 0 else (r.gap ~ ' day' ~ ('' if r.gap == 1 else 's') ~ ' apart') }}</div>{% endif %}</td>
+<td><span class="tag {{ 'fuzzy' if r.type in ('fuzzy','manual') else 'exact' }}">{{ 'same payee, amount differs' if r.type=='fuzzy' else ('opposite sign' if r.type=='manual' else (('other side confirmed' if r.mirror else 'cleared later') if r.type=='exact' else ('bank charges, dates differ' if r.charges else ('payment and its reversal' if r.reversal else 'batched total')))) }}</span>{% if r.gap is not none %}<div class=hint>{{ 'same day' if r.gap == 0 else (r.gap ~ ' day' ~ ('' if r.gap == 1 else 's') ~ ' apart') }}</div>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.sls %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}{% if r.delta and r.delta != 0 %}<span style="color:#9a6a16">off {{ r.delta|money }}</span>{% endif %}</td>
 <td class=desc>{% for d,a,w in r.bts %}{{ d }} · {{ a|money }} · {{ w }}<br>{% endfor %}</td>
 <td>{% if r.status=='proposed' %}<span class="tag pending">to review</span>{% elif r.status=='rejected' %}<span style="color:#b3471f">rejected</span>{% else %}<span style="color:#3a7d44">confirmed</span>{% endif %}</td>
@@ -7011,7 +7054,7 @@ document.querySelectorAll('.wrap table').forEach(function(tbl,ti){
   function apply(c,at,save){
     cols.forEach(function(o){if(o!==c){o.at=-1;o.ind.textContent=''}});
     c.at=at;var m=c.modes[at],k=m[0],dir=m[1];
-    c.ind.textContent=(NAMES[k]?NAMES[k]+' ':'')+(dir>0?'\\u2191':'\\u2193');
+    c.ind.textContent=(c.modes.length>2?NAMES[k]+' ':'')+(dir>0?'\\u2191':'\\u2193');
     var groups=[],cur=null;
     [].slice.call(tbl.rows,1).forEach(function(r){if(PANEL.test(r.className)&&cur)cur.push(r);else groups.push(cur=[r])});
     groups.forEach(function(g,i){g.i=i;g.k=key(g[0].cells[c.ci],k)});
@@ -7450,6 +7493,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
                                        if hasattr(a_[0], "year") and hasattr(b_[0], "year")), default=None),
                            "charges": mtype == "many_to_one" and conf is not None and float(conf) == CHARGE_GROUP_CONF,
                            "reversal": mtype == "many_to_one" and conf is not None and float(conf) == REVERSAL_CONF,
+                           "mirror": mtype == "exact" and conf is not None and float(conf) == MIRROR_CONF,
                            "sls": sls_by.get(str(mid), []), "bts": bts_by.get(str(mid), []),
                            "lids": lids, "tids": tids})
     user_matches = [{"id": mid, "delta": delta, "by": by, "at": at,
@@ -8464,7 +8508,29 @@ def _after_review(sid):
     run_matcher(sid)
     conn = get_conn(); cur = conn.cursor()
     cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (sid,))
-    conn.commit(); cur.close(); conn.close()
+    conn.commit()
+    rematch_open(cur, other_sides(cur, sid))
+    cur.close(); conn.close()
+
+
+def other_sides(cur, sid):
+    """Accounts holding the other side of entries confirmed on this statement (transfers between your
+    accounts), or a mirror of one from this account: re-matched so the confirmation follows there."""
+    cur.execute("""SELECT o.account_id FROM match m JOIN match_book_txn mbt ON mbt.match_id=m.match_id
+                   JOIN book_txn bt ON bt.txn_id=mbt.txn_id
+                   JOIN book_txn o ON o.source_txn_type=bt.source_txn_type AND o.source_txn_id=bt.source_txn_id
+                                  AND o.account_id<>bt.account_id
+                   WHERE m.statement_id=%s AND m.status='confirmed' AND bt.source_txn_type <> 'CSV'
+                   UNION
+                   SELECT st.account_id FROM statement me
+                   JOIN book_txn bt ON bt.account_id=me.account_id AND bt.source_txn_type <> 'CSV'
+                   JOIN book_txn o ON o.source_txn_type=bt.source_txn_type AND o.source_txn_id=bt.source_txn_id
+                                  AND o.account_id<>bt.account_id
+                   JOIN match_book_txn mbt ON mbt.txn_id=o.txn_id
+                   JOIN match m ON m.match_id=mbt.match_id AND m.match_type='exact' AND m.confidence=%s
+                   JOIN statement st ON st.statement_id=m.statement_id
+                   WHERE me.statement_id=%s;""", (sid, MIRROR_CONF, sid))
+    return [r[0] for r in cur.fetchall()]
 
 
 @app.route("/account/<name>/review/<match_id>", methods=["POST"])
