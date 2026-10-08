@@ -86,4 +86,13 @@ check("unpaired: Okech's entry isn't given to the other identical line instead",
 check("…and the unpaired line is left unmatched, for a match by hand",
       q("""SELECT count(*) FROM statement_line sl WHERE NOT EXISTS (SELECT 1 FROM match_statement_line msl
            JOIN match m ON m.match_id=msl.match_id WHERE msl.line_id=sl.line_id AND m.status='confirmed')""")[0][0] == 1)
+
+# A payment and its reversal left over when QuickBooks has nothing unmatched: the form still shows them.
+q("UPDATE book_txn SET is_deleted=true RETURNING 1")
+body = "Date,Description,Amount" + chr(10) + "2026-01-27,EFT-X IN,420000" + chr(10) + "2026-01-27,EFT-X OUT,-420000" + chr(10)
+cl.post(f"/account/{NAME}/upload", data={"replace": "1", "statement": (io.BytesIO(body.encode()), "s.csv"),
+        "period_start": "2026-01-01", "period_end": "2026-02-28", "closing_balance": "0"}, content_type="multipart/form-data")
+page = cl.get(f"/account/{NAME}").data.decode()
+check("nothing unmatched in QuickBooks: Match manually still offers the two bank lines that cancel out",
+      "id=mmform" in page and "EFT-X IN" in page.split("id=mmform", 1)[1] and "EFT-X OUT" in page.split("id=mmform", 1)[1])
 sys.exit(T.summary())

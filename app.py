@@ -6927,7 +6927,7 @@ count();
 })();</script>
 {% endif %}
 {% if all_unmatched or in_books or user_matches %}
-<h2 id=sec-manual style="font-size:15px" data-sec data-state="{{ 'attn' if all_unmatched and in_books else 'done' }}" data-note="{{ (all_unmatched|length ~ ' bank line' ~ ('' if all_unmatched|length == 1 else 's') ~ ' unmatched') if all_unmatched and in_books else 'Nothing to pair' }}">Match manually <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Pair bank lines with QuickBooks entries the matcher missed, one to one or several together.<br><br>Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</span></span></h2>
+<h2 id=sec-manual style="font-size:15px" data-sec data-state="{{ 'attn' if all_unmatched and (in_books or all_unmatched|length > 1) else 'done' }}" data-note="{{ (all_unmatched|length ~ ' bank line' ~ ('' if all_unmatched|length == 1 else 's') ~ ' unmatched') if all_unmatched and (in_books or all_unmatched|length > 1) else 'Nothing to pair' }}">Match manually <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Pair bank lines with QuickBooks entries the matcher missed, one to one or several together.<br><br>Pair bank lines with QuickBooks transactions the matcher missed — one to one, or several together (two deposits banked as one, a payment split in the books). Tick items on both sides; the QuickBooks list re-sorts to put the closest amounts first. Only QuickBooks entries dated up to {{ p_end }} can be matched here.</span></span></h2>
 
 {% if user_matches %}
 <table><tr><th>Matched by you</th><th>Statement side</th><th>Books side</th><th class=a>Difference</th><th></th></tr>
@@ -6939,7 +6939,7 @@ count();
 <td><form method=post action="{{ url_for('unmatch', name=name, match_id=u.id) }}"><button type=submit class=btn-sm>Undo</button></form></td>
 </tr>{% endfor %}</table>
 {% endif %}
-{% if all_unmatched and in_books %}
+{% if all_unmatched and (in_books or all_unmatched|length > 1) %}
 <form method=post action="{{ url_for('manual_match', name=name) }}" id=mmform>
 <input type=hidden name=orig id=mmorig value="">
 <div id=mmnote style="display:none;background:#eef4ff;border:1px solid #c7d7f5;color:#1e3a6e;padding:8px 12px;border-radius:9px;font-size:13px;margin:0 0 10px">Editing a suggested match: its items are ticked below. Untick the ones that don't belong, tick the right ones, then press <b>Match selected</b>. The old suggestion is then marked rejected.</div>
