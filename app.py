@@ -6564,10 +6564,10 @@ f.querySelector('button[type=submit]').click()})})();</script>
 {% endif %}
 <h2 id=sec-matched style="font-size:15px" data-sec data-state=done data-note="Matched">Matched ({{ matched|length }}{% if n_m2o %} + {{ n_m2o }} batched{% endif %})</h2>
 {% if matched|length > 5 %}<div class=tsearch data-table=mtbl><input type=search placeholder="Search payee, amount, date…" title="Every word must appear: payee or description, amount (commas optional), date, or the account chosen" aria-label="Search matched lines" autocomplete=off><span class=ts-n></span></div>{% endif %}
-<table id=mtbl><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th></tr>
-{% for mt, delta, d, samt, who, bamt in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
+{% set unpair = not signed_off and can('review') %}<table id=mtbl><tr><th>Date</th><th>Payee</th><th></th><th class=a>Statement</th><th class=a>Books</th>{% if unpair %}<th></th>{% endif %}</tr>
+{% for mt, delta, d, samt, who, bamt, mid in matched %}<tr><td>{{ d }}</td><td class=desc>{{ who }}</td>
 <td><span class="tag {{ mt }}">{{ mt }}{% if delta and delta != 0 %} · off {{ delta|money }}{% endif %}</span></td>
-<td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td></tr>{% endfor %}</table>
+<td class=a>{{ samt|money }}</td><td class=a>{{ bamt|money }}</td>{% if unpair %}<td><form method=post action="{{ url_for('review_match', name=name, match_id=mid) }}"><input type=hidden name=back value=matched><button type=submit name=status value=rejected class=btn-sm title="Wrong pair: both go back to unmatched, and the matcher won't pair them again (restore it from To review)" data-busy="Unpairing...">Unpair</button></form></td>{% endif %}</tr>{% endfor %}</table>
 {% if pcopies is not none %}<h2 id=sec-qrec style="font-size:15px" data-sec data-state="{{ 'attn' if pcopies.rows else 'done' }}" data-note="{{ (pcopies.rows|length ~ ' to delete') if pcopies.rows else 'None' }}">Recorded from here on or before {{ qrec.strftime('%d/%m/%Y') }} ({{ pcopies.rows|length }}) <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>QuickBooks was already reconciled up to {{ qrec.strftime('%d/%m/%Y') }}, so it had these: each is in QuickBooks twice. Deleting them leaves QuickBooks' own entries; then each month's bank charges are matched to QuickBooks' combined charge entries where the totals agree, and you match the rest by hand. <a href="{{ url_for('detail', name=name) }}">Close this check</a></span></span></h2>
 
 {% if pcopies.rows %}<table class=rectbl><tr><th>Date</th><th>Bank description</th><th class=a>Amount</th><th>Recorded as</th></tr>
@@ -7544,7 +7544,7 @@ def compute_detail(cur, acct_uuid, atype="bank", acct_qbo=None):
     rec = reconcile(cur, acct_uuid, s)
     lines, ml = rec["lines"], rec["ml"]
     cur.execute("""SELECT m.match_type, m.amount_delta, sl.posted_date, sl.amount,
-                   coalesce(sl.counterparty, sl.description,''), bt.amount FROM match m
+                   coalesce(sl.counterparty, sl.description,''), bt.amount, m.match_id::text FROM match m
                    JOIN match_statement_line msl ON msl.match_id=m.match_id JOIN statement_line sl ON sl.line_id=msl.line_id
                    JOIN match_book_txn mbt ON mbt.match_id=m.match_id JOIN book_txn bt ON bt.txn_id=mbt.txn_id
                    WHERE m.statement_id=%s AND m.match_type IN ('exact','fuzzy') AND m.status='confirmed' ORDER BY sl.posted_date;""", (sid,))
@@ -8630,6 +8630,10 @@ def review_match(name, match_id):
         conn.commit(); cur.close(); conn.close()
         if row:
             _after_review(row[0])
+    if row and new_status == "rejected" and request.form.get("back") == "matched":
+        session["detail_msg"] = ("Unpaired: the bank line and the QuickBooks entry are unmatched again, and won't be "
+                                 "paired with each other automatically. Match them by hand under Match manually.")
+        return redirect(url_for("detail", name=name) + "#sec-manual")
     return redirect(url_for("detail", name=name) + ("#sec-manual" if edit else "#sec-review"))
 
 

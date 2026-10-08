@@ -54,4 +54,17 @@ check("…and Zoe's with Zoe's", paired("CSD:ZOE WILLIAM MWANJE") == ["34914"])
 check("the same day, same amount: each MTN reference pairs with its own entry",
       paired("MTN-256772455254-38177622413") == ["32931"] and paired("MTN-256772455254-38177675437") == ["32930"])
 check("nothing in common: the nearest date still decides", paired("DEPOSIT A") in (["50001"], ["50002"]))
+
+# ---- Unpair: an automatic match that's wrong can be taken apart, and stays apart -----------------------------
+page = cl.get(f"/account/{NAME}").data.decode()
+mid = q("""SELECT m.match_id::text FROM match m JOIN match_statement_line msl USING (match_id)
+           JOIN statement_line sl ON sl.line_id=msl.line_id WHERE sl.description='DEPOSIT A' AND m.status='confirmed'""")[0][0]
+check("each automatic match has an Unpair button", f"/review/{mid}" in page and ">Unpair</button>" in page)
+was = paired("DEPOSIT A")
+r = cl.post(f"/account/{NAME}/review/{mid}", data={"status": "rejected", "back": "matched"})
+check("Unpair: that pair is taken apart, and the page opens at Match manually",
+      paired("DEPOSIT A") != was and r.headers["Location"].endswith("#sec-manual"))
+A.run_matcher(q("SELECT statement_id FROM statement")[0][0])
+check("…and the matcher doesn't pair those two again (the other CASH entry may be paired instead)",
+      paired("DEPOSIT A") != was and q("SELECT status FROM match WHERE match_id=%s", (mid,)) in ([("rejected",)], []))
 sys.exit(T.summary())
