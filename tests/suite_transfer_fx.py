@@ -248,4 +248,7 @@ check("USD -> UGX, the UGX statement shows 3,690,000: the rate is 3,690, not Qui
       and matched(L) and matched(lid("FROM USD SIDE")))
 check("spot_rate reads the other way round too", A.spot_rate("FXPLSP~1206233~SPOT~SELL~UGX/USD~0.0002", "USD", "UGX") == 5000
       and A.spot_rate("FXPLOU~1110179~FWD~BUY~USD/UGX~3,840", "USD", "UGX") is None)
+p = page()
+check("the Transfers heading links to the transfers recorded from here (undo or change)",
+      re.search(r'<a href="#xferrec" class=xrec-link[^>]*>\d+ recorded from here: undo or change</a>', p) and 'id=xferrec' in p)
 sys.exit(T.summary())
