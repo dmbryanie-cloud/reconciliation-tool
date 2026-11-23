@@ -34,7 +34,9 @@ RULES = {"date_days": (DATE_TOLERANCE_DAYS, 0, 10, "Days a bank line and its ent
          "transfer_days": (4, 0, 14, "Days apart the two sides of a transfer may be"),
          "charges_exact": (1, 0, 1, "Bank charges match on the exact date only"),
          "two_person": (1, 0, 1, "Sign-off needs a second person (admins excepted)"),
-         "close_day": (10, 1, 28, "Month-end close is due on this day of the next month")}
+         "close_day": (10, 1, 28, "Month-end close is due on this day of the next month"),
+         "remind": (0, 0, 1, "Email a weekday-morning reminder of open reconciliations")}
+REMIND_HOUR = 8          # EAT: the reminder goes out on the first check after this hour, Monday to Friday
 
 
 def rule(key):
@@ -412,11 +414,12 @@ def refresh_book_balances():
     one account never fails the sync."""
     try:
         conn = get_conn(); cur = conn.cursor()
-        cur.execute("""SELECT DISTINCT ON (a.account_id) a.account_id, a.source_account_id, s.statement_id,
+        # Every open reconciliation (several per account with daily or weekly ones kept separate).
+        cur.execute("""SELECT a.account_id, a.source_account_id, s.statement_id,
                               s.period_end, s.signed_off_at, s.book_balance, s.book_balance_source
                        FROM account a JOIN statement s ON s.account_id = a.account_id
-                       WHERE a.source_account_id IS NOT NULL AND coalesce(a.is_active, true)
-                       ORDER BY a.account_id, s.created_at DESC;""")
+                       WHERE a.source_account_id IS NOT NULL AND coalesce(a.is_active, true) AND s.signed_off_at IS NULL
+                       ORDER BY a.account_id, s.period_end;""")
         todo = [r for r in cur.fetchall() if not r[4] and (r[6] in ("qbo", "pending") or r[5] is None)]
         cur.close(); conn.close()
         if not todo:
@@ -1194,10 +1197,9 @@ def _removal_fallout(cur, removed):
 
 
 def _open_statement_ids():
-    """Latest statement per account, where it isn't signed off yet."""
+    """Every statement not signed off yet (usually one per account; more with short ones kept separate)."""
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""SELECT statement_id FROM (SELECT DISTINCT ON (account_id) statement_id, signed_off_at FROM statement
-                   ORDER BY account_id, created_at DESC) t WHERE signed_off_at IS NULL;""")
+    cur.execute("""SELECT statement_id FROM statement WHERE signed_off_at IS NULL ORDER BY account_id, period_end;""")
     ids = [r[0] for r in cur.fetchall()]
     cur.close(); conn.close()
     return ids
@@ -2133,11 +2135,11 @@ def store_transfer(cur, new_id, ent, txn_date, desc, names):
 
 
 def rematch_open(cur, account_uuids):
-    """Re-run matching on these accounts' latest statements, unless signed off (leave those alone)."""
+    """Re-run matching on these accounts' open statements (signed-off ones are left alone)."""
     for a in account_uuids:
-        s = _latest_statement(cur, a)
-        if s and not s[3]:
-            run_matcher(s[0])
+        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s AND signed_off_at IS NULL ORDER BY period_end;", (a,))
+        for (sid,) in cur.fetchall():
+            run_matcher(sid)
 
 
 DUP_WINDOW_DAYS = 45   # how far apart a bank line and its QuickBooks twin can plausibly be dated
@@ -2413,6 +2415,8 @@ CSS = """<link rel=preconnect href="https://fonts.googleapis.com"><link rel=prec
 *{box-sizing:border-box}
 html{color-scheme:light}
 [hidden]{display:none!important}
+.lnk{color:var(--accent);font-weight:600}
+.recpick select{font:inherit;font-size:12.5px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:#fff;max-width:330px}
 .spin-sm{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:4px}
 .tsearch{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:6px 0}
 .tsearch input{flex:1 1 240px;max-width:420px;padding:5px 9px 5px 28px;border:1px solid #b9c2d0;border-radius:6px;font-size:13px;color:var(--ink);background:var(--panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23667085' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") no-repeat 9px center}
@@ -3502,7 +3506,10 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <div class=panel-h><h2>Sign-off and month end</h2><span class=r><button type=submit class="btn-sm pri">Save</button></span></div>
 <label class=opt><span><b>Sign-off needs a second person</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>The person who prepared it can't sign it off, unless they're an admin</span></span></span><input type=checkbox name=two_person value=1 {% if rules.two_person %}checked{% endif %}></label>
 <label class=opt><span><b>Month-end close due on day</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Of the following month, shown on the dashboard checklist</span></span></span><input class=n name=close_day value="{{ rules.close_day }}" inputmode=numeric></label>
+<label class=opt><span><b>Email a reminder each weekday morning</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>At about {{ remind_hour }}:00 (East Africa time), Monday to Friday, to everyone with an email address who can upload, match, record or sign off: each open reconciliation with what's left (lines to match, suggestions to review, out of balance, ready to sign off). Nothing is sent on a day when everything is signed off.</span></span></span><input type=checkbox name=remind value=1 {% if rules.remind %}checked{% endif %}></label>
+{% if not email_on %}<div class=hint style="padding:8px 14px">Email isn't set up on this server (BREVO_API_KEY and EMAIL_FROM), so no reminder can be sent.</div>{% endif %}
 </form>
+{% if email_on %}<form method=post action="{{ url_for('settings') }}" style="margin:-6px 0 12px"><input type=hidden name=action value=remind_test><button type=submit class=btn-sm data-busy="Sending...">Email me today's reminder now</button>{% if my_email %} <span class=faint>to {{ my_email }}</span>{% else %} <span class=faint>(add an email address to your user first)</span>{% endif %}</form>{% endif %}
 
 <div class=panel>
 <div class=panel-h><h2>Backup</h2></div>
@@ -3559,9 +3566,19 @@ def settings():
         if t:
             log_activity(f"{'ticked off' if on else 'reopened'} the improvement '{t[0]}'")
         return redirect(url_for("settings") + "#todo")
+    if request.method == "POST" and request.form.get("action") == "remind_test":
+        to = _user_email(session.get("username"))
+        if not to:
+            session["sync_msg"] = "Your user has no email address. Add one under Users & permissions first."
+        else:
+            err = send_reminder(to, session.get("name"))
+            session["sync_msg"] = (f"Reminder sent to {to}." if err is None else
+                                   "Nothing to remind about: every reconciliation is signed off." if err == "nothing" else
+                                   f"Couldn't send it: {err}.")
+        return redirect(url_for("settings"))
     if request.method == "POST":
         keys = {"rules": ("charges_exact", "date_days", "clear_days", "group_days", "transfer_days"),
-                "signoff": ("two_person", "close_day")}.get(request.form.get("action"), ())
+                "signoff": ("two_person", "close_day", "remind")}.get(request.form.get("action"), ())
         for k in keys:
             default, lo, hi, _ = RULES[k]
             if hi == 1 and lo == 0:      # a tick box
@@ -3603,7 +3620,8 @@ def settings():
     return render_template_string(SETTINGS_TEMPLATE, msg=msg, qbo_connected=qbo_is_connected(), todo=todo,
                                   company=get_config("company_name"), home=home, last_sync=last_sync_label(),
                                   n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES},
-                                  problems=problems, slow_s=SLOW_MS // 1000)
+                                  problems=problems, slow_s=SLOW_MS // 1000, email_on=email_ready(),
+                                  my_email=_user_email(session.get("username")), remind_hour=REMIND_HOUR)
 
 
 REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reports · ReconBook</title>""" + CSS + """</head><body>
@@ -3621,7 +3639,7 @@ REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=
 <td>{{ r.prep or '—' }}</td><td>{{ r.by or '—' }}</td>
 <td class=a><div class=btnrow style="justify-content:flex-end"><a class=btn-sm href="{{ url_for('report', name=r.name, s=r.id) }}" target=_blank rel=noopener title="Open the printable report">Open report</a>
 <span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ r.name }} {{ r.pe.strftime('%b %Y') }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
-<a href="{{ url_for('detail', name=r.name) }}">Open the account</a>
+<a href="{{ url_for('detail', name=r.name, rec=r.id) }}">Work on this reconciliation</a>
 <a href="{{ url_for('history', name=r.name) }}">History of this account</a>
 {% if r.signed and can('reopen') %}<form method=post action="{{ url_for('reopen', name=r.name) }}" data-confirm="Undo the sign-off of {{ r.name }} for {{ r.ps.strftime('%d/%m/%Y') }} to {{ r.pe.strftime('%d/%m/%Y') }}? It goes back to in progress; sign it off again afterwards, or replace it with a statement covering more months."><input type=hidden name=s value="{{ r.id }}"><button type=submit>Undo sign-off</button></form>{% endif %}
 {% if can('users') %}<div class=sep></div>{% if r.signed %}<span class=dh style="text-transform:none;letter-spacing:0">Signed off: undo the sign-off to delete it</span>
@@ -4533,8 +4551,10 @@ def _balances_from_running(rows):
     Ascending files satisfy bal[i] = bal[i-1] + amt[i]; newest-first files satisfy
     bal[i-1] = bal[i] + amt[i-1]. Whichever holds for most adjacent pairs wins."""
     rb = [r for r in rows if "balance" in r]
-    if len(rb) < 2 or len(rb) != len(rows):
+    if not rb or len(rb) != len(rows):
         return None, None
+    if len(rb) == 1:      # a one-line statement (a quiet day): its balance is after its only line
+        return rb[0]["balance"] - rb[0]["amount"], rb[0]["balance"]
     asc = sum(1 for a, b in zip(rb, rb[1:]) if b["balance"] == a["balance"] + b["amount"])
     desc = sum(1 for a, b in zip(rb, rb[1:]) if a["balance"] == b["balance"] + a["amount"])
     if max(asc, desc) * 2 < len(rb) - 1:
@@ -5220,17 +5240,34 @@ def _continue_statement(cur, st, rows, p_end, closing, currency):
     Returns its statement_id."""
     dmy = lambda d: d.strftime("%d/%m/%Y")
     sid, eps, epe = st[:3]
-    if p_end <= epe:
-        raise ValueError(f"Nothing new: the open reconciliation for {dmy(eps)} to {dmy(epe)} already covers this file's "
-                         f"dates up to {dmy(p_end)}. It's unchanged.")
-    add = [r for r in rows if epe < r["date"] <= p_end]
+    nothing_new = (f"Nothing new: the open reconciliation for {dmy(eps)} to {dmy(epe)} already covers this file's "
+                   f"dates up to {dmy(p_end)}. It's unchanged.")
+    if p_end < epe:
+        raise ValueError(nothing_new)
+    keyed = list(zip(rows, _dedupe_keys(rows)))     # keyed over the whole file, so a repeated line keeps its own key
+    add = [(r, k) for r, k in keyed if epe < r["date"] <= p_end]
+    # The last day already in it may have had more lines since (a statement taken during the day, then the
+    # rest of it): those go in too. Counted by amount, so the same line worded differently by another file
+    # format isn't added twice.
+    day = [(r, k) for r, k in keyed if r["date"] == epe and eps <= epe <= p_end]
+    if day:
+        cur.execute("SELECT amount, dedupe_key FROM statement_line WHERE statement_id=%s AND posted_date=%s;", (sid, epe))
+        have = cur.fetchall()
+        extra = Counter(r["amount"] for r, _k in day) - Counter(a for a, _k in have)
+        keys = {k for _a, k in have}
+        for r, k in sorted(day, key=lambda rk: rk[1] in keys):     # lines not there by key first
+            if extra[r["amount"]] > 0 and k not in keys:
+                extra[r["amount"]] -= 1
+                add.append((r, k))
+    if not add and p_end == epe:
+        raise ValueError(nothing_new)
     post = [r for r in rows if r["date"] > p_end]
     Z = Decimal(0)
     c_src = "user" if closing is not None else None
     if closing is None and getattr(rows, "closing", None) is not None:
         closing, c_src = rows.closing - sum((r["amount"] for r in post), Z), "file"
     seen = {}
-    for r, key in zip(add, _dedupe_keys(add)):
+    for r, key in add:
         seen.setdefault(key, (ORG_ID, sid, r["date"], r["amount"], currency, r.get("desc") or "", key))
     if seen:
         execute_values(cur, """INSERT INTO statement_line (org_id, statement_id, posted_date, amount, currency, description,
@@ -5241,20 +5278,83 @@ def _continue_statement(cur, st, rows, p_end, closing, currency):
                    WHERE statement_id=%s;""", (p_end, closing or 0, c_src, sid))
     if has_request_context():
         g.kept, g.left_out = len(add), (0, len(post))
-        g.continued = (f" Added to the open reconciliation, which now runs {dmy(eps)} to {dmy(p_end)}: the lines up to "
-                       f"{dmy(epe)} were already in it, and the matches and work on them are kept.")
+        n_day = sum(1 for r, _k in add if r["date"] == epe)
+        g.continued = ((f" Added to the open reconciliation for {dmy(eps)} to {dmy(epe)}: the lines dated {dmy(epe)} "
+                        f"that weren't in it yet. The matches and work already there are kept.") if p_end == epe else
+                       (f" Added to the open reconciliation, which now runs {dmy(eps)} to {dmy(p_end)}: the lines up to "
+                        f"{dmy(epe)} were already in it" + (f" (plus {n_day} more dated {dmy(epe)})" if n_day else "")
+                        + ", and the matches and work on them are kept."))
     return sid
 
 
+def _month_end(d):
+    return (d.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+
+def _save_quiet(cur, acct_uuid, currency, source_format, rows, opening, closing, p_start, p_end, separate):
+    """A statement with no transactions (a quiet day or days): the reconciliation runs on to its date. Within
+    the month it carries on the open one; otherwise it's a reconciliation with no lines, whose closing balance
+    is its opening one (nothing moved) unless the file or the person says otherwise. Returns its statement_id."""
+    dmy = lambda d: d.strftime("%d/%m/%Y")
+    if closing is None and getattr(rows, "closing", None) is not None:
+        closing, c_src = rows.closing, "file"
+    else:
+        c_src = "user" if closing is not None else None
+    cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at FROM statement
+                   WHERE account_id=%s AND period_start <= %s ORDER BY period_end DESC LIMIT 1;""", (acct_uuid, p_end))
+    prev = cur.fetchone()
+    if prev and prev[2] >= p_end:
+        raise ValueError(f"Nothing new: the file has no transactions, and the reconciliation for {dmy(prev[1])} to "
+                         f"{dmy(prev[2])} already runs to {dmy(p_end)}. It's unchanged.")
+    if prev and not prev[3] and not separate and (prev[2].year, prev[2].month) == (p_end.year, p_end.month):
+        if closing is None:          # nothing moved: the balance it closed at still stands
+            cur.execute("""UPDATE statement SET period_end=%s, book_balance=NULL, book_balance_source=NULL
+                           WHERE statement_id=%s;""", (p_end, prev[0]))
+        else:
+            cur.execute("""UPDATE statement SET period_end=%s, closing_balance=%s, closing_source=%s, book_balance=NULL,
+                             book_balance_source=NULL WHERE statement_id=%s;""", (p_end, closing, c_src, prev[0]))
+        if has_request_context():
+            g.kept, g.left_out = 0, (0, 0)
+            g.continued = (f" No transactions in the file: the open reconciliation now runs {dmy(prev[1])} to "
+                           f"{dmy(p_end)}, with nothing to add.")
+        return prev[0]
+    p_start = p_start or getattr(rows, "period_start", None) or (prev[2] + timedelta(days=1) if prev else p_end)
+    if p_start > p_end:
+        raise ValueError(f"The period starts ({p_start:%d/%m/%Y}) after it ends ({p_end:%d/%m/%Y}).")
+    o_src = "user" if opening is not None else None
+    opening, o_src, closing, c_src = _resolve_balances(cur, acct_uuid, p_start, Decimal(0), opening, o_src, closing, c_src)
+    if closing is None and opening is not None:
+        closing, c_src = opening, "quiet"
+    cur.execute("""INSERT INTO statement (org_id, account_id, period_start, period_end, opening_balance, closing_balance,
+                   opening_source, closing_source, currency, source_format, prepared_by)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING statement_id;""",
+                (ORG_ID, acct_uuid, p_start, p_end, opening or 0, closing or 0, o_src, c_src, currency, source_format,
+                 session.get("name") if has_request_context() else None))
+    if has_request_context():
+        g.kept, g.left_out = 0, (0, 0)
+        g.continued = f" No transactions in the file: a reconciliation for {dmy(p_start)} to {dmy(p_end)} with no lines."
+    return cur.fetchone()[0]
+
+
 def _save_statement(rows, account_name, source_format, opening=None, closing=None, p_start=None, p_end=None,
-                    replace_ok=False):
-    if not rows: raise ValueError("No transactions found in the file.")
+                    replace_ok=False, separate=False):
+    if not rows and not (p_end or getattr(rows, "period_end", None)):
+        raise ValueError("No transactions found in the file. For a day (or days) with no activity, set "
+                         "'Reconcile to' to the statement date and upload it again: the reconciliation then runs to it.")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT account_id, currency FROM account WHERE name=%s LIMIT 1;", (account_name,))
     arow = cur.fetchone()
     if not arow:
         cur.close(); conn.close(); raise ValueError(f"Unknown account: {account_name}")
     acct_uuid, currency = arow
+    if not rows:
+        try:
+            sid = _save_quiet(cur, acct_uuid, currency, source_format, rows, opening, closing, p_start,
+                              p_end or getattr(rows, "period_end", None), separate)
+        except ValueError:
+            cur.close(); conn.close(); raise
+        conn.commit(); cur.close(); conn.close()
+        return sid
     p_start, p_end = _resolve_period(cur, acct_uuid, rows, p_start, p_end)
     dmy = lambda d: d.strftime("%d/%m/%Y")
     cur.execute("SELECT as_of FROM qbo_baseline WHERE account_id=%s AND as_of >= %s;", (acct_uuid, p_start))
@@ -5301,6 +5401,45 @@ def _save_statement(rows, account_name, source_format, opening=None, closing=Non
                     g.continued = (f" The lines up to {dmy(after - timedelta(days=1))} are in the signed-off reconciliation "
                                    f"for {periods(signed)}, so this one starts on {dmy(after)}.")
         open_ov = [o for o in overlap if not o[3] and o[2] >= p_start]
+        split_at = None
+        if not open_ov and not separate:
+            # A short statement (a day, a week) straight after the open reconciliation in the same month carries
+            # on with it, so a month's dailies or weeklies build up one reconciliation, signed off once. Signing
+            # each one off instead starts a new reconciliation each time (it opens at the last one's closing).
+            cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at, closing_balance, closing_source
+                           FROM statement WHERE account_id=%s AND period_end < %s ORDER BY period_end DESC LIMIT 1;""",
+                        (acct_uuid, p_start))
+            prev_st = cur.fetchone()
+            if (prev_st and not prev_st[3] and (prev_st[2].year, prev_st[2].month) == (p_start.year, p_start.month)):
+                open_ov = [prev_st]
+                if p_end > _month_end(prev_st[2]):
+                    split_at = _month_end(prev_st[2])     # the rest is next month's: a reconciliation of its own
+                file_open = getattr(rows, "opening", None)
+                if (file_open is not None and prev_st[5] is not None and _D(file_open) != _D(prev_st[4])
+                        and has_request_context()):
+                    g.gap_note = (f" Check for a missing statement: this file opens at {_money(file_open)}, but the "
+                                  f"reconciliation closed at {_money(prev_st[4])} on {dmy(prev_st[2])} (a difference of "
+                                  f"{_money(_D(file_open) - _D(prev_st[4]))}). Upload the days in between too.")
+        if open_ov and split_at:
+            try:
+                sid1 = _continue_statement(cur, open_ov[0], rows, split_at, None, currency)
+            except ValueError:
+                cur.close(); conn.close(); raise
+            cur.execute("SELECT closing_balance, closing_source FROM statement WHERE statement_id=%s;", (sid1,))
+            c1, c1_src = cur.fetchone()
+            conn.commit(); cur.close(); conn.close()
+            kept1 = g.kept if has_request_context() else 0
+            if has_request_context():
+                g.continued = None
+            sid = _save_statement(rows, account_name, source_format, c1 if c1_src == "file" else None, closing,
+                                  split_at + timedelta(days=1), p_end, False, True)
+            if has_request_context():
+                g.kept = kept1 + getattr(g, "kept", 0)
+                g.left_out = (0, getattr(g, "left_out", (0, 0))[1])
+                g.continued = (f" Split at the month end: the lines up to {dmy(split_at)} were added to the open "
+                               f"reconciliation, which now runs {dmy(open_ov[0][1])} to {dmy(split_at)}; the rest start a "
+                               f"new reconciliation for {split_at + timedelta(days=1):%B %Y}.")
+            return sid
         if open_ov:
             try:
                 sid = _continue_statement(cur, max(open_ov, key=lambda o: o[2]), rows, p_end, closing, currency)
@@ -6154,8 +6293,12 @@ def dashboard():
     if month not in months:
         month = months[0] if months else date.today().replace(day=1)
     # Every account's statement for the month, and how far each is reconciled, in two questions.
+    # With several in the month (daily or weekly statements reconciled one by one), the earliest still open is
+    # the one to work on; the month counts as signed off only when none is left open.
     cur.execute(f"""SELECT DISTINCT ON (account_id) account_id, {STMT_COLS} FROM statement
-                    WHERE date_trunc('month', period_end)::date=%s ORDER BY account_id, created_at DESC;""", (month,))
+                    WHERE date_trunc('month', period_end)::date=%s
+                    ORDER BY account_id, (signed_off_at IS NOT NULL), CASE WHEN signed_off_at IS NULL THEN period_start END,
+                             period_end DESC, created_at DESC;""", (month,))
     stmts = {r[0]: r[1:] for r in cur.fetchall()}
     # ...counting a starting point taken from QuickBooks' reconciliation, which is shown beside it.
     cur.execute("""SELECT a.account_id, greatest(max(s.period_end), b.as_of), b.as_of, b.balance FROM account a
@@ -6322,14 +6465,14 @@ DETAIL_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=v
 {% if ccy %}<span>{{ ccy }}</span>{% endif %}{% if atype=='credit_card' %}<span class=faint>·</span><span>Credit card</span>{% endif %}
 <span class=faint>·</span><span title="The end of the latest signed-off reconciliation">{% if rec_to %}Reconciled to <b>{{ rec_to.strftime('%d/%m/%Y') }}</b>{% else %}Not reconciled yet{% endif %}</span>
 {% if qbo_base %}<span class=faint>·</span><span title="Started from QuickBooks' reconciliation: its {{ qbo_base.n_rec }} reconciled entries up to {{ qbo_base.as_of.strftime('%d/%m/%Y') }} add up to this">QuickBooks reconciled to <b>{{ qbo_base.as_of.strftime('%d/%m/%Y') }}</b> at <b>{{ qbo_base.balance|money }}</b></span>{% endif %}
-{% if has_results %}<span class=faint>·</span><span>Statement {{ p_start }} to {{ p_end }}</span>{% if not signed_off %}<span class=faint>·</span><span title="Every bank line up to this date is matched or recorded">{% if cleared %}Cleared to <b>{{ cleared.strftime('%d/%m/%Y') }}</b>{% else %}Nothing cleared yet{% endif %}</span>{% endif %}{% endif %}
+{% if has_results %}<span class=faint>·</span>{% if work.recs|length > 1 %}<form method=get action="{{ url_for('detail', name=name) }}" class=recpick style="display:inline;margin:0"><select id=recpick name=rec aria-label="Reconciliation to work on" onchange="this.form.submit()" title="Choose which reconciliation to work on">{% for r in work.recs %}<option value="{{ r.id }}" {% if r.id == work.sid %}selected{% endif %}>{{ r.ps.strftime('%d/%m/%Y') }} to {{ r.pe.strftime('%d/%m/%Y') }} · {{ 'signed off' if r.signed else 'in progress' }}</option>{% endfor %}</select><noscript><button type=submit class=btn-sm>Open</button></noscript></form>{% else %}<span>Statement {{ p_start }} to {{ p_end }}</span>{% endif %}{% if not signed_off %}<span class=faint>·</span><span title="Every bank line up to this date is matched or recorded">{% if cleared %}Cleared to <b>{{ cleared.strftime('%d/%m/%Y') }}</b>{% else %}Nothing cleared yet{% endif %}</span>{% endif %}{% endif %}
 {% if saved_at and not signed_off %}<span class=faint>·</span><span>Saved for later {{ saved_at.strftime('%d/%m/%Y %H:%M') }}{% if saved_by %} by {{ saved_by }}{% endif %}</span>{% endif %}
 {% if prep %}<span class=faint>·</span><span>Prepared by {{ prep }}</span>{% endif %}{% if signed_by %}<span class=faint>·</span><span>Approved by {{ signed_by }}{% if signed_off %} on {{ signed_off }}{% endif %}</span>{% endif %}</div></div>
 <div class=acts>
 {% if has_results and not signed_off %}<form method=post action="{{ url_for('save_later', name=name) }}" id=laterform class=btnrow style="margin:0"><button type=submit class=btn-sm data-busy="Saving your work..." title="Keep everything as it is (including what's ticked and chosen to record) and continue another time">Save &amp; finish later</button></form>{% endif %}
 {% if can('upload') and has_results %}<button type=button class=btn-sm data-drawer=upload><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 16v4h16v-4"/></svg>Upload statement</button>{% endif %}
 <a href="{{ url_for('history', name=name) }}" class=btn-sm>History</a>
-{% if has_results %}<a href="{{ url_for('report', name=name) }}" class=btn-sm target=_blank rel=noopener title="Print reconciliation report">Report</a>{% endif %}
+{% if has_results %}<a href="{{ url_for('report', name=name, s=work.sid) }}" class=btn-sm target=_blank rel=noopener title="Print reconciliation report">Report</a>{% endif %}
 {% if has_results and qbo_linked and can('signoff') %}{% if signed_off %}<a href="{{ url_for('qbo_reconcile', name=name) }}" class=btn-sm title="The figures to reconcile in QuickBooks, and a check of what it reconciled">QuickBooks reconciliation</a>{% else %}<button type=button class=btn-sm disabled title="Sign off this reconciliation first">QuickBooks reconciliation</button>{% endif %}{% endif %}
 <span class=kebab><button type=button class=icon-btn data-dd aria-label="More for this account" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
 {% if has_results %}<a href="{{ url_for('exceptions_csv', name=name) }}">Download exceptions (CSV)</a><a href="{{ url_for('qbo_import_csv', name=name) }}">Download for QuickBooks (CSV)</a><div class=sep></div>{% endif %}
@@ -6353,13 +6496,14 @@ function tick(){fetch(b.getAttribute('data-url'),{credentials:'same-origin'}).th
   else if(dirty){b.innerHTML='The statement is ready. <a href="" onclick="location.reload();return false">Reload to see it</a>'}
   else location.reload()}).catch(function(){setTimeout(tick,6000)})}
 setTimeout(tick,3000)})();</script>{% endif %}
+{% if work.older %}<div class="recnote" id=olderrec style="margin:0 0 10px">You're working on an earlier reconciliation ({{ p_start|dmy }} to {{ p_end|dmy }}), not the newest ({{ work.newest.ps.strftime('%d/%m/%Y') }} to {{ work.newest.pe.strftime('%d/%m/%Y') }}). Everything on this page — matching, recording, sign-off — applies to it. <a href="{{ url_for('detail', name=name, rec='latest') }}" class=lnk>Back to the newest</a></div>{% endif %}
 {% if detail_msg %}{% if detail_ok %}<div id=flash role=status class=ok data-stay><b>Statement uploaded.</b> {{ detail_msg }}</div>{% else %}<div id=flash role=status>{{ detail_msg }}</div>{% endif %}{% endif %}
 {% if not has_results %}<div class="panel empty"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/><path d="M12 11v6"/><path d="m9.5 13.5 2.5-2.5 2.5 2.5"/></svg>
 <div><b>No statement yet.</b> Upload this account's bank statement (PDF, CSV or OFX) to start the reconciliation.</div>
 {% if can('upload') %}<button type=button class=btn data-drawer=upload>Upload statement</button>{% endif %}</div>{% endif %}
 
 <aside class=drawer id=dr-upload {% if not open_upload %}hidden{% endif %} aria-label="Upload a statement"><form action="{{ url_for('upload', name=name) }}" method=post enctype=multipart/form-data style="display:contents">
-<div class=drawer-h><h2>Upload a statement <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}<br><br>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A scanned PDF is read on your computer first (free; it needs the internet the first time), then checked against its running balance. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
+<div class=drawer-h><h2>Upload a statement <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>{% if qbo_connected and qbo_linked %}Books refresh from QuickBooks automatically when you upload{% if last_sync %} (last synced {{ last_sync }}){% endif %}.{% else %}{% if not qbo_connected %}QuickBooks isn't connected, so import the books as a CSV (⋯ menu).{% else %}This account isn't linked to a QuickBooks account: import the books as a CSV (⋯ menu).{% endif %}{% endif %}<br><br>Balances can stay empty when the file has a running-balance column (PDF, CSV) or a ledger balance (OFX): they're read automatically. A scanned PDF is read on your computer first (free; it needs the internet the first time), then checked against its running balance. Set the statement date as the period end: without it the period ends on the last transaction, and later book items won't show as outstanding. Daily, weekly or few-day statements are fine: within a month they add to the open reconciliation (the last day's later lines too), unless you keep them separate. The period can be part of the file — a year's statement reconciled one month at a time: only its lines are kept, and the balances are worked out from the file's own for those dates (type them if the file has none).</span></span></h2><button type=button class=icon-btn data-close style="margin-left:auto" aria-label="Close">&times;</button></div>
 <div class=drawer-b>
 <input type=file name=ocr_words id=up-ocr hidden tabindex=-1 aria-hidden=true>
 <label class=drop for=up-file><b>Choose the bank statement</b><span>PDF (from online banking, or a scan), CSV or OFX · <a href="{{ url_for('template', kind='bank') }}">CSV template</a></span><input id=up-file type=file name=statement accept=.pdf,.csv,.ofx required></label>
@@ -6370,6 +6514,7 @@ setTimeout(tick,3000)})();</script>{% endif %}
 <div class=fld><label for=up-cb>Closing balance</label><input id=up-cb name=closing_balance inputmode=decimal placeholder="read from the statement"></div>
 </div>
 <div class=fld><label for=up-pw>PDF password <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Used once to open the file; never stored.</span></span></label><input id=up-pw type=password name=pdf_password autocomplete=off placeholder="only for protected PDFs"{% if request.args.get('pdfpw') %} autofocus style="border-color:var(--warn)"{% endif %}></div>
+<label class=opt><span><b>Keep as a separate reconciliation</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Statements shorter than a month (a day, a few days, a week) are fine. One that starts after this month's open reconciliation is added to it, so the month builds up and is signed off once. Tick this to reconcile these dates on their own instead. Signing off each short statement also starts a new reconciliation each time, opening at the last one's closing balance.</span></span></span><input type=checkbox name=separate value=1></label>
 <div class=recnote id=up-scan hidden aria-live=polite></div>
 </div>
 <div class=drawer-f><button type=button class=btn-sm data-close>Cancel</button><button type=submit class=btn data-busy="Uploading the file...">Upload &amp; reconcile</button></div></form></aside>
@@ -6495,7 +6640,7 @@ f.querySelector('button[type=submit]').click()})})();</script>
 <div class=recgrid>
 <table class=rec>
 <tr><th colspan=2>Bank {{ 'card statement' if cc else 'statement' }}</th></tr>
-<tr><td>Closing balance at {{ p_end }}{% if rec.closing_src %} <span class=src>· {{ src_label[rec.closing_src] }}</span>{% endif %}</td><td class=a>{% if rec.closing is none %}<span class=muted>not entered</span>{% else %}{{ rec.closing|money }}{% endif %}</td></tr>
+<tr><td>Closing balance at {{ p_end }}{% if rec.closing_src %} <span class=src>· {{ src_label[rec.closing_src] }}</span>{% endif %}</td><td class=a>{% if rec.closing is none %}<span class=muted>not entered</span>{% if rec.opening_src and not signed_off and can('upload') %}<form method=post action="{{ url_for('balances', name=name) }}" style="display:inline;margin:0 0 0 8px"><input type=hidden name=action value=work_closing><button type=submit class=btn-sm data-busy="Working it out..." title="Opening balance plus the statement lines. Use it only when the file has no balance; check the result against the bank, since a missing line wouldn't show." data-confirm="Work out the closing balance from the opening balance and the statement lines? It always agrees with the lines, so it can't show a missing one: check it against the bank's balance before signing off.">Work it out</button></form>{% endif %}{% else %}{{ rec.closing|money }}{% endif %}</td></tr>
 <tr><td>Add: {{ 'charges' if cc else 'deposits' }} in books, not yet on statement ({{ rec.n_out_in }})</td><td class=a>{{ rec.out_in|money }}</td></tr>
 <tr><td>Less: {{ 'payments & refunds' if cc else 'payments' }} in books, not yet on statement ({{ rec.n_out_out }})</td><td class=a>{{ rec.out_out|money }}</td></tr>
 <tr class=tot><td>Adjusted bank balance</td><td class=a>{% if rec.adj_bank is none %}—{% else %}{{ rec.adj_bank|money }}{% endif %}</td></tr>
@@ -7433,15 +7578,52 @@ STMT_COLS = """statement_id, period_start, period_end, signed_off_at, opening_ba
                opening_source, closing_source, book_balance, book_balance_source"""
 
 
-def _latest_statement(cur, acct_uuid):
+def _work_key(acct_uuid):
+    return f"work:{acct_uuid}"
+
+
+def _newest_statement(cur, acct_uuid):
     cur.execute(f"SELECT {STMT_COLS} FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
+    return cur.fetchone()
+
+
+def _latest_statement(cur, acct_uuid):
+    """The reconciliation an account's page works on: the one picked on the page (an older one still open,
+    say), else the newest. Every action on the page goes through here, so they all follow the pick."""
+    want = session.get(_work_key(acct_uuid)) if has_request_context() else None
+    if want:
+        cur.execute(f"SELECT {STMT_COLS} FROM statement WHERE account_id=%s AND statement_id::text=%s;", (acct_uuid, want))
+        row = cur.fetchone()
+        if row:
+            return row
+        session.pop(_work_key(acct_uuid), None)     # deleted or replaced since
+    return _newest_statement(cur, acct_uuid)
+
+
+def account_statements(cur, acct_uuid):
+    """Every reconciliation of the account for the picker, newest period first."""
+    cur.execute("""SELECT statement_id, period_start, period_end, signed_off_at, created_at FROM statement WHERE account_id=%s
+                   ORDER BY period_end DESC, created_at DESC;""", (acct_uuid,))
+    return [{"id": str(i), "ps": a, "pe": b, "signed": sg is not None, "created": cr} for i, a, b, sg, cr in cur.fetchall()]
+
+
+def _statement_of_lines(cur, acct_uuid, ids):
+    """The account's reconciliation these bank lines belong to (a recording carries on in the background,
+    without the page's pick), or None."""
+    ids = [i for i in ids or [] if _is_uuid(i)]
+    if not ids:
+        return None
+    cur.execute(f"""SELECT {', '.join('s.' + c.strip() for c in STMT_COLS.split(','))} FROM statement s
+                    JOIN statement_line sl ON sl.statement_id=s.statement_id
+                    WHERE s.account_id=%s AND sl.line_id::text = ANY(%s) LIMIT 1;""", (acct_uuid, ids))
     return cur.fetchone()
 
 
 def book_pool(cur, acct_uuid, sid, p_start, p_end):
     """Book transactions a statement can clear: those dated in its period, plus older ones still
     outstanding (brought forward) since the account's first signed-off period. Anything already
-    cleared on an EARLIER signed-off statement is excluded, so it can't be matched twice -- while
+    cleared on an EARLIER statement (signed off, or still open, as short ones kept separate may be) is
+    excluded, so it can't be matched twice -- while
     a past period still shows the items that were outstanding at its end, even if a later
     period has since cleared them."""
     cur.execute("""SELECT (SELECT min(period_start) FROM statement
@@ -7463,8 +7645,7 @@ def book_pool(cur, acct_uuid, sid, p_start, p_end):
                                      JOIN match m ON m.match_id=mbt.match_id
                                      JOIN statement s ON s.statement_id=m.statement_id
                                      WHERE mbt.txn_id=bt.txn_id AND m.status='confirmed'
-                                       AND s.statement_id<>%s AND s.signed_off_at IS NOT NULL
-                                       AND s.period_start < %s)
+                                       AND s.statement_id<>%s AND s.period_start < %s)
                    ORDER BY bt.posted_date;""", (acct_uuid, floor, p_end, sid, p_start))
     return cur.fetchall()
 
@@ -8043,6 +8224,8 @@ def account_switch_list(cur):
 
 
 BALANCE_SOURCES = {"user": "entered", "file": "from file", "carried": "last signed-off closing",
+                   "quiet": "no transactions: same as the opening",
+                   "worked": "worked out from the lines: check it against the bank",
                    "derived": "closing less movements", "qbo": "from QuickBooks",
                    "pending": "updating from QuickBooks after the sync"}
 
@@ -8208,8 +8391,24 @@ def detail(name):
     if not row:
         cur.close(); conn.close(); return "Unknown account", 404
     acct_uuid, atype, ccy, acct_qbo = row
+    pick = request.args.get("rec")
+    if pick:
+        newest = _newest_statement(cur, acct_uuid)
+        if pick == "latest" or (newest and str(newest[0]) == pick) or not _is_uuid(pick):
+            session.pop(_work_key(acct_uuid), None)
+        else:
+            cur.execute("SELECT 1 FROM statement WHERE account_id=%s AND statement_id=%s;", (acct_uuid, pick))
+            if cur.fetchone():
+                session[_work_key(acct_uuid)] = pick
+        cur.close(); conn.close()
+        return redirect(url_for("detail", name=name))
     d = compute_detail(cur, acct_uuid, atype, acct_qbo)
     switch = account_switch_list(cur)
+    recs = account_statements(cur, acct_uuid)        # one question: the pick and the newest come from it
+    newest = max(recs, key=lambda r: r["created"]) if recs else None
+    want = session.get(_work_key(acct_uuid))
+    cur_r = next((r for r in recs if r["id"] == want), newest)
+    work = {"recs": recs, "sid": cur_r and cur_r["id"], "older": bool(cur_r and cur_r is not newest), "newest": newest}
     cur.close(); conn.close()
     rec_job = record_job(name)
     if rec_job and rec_job.get("state") in ("done", "failed", "stalled") and \
@@ -8300,7 +8499,7 @@ def detail(name):
                                   rec_to=rec_to, qbo_base=qbo_base, qrec=qrec, pcopies=pcopies, cleared=clr, saved_at=saved_at and saved_at.astimezone(EAT), saved_by=saved_by,
                                   qbo_connected=qbo_is_connected(), last_sync=last_sync_label(),
                                   src_label=BALANCE_SOURCES, detail_msg=detail_msg, detail_ok=detail_ok,
-                                  mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus,
+                                  mm_edit=session.pop("mm_edit", None), switch=switch, focus=focus, work=work,
                                   focus_picks=focus_choices(st[1], st[2]) if st and d.get("has_results") else None,
                                   opening_check=opening_check, **d)
 
@@ -8356,6 +8555,8 @@ def upload(name):
     if not f or not f.filename:
         return redirect(url_for("detail", name=name))
     session.pop("detail_ok", None)      # a new upload: an earlier one's "uploaded" no longer applies
+    for k in [k for k in session.keys() if k.startswith("work:")]:
+        session.pop(k, None)            # ...and the page goes back to the newest reconciliation
     job = upload_job(name)
     if job and job.get("state") == "running":
         session["detail_msg"] = "A statement for this account is still being read and matched. Wait for it to finish."
@@ -8379,6 +8580,7 @@ def upload(name):
     _start_upload(name, dict(name=name, data=data, filename=f.filename, is_pdf=is_pdf, password=password,
                              opening=opening, closing=closing, p_start=_form_date("period_start"),
                              p_end=_form_date("period_end"), replace_ok=bool(request.form.get("replace")),
+                             separate=bool(request.form.get("separate")),
                              ocr_words=_ocr_upload(),
                              user={k: session.get(k) for k in ("name", "username", "is_admin")}))
     return redirect(url_for("detail", name=name))
@@ -8492,7 +8694,7 @@ def pdf_check(data, password=None):
 
 
 def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_start, p_end, user, progress=None,
-                replace_ok=False, ocr_words=None):
+                replace_ok=False, ocr_words=None, separate=False):
     """Read, save and match an uploaded statement, then start a books refresh. Runs in its own request
     context (the background job has none), as the user who uploaded it. Returns (ok, message).
     An overlapping statement continues the reconciliations already here (replace_ok: replaces them)."""
@@ -8514,7 +8716,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
                 fmt = "ofx" if (filename or "").lower().endswith(".ofx") or "<OFX>" in text[:3000].upper() else "csv"
                 rows = parse_ofx(text) if fmt == "ofx" else parse_csv(text)
             step(f"Saving {len(rows)} statement lines")
-            sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok)
+            sid = _save_statement(rows, name, fmt, opening, closing, p_start, p_end, replace_ok, separate)
             n, skipped = getattr(g, "kept", len(rows)), getattr(rows, "skipped", [])
             checked = "" if fmt != "pdf" else (
                 " Read from the scanned PDF on your computer; every running balance checks out, so the amounts are "
@@ -8541,7 +8743,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
         if replaced:
             checked += f" It replaces the earlier reconciliation for {replaced} (one per period)."
         n_pre, n_post = getattr(g, "left_out", (0, 0))
-        checked += getattr(g, "opening_note", "")
+        checked += getattr(g, "opening_note", "") + getattr(g, "gap_note", "")
         continued = getattr(g, "continued", None)
         if continued:      # it says itself which lines were already here
             checked += continued
@@ -8554,7 +8756,7 @@ def _upload_run(name, data, filename, is_pdf, password, opening, closing, p_star
                                             (f"{n_post} after {pe_:%d/%m/%Y}" if n_post else "")) if x)
             checked += (f" Only {ps_:%d/%m/%Y} to {pe_:%d/%m/%Y} is reconciled: {out_} in the file "
                         f"{'was' if n_pre + n_post == 1 else 'were'} left out.")
-        return True, (f"Loaded {n} statement lines and reconciled." + checked + _skipped_note(skipped)
+        return True, (("Saved." if not n and continued else f"Loaded {n} statement lines and reconciled.") + checked + _skipped_note(skipped)
                       + (f" {note}" if note else "") + refreshed)
 
 @app.route("/account/<name>/import_books", methods=["POST"])
@@ -8569,8 +8771,7 @@ def import_books(name):
         arow = cur.fetchone()
         sid = None
         if arow:
-            cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (arow[0],))
-            srow = cur.fetchone(); sid = srow[0] if srow else None
+            srow = _latest_statement(cur, arow[0]); sid = srow[0] if srow else None
         cur.close(); conn.close()
         note = None
         if sid:
@@ -8876,6 +9077,112 @@ def resume_record_jobs():
     return [n for n, _, _ in found]
 
 
+def _user_email(username):
+    if not username:
+        return None
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT email FROM app_users WHERE username=%s;", (username,))
+        r = cur.fetchone()
+    except Exception:
+        conn.rollback(); r = None
+    cur.close(); conn.close()
+    return (r[0] or "").strip() or None if r else None
+
+
+def reminder_items(cur):
+    """Each open reconciliation of an active account, with what's left on it (oldest first)."""
+    cur.execute(f"""SELECT a.account_id, a.name, a.type, a.currency, {', '.join('s.' + c.strip() for c in STMT_COLS.split(','))}
+                    FROM statement s JOIN account a USING (account_id)
+                    WHERE s.signed_off_at IS NULL AND coalesce(a.is_active, true)
+                    ORDER BY s.period_end, a.name;""")
+    out = []
+    for r in cur.fetchall():
+        a, name, atype, ccy, st = r[0], r[1], r[2], (r[3] or "").strip() or None, r[4:]
+        x = account_summary(cur, a, name, atype, ccy, st, None)
+        left = []
+        if x.get("n_unmatched"):
+            left.append(f"{x['n_unmatched']} bank line{'' if x['n_unmatched'] == 1 else 's'} to match or record")
+        if x.get("n_pending"):
+            left.append(f"{x['n_pending']} suggestion{'' if x['n_pending'] == 1 else 's'} to review")
+        if x.get("rec_status") == "out":
+            left.append(f"out of balance by {ccy or ''} {_money(x['rec_diff'])}".replace("  ", " "))
+        elif x.get("rec_status") == "incomplete":
+            left.append(f"needs its {x['missing']}")
+        elif not left:
+            left.append("balanced: ready to sign off")
+        out.append({"name": name, "ps": st[1], "pe": st[2], "left": left})
+    return out
+
+
+def send_reminder(to, to_name, items=None):
+    """Email the open reconciliations to one person. None when sent, 'nothing' when all is signed off, else why not."""
+    if items is None:
+        conn = get_conn(); cur = conn.cursor()
+        try:
+            items = reminder_items(cur)
+        finally:
+            cur.close(); conn.close()
+    if not items:
+        return "nothing"
+    base = app_base_url() if has_request_context() else (os.environ.get("APP_URL") or
+                                                         re.sub(r"(https?://[^/]+).*", r"\1", QBO_REDIRECT_URI or "")).rstrip("/")
+    n = len(items)
+    subject = f"ReconBook: {n} reconciliation{'' if n == 1 else 's'} open"
+    text = (f"Good morning{' ' + to_name if to_name else ''},\n\nThese reconciliations are still open:\n\n" +
+            "".join(f"- {i['name']} ({i['ps']:%d/%m/%Y} to {i['pe']:%d/%m/%Y}): {'; '.join(i['left'])}\n" for i in items)
+            + (f"\nOpen ReconBook: {base}/\n" if base else ""))
+    rows = "".join(f"<tr><td style=\"padding:6px 10px;border-bottom:1px solid #e6e9ef\"><b>{escape(i['name'])}</b><br>"
+                   f"<span style=\"color:#5d6779;font-size:12px\">{i['ps']:%d/%m/%Y} to {i['pe']:%d/%m/%Y}</span></td>"
+                   f"<td style=\"padding:6px 10px;border-bottom:1px solid #e6e9ef\">{escape('; '.join(i['left']))}</td></tr>"
+                   for i in items)
+    html_body = (f"<p>Good morning{' ' + escape(to_name) if to_name else ''},</p><p>These reconciliations are still open:</p>"
+                 f"<table style=\"border-collapse:collapse;font-size:14px\">{rows}</table>" +
+                 (f"<p><a href=\"{escape(base)}/\" style=\"display:inline-block;background:#13213b;color:#fff;padding:9px 15px;"
+                  f"border-radius:7px;text-decoration:none\">Open ReconBook</a></p>" if base else "") +
+                 "<p style=\"color:#5d6779;font-size:12px\">An admin can turn these reminders off under Settings.</p>")
+    return send_email(to, to_name, subject, text, html_body)
+
+
+REMIND_PERMS = {"upload", "review", "record", "signoff"}
+
+
+def reminder_recipients(cur):
+    """Active people with an email address who work on reconciliations: (email, name)."""
+    cur.execute("""SELECT email, name, is_admin, perms FROM app_users
+                   WHERE coalesce(active, true) AND coalesce(email, '') <> '' AND (expires IS NULL OR expires >= current_date);""")
+    return [(e.strip(), n) for e, n, adm, perms in cur.fetchall()
+            if adm or perms is None or REMIND_PERMS & set(p for p in perms.split(",") if p)]
+
+
+def maybe_send_reminders(now=None):
+    """Once each weekday after REMIND_HOUR (EAT), when turned on: email everyone their reminder. The day is
+    claimed in app_config first, so two servers (or a restart) never send it twice. Returns how many were sent."""
+    now = now or datetime.now(EAT)
+    if not rule("remind") or not email_ready() or now.weekday() > 4 or now.hour < REMIND_HOUR:
+        return 0
+    today = now.date().isoformat()
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
+        cur.execute("""INSERT INTO app_config (key, value) VALUES ('remind_sent', %s)
+                       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value WHERE app_config.value IS DISTINCT FROM EXCLUDED.value
+                       RETURNING 1;""", (today,))
+        claimed = cur.fetchone() is not None
+        conn.commit()
+        if not claimed:
+            return 0
+        items = reminder_items(cur)
+        people = reminder_recipients(cur) if items else []
+    finally:
+        cur.close(); conn.close()
+    sent = 0
+    for email, name in people:
+        if send_reminder(email, name, items) is None:
+            sent += 1
+    return sent
+
+
 _resume_watch = {"on": False}
 
 
@@ -8891,6 +9198,10 @@ def start_resume_watch():
                 resume_record_jobs()
             except Exception:
                 pass        # the database may be briefly unreachable; try again next time
+            try:
+                maybe_send_reminders()
+            except Exception:
+                pass
             time.sleep(RESUME_CHECK_SECS)
 
     threading.Thread(target=loop, daemon=True, name="resume-watch").start()
@@ -8962,7 +9273,7 @@ def _record_run(name, form, ids, user, progress=None):
     if not arow:
         cur.close(); conn.close(); return "Unknown account."
     acct_uuid, acct_qbo, atype, ccy = arow
-    s = _latest_statement(cur, acct_uuid)
+    s = _statement_of_lines(cur, acct_uuid, ids) or _latest_statement(cur, acct_uuid)
     if not ids or not s or not acct_qbo:
         cur.close(); conn.close()
         return "Nothing to record." if acct_qbo else "This account isn't linked to QuickBooks."
@@ -10247,7 +10558,21 @@ def balances(name):
     acct_uuid, acct_qbo = row
     sid, ps, pe = s[:3]
     try:
-        if request.form.get("action") == "fetch_book":
+        if request.form.get("action") == "work_closing":
+            # Only when asked: a closing worked out from the lines always agrees with them, so it can't show a
+            # missing line. It's labelled as worked out; check it against the bank before signing off.
+            if s[3]:
+                raise ValueError("it's signed off. Undo the sign-off first.")
+            if s[6] is None:
+                raise ValueError("there's no opening balance to work from. Enter the opening balance first.")
+            cur.execute("SELECT coalesce(sum(amount),0) FROM statement_line WHERE statement_id=%s;", (sid,))
+            closing = _D(s[4]) + _D(cur.fetchone()[0])
+            cur.execute("UPDATE statement SET closing_balance=%s, closing_source='worked' WHERE statement_id=%s;", (closing, sid))
+            log_activity(f"worked out the closing balance at {pe:%d/%m/%Y} from the lines", name)
+            session["detail_msg"] = (f"Closing balance at {pe:%d/%m/%Y} worked out from the opening and the lines: {_money(closing)}. "
+                                     f"Check it against the bank's balance on that day before signing off: a missing line "
+                                     f"wouldn't show up in it.")
+        elif request.form.get("action") == "fetch_book":
             cur.close(); conn.close()
             if not acct_qbo:
                 raise ValueError("This account isn't linked to a QuickBooks account.")
@@ -10330,8 +10655,7 @@ def signoff(name):
     row = cur.fetchone()
     if row:
         acct_uuid, atype = row
-        cur.execute("SELECT statement_id FROM statement WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;", (acct_uuid,))
-        srow = cur.fetchone()
+        srow = _latest_statement(cur, acct_uuid)     # the one the page shows (picked, else the newest)
         if srow:
             sid = srow[0]
             d = compute_detail(cur, acct_uuid, atype)
@@ -10383,8 +10707,9 @@ def reopen(name):
             cur.execute("SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s AND statement_id=%s;",
                         (row[0], sid))
         else:
+            st_ = _latest_statement(cur, row[0])
             cur.execute("""SELECT statement_id, period_start, period_end FROM statement WHERE account_id=%s
-                           ORDER BY created_at DESC LIMIT 1;""", (row[0],))
+                           AND statement_id=%s;""", (row[0], st_[0] if st_ else None))
         srow = cur.fetchone()
         if srow:
             cur.execute("UPDATE statement SET signed_off_at=NULL, signed_off_by=NULL WHERE statement_id=%s;", (srow[0],))
@@ -10511,8 +10836,9 @@ def qbo_reconcile(name):
                            WHERE account_id=%s AND statement_id=%s;""", (acct_uuid, sid_arg))
         else:
             sid_arg = ""
+            cur_st = _latest_statement(cur, acct_uuid)
             cur.execute("""SELECT statement_id, period_start, period_end, closing_balance, signed_off_at FROM statement
-                           WHERE account_id=%s ORDER BY created_at DESC LIMIT 1;""", (acct_uuid,))
+                           WHERE account_id=%s AND statement_id=%s;""", (acct_uuid, cur_st[0] if cur_st else None))
         st = cur.fetchone()
         if not st or not st[4] or not acct_qbo:
             session["detail_msg"] = ("QuickBooks reconciliation opens once this reconciliation is signed off." if acct_qbo
