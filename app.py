@@ -78,7 +78,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")) or os.environ.get("SESSION_COOKIE_SECURE") == "1",
 )
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
-CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "dmbryanie@gmail.com")  # shown on Terms/Privacy pages
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "reconbook@northgreen.ac.ug")  # shown on Terms/Privacy pages
 
 QBO_REALM_ID = os.environ.get("QBO_REALM_ID", "")
 QBO_BASE = os.environ.get("QBO_BASE", "https://sandbox-quickbooks.api.intuit.com")
@@ -646,6 +646,16 @@ PERM_PRESETS = {"assistant": ("Accounts assistant", ["upload", "review", "record
                 "admin": ("Admin", [k for k, _ in PERMS])}
 
 
+def role_of(is_admin, perms):
+    """The role name for the Users table: Admin, a preset whose ticks match exactly, else Custom."""
+    if is_admin:
+        return "Admin"
+    for k, (label, ps) in PERM_PRESETS.items():
+        if k != "admin" and set(ps) == set(perms):
+            return label
+    return "Custom"
+
+
 def user_row(username):
     """(username, name, is_admin, perms or None, title, active, expires) for a named user, or None."""
     try:
@@ -696,7 +706,7 @@ def get_user(username):
 def list_users():
     conn = get_conn(); cur = conn.cursor()
     _ensure_users(cur); conn.commit()
-    cur.execute("""SELECT username, name, is_admin, created_at, perms, title, coalesce(active, true), expires, last_seen
+    cur.execute("""SELECT username, name, is_admin, created_at, perms, title, coalesce(active, true), expires, last_seen, email
                    FROM app_users ORDER BY is_admin DESC, created_at;""")
     rows = cur.fetchall(); cur.close(); conn.close()
     return rows
@@ -3378,18 +3388,19 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <button type=button class=btn-sm onclick="var i=document.getElementById('inv-link');i.select();try{navigator.clipboard.writeText(i.value)}catch(e){document.execCommand('copy')}this.textContent='Copied'">Copy link</button></div>
 <div class=hint style="margin-top:6px">Send it to them privately (WhatsApp, email). It's shown only now and works for 7 days.</div></div>{% endif %}
 <div class=panel style="margin-bottom:14px"><div class=tw><table class=perm>
-<thead><tr><th>User</th><th class=p>View &amp; reports</th>{% for k, lab in perms %}<th class=p>{{ lab }}</th>{% endfor %}<th></th></tr></thead><tbody>
+<thead><tr><th>User</th><th>Role</th><th class=p>View &amp; reports</th>{% for k, lab in perms %}<th class=p>{{ lab }}</th>{% endfor %}<th></th></tr></thead><tbody>
 {% for u in users %}<tr{% if not u.active %} class=off{% endif %}>
-<td><div class=who><span class="av{{ ' gold' if u.admin else '' }}">{{ u.initials }}</span><div><b>{{ u.name }}</b><span class=sub2>{{ u.username }}{% if u.title %} · {{ u.title }}{% endif %}{% if not u.active %} · <span class=bad>switched off</span>{% elif u.expires %} · access until {{ u.expires.strftime('%d %b %Y') }}{% endif %}{% if u.seen %} · seen {{ u.seen }}{% endif %}</span></div></div></td>
+<td><div class=who><span class="av{{ ' gold' if u.admin else '' }}">{{ u.initials }}</span><div><b>{{ u.name }}</b><span class=sub2>{{ u.username }}{% if u.email %} · {{ u.email }}{% else %} · <span class=faint>no email</span>{% endif %}{% if u.title %} · {{ u.title }}{% endif %}{% if not u.active %} · <span class=bad>switched off</span>{% elif u.expires %} · access until {{ u.expires.strftime('%d %b %Y') }}{% endif %}{% if u.seen %} · seen {{ u.seen }}{% endif %}</span></div></div></td>
+<td><span class="pill {{ 'gold' if u.admin else 'none' if u.role == 'Viewer' else 'info' }}" {% if u.role == 'Custom' %}title="These ticks don't match a standard role"{% endif %}>{{ u.role }}</span></td>
 <td class=p><span class="tick lock" title="Everyone can view and print reports">&#10003;</span></td>
 {% for k, lab in perms %}<td class=p>{% if u.admin %}<span class="tick lock gold" title="Admins may do everything">&#10003;</span>{% else %}<form method=post class=tf><input type=hidden name=action value=perm><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=perm value="{{ k }}"><input type=hidden name=on value="{{ '0' if k in u.perms else '1' }}"><button type=submit class="tick{{ ' on' if k in u.perms else '' }}" aria-label="{{ lab }} for {{ u.name }}" aria-pressed="{{ 'true' if k in u.perms else 'false' }}" data-busy="Saving...">{% if k in u.perms %}&#10003;{% endif %}</button></form>{% endif %}</td>{% endfor %}
-<td class=a>{% if u.admin %}<span class="pill gold">Admin</span> {% endif %}<span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ u.name }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
-<a href="{{ url_for('users') }}?edit={{ u.username }}">Edit details or password</a>
+<td class=a><span class=kebab><button type=button class=icon-btn data-dd aria-label="More for {{ u.name }}" aria-expanded=false>""" + DOTS_ICON + """</button><div class=dd hidden>
+<a href="{{ url_for('users') }}?edit={{ u.username }}">Edit details, email or password</a>
 {% if u.username != session.username %}<form method=post><input type=hidden name=action value=admin><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=on value="{{ '0' if u.admin else '1' }}"><button type=submit>{{ 'Remove admin' if u.admin else 'Make admin' }}</button></form>
 <form method=post><input type=hidden name=action value=active><input type=hidden name=username value="{{ u.username }}"><input type=hidden name=on value="{{ '0' if u.active else '1' }}"><button type=submit>{{ 'Switch off sign-in' if u.active else 'Switch sign-in back on' }}</button></form>
 <div class=sep></div><form method=post data-confirm="Remove user {{ u.username }}? Their past sign-offs keep their name."><input type=hidden name=action value=delete><input type=hidden name=username value="{{ u.username }}"><button type=submit class=danger>Remove user</button></form>{% endif %}
 </div></span></td></tr>
-{% else %}<tr><td colspan=9 class=muted>No named users yet. Invite one with the button above.</td></tr>{% endfor %}
+{% else %}<tr><td colspan=11 class=muted>No named users yet. Invite one with the button above.</td></tr>{% endfor %}
 </tbody></table></div>
 {% if invites %}<div class=invs><h3>Invited, not set up yet ({{ invites|length }})</h3>
 {% for v in invites %}<div class=inv><div><b>{{ v.name }}</b> <span class=sub2>{{ v.email }} · {{ v.role }}{% if v.expires %} · access until {{ v.expires.strftime('%d %b %Y') }}{% endif %} · invited {{ v.sent }}{% if v.by %} by {{ v.by }}{% endif %} · {% if v.lapsed %}<span class=bad>link expired</span>{% else %}{{ 'emailed' if v.emailed else 'link not emailed' }}, works until {{ v.until }}{% endif %}</span></div>
@@ -3417,6 +3428,7 @@ USERS_PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewpo
 <div class=drawer-b><input type=hidden name=action value=save><input type=hidden name=username value="{{ edit_user.username }}">
 <div class=fld><label>Username</label><input value="{{ edit_user.username }}" readonly style="background:var(--bg);color:var(--muted)"></div>
 <div class=fld><label for=eu-name>Full name</label><input id=eu-name name=name value="{{ edit_user.name }}"></div>
+<div class=fld><label for=eu-email>Email <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Where reminders and other emails go. Leave empty for none.</span></span></label><input id=eu-email name=email type=email autocapitalize=off placeholder="name@example.com" value="{{ edit_user.email }}"></div>
 <div class=fld><label for=eu-title>Job title</label><input id=eu-title name=title value="{{ edit_user.title or '' }}"></div>
 <div class=fld><label for=eu-pw>New password</label><div class=pw-wrap><input id=eu-pw name=password type=password placeholder="Leave empty to keep the current one" style="width:100%"><button type=button class=pw-toggle onclick="togglePw(this,'eu-pw')" aria-label="Show password" aria-pressed="false">""" + EYE_ICON + """</button></div></div>
 <div class=fld><label for=eu-exp>Access until</label><input id=eu-exp name=expires type=date value="{{ edit_user.expires or '' }}"></div>
@@ -3870,6 +3882,11 @@ def users():
             nm = (request.form.get("name") or "").strip()
             pw = request.form.get("password") or ""
             title = (request.form.get("title") or "").strip()[:60] or None
+            email_in = (request.form.get("email") or "").strip()[:200]
+            email_taken = None
+            if email_in:
+                cur.execute("SELECT username FROM app_users WHERE lower(email)=lower(%s) AND username<>%s;", (email_in, un or ""))
+                email_taken = cur.fetchone()
             try:
                 exp = date.fromisoformat(request.form.get("expires")) if request.form.get("expires") else None
             except ValueError:
@@ -3878,9 +3895,14 @@ def users():
                 error, open_add = "Choose a username of letters, numbers, dots or dashes.", True
             elif request.form.get("new") and row:
                 error, open_add = f"There is already a user called {un}.", True
+            elif row and email_in and not _EMAIL_RE.match(email_in):
+                error = "Type a valid email address, or leave it empty."
+            elif row and email_taken:
+                error = f"{email_in} is already the email of another user."
             elif row:
                 update_user(un, nm or row[1], row[2], pw or None)
-                cur.execute("UPDATE app_users SET title=%s, expires=%s WHERE username=%s;", (title, exp, un))
+                cur.execute("UPDATE app_users SET title=%s, expires=%s, email=%s WHERE username=%s;",
+                            (title, exp, email_in or None, un))
                 msg = f"Saved {nm or un}."
                 log_activity(f"changed the details of {nm or un}")
             elif len(pw) < 6:
@@ -3927,19 +3949,23 @@ def users():
         eu = (request.args.get("edit") or "").strip().lower()
         row = user_row(eu) if eu else None
         if row:
-            edit_user = {"username": row[0], "name": row[1] or row[0], "title": row[4], "expires": row[6]}
+            edit_user = {"username": row[0], "name": row[1] or row[0], "title": row[4], "expires": row[6],
+                         "email": _user_email(row[0]) or ""}
     now = datetime.now(timezone.utc)
     rows = []
-    for un, nm, adm, created, perms, title, active, expires, seen in list_users():
+    for un, nm, adm, created, perms, title, active, expires, seen, email in list_users():
         nm = nm or un
         ago = None
         if seen:
             secs = (now - seen).total_seconds()
             ago = "just now" if secs < 120 else f"{int(secs // 60)} min ago" if secs < 3600 else \
                   f"{int(secs // 3600)} h ago" if secs < 86400 else seen.astimezone(EAT).strftime("%d %b")
-        rows.append({"username": un, "name": nm, "admin": bool(adm), "title": title, "active": active, "expires": expires,
-                     "seen": ago, "initials": "".join(w[0] for w in nm.split()[:2]).upper(),
-                     "perms": set(p for p in perms.split(",") if p) if perms is not None else {p for p, _ in PERMS if p != "users"}})
+        pset = set(p for p in perms.split(",") if p) if perms is not None else {p for p, _ in PERMS if p != "users"}
+        role = role_of(adm, pset)
+        rows.append({"username": un, "name": nm, "admin": bool(adm), "active": active, "expires": expires,
+                     "title": title if title and title not in {v[0] for v in PERM_PRESETS.values()} else None,
+                     "seen": ago, "initials": "".join(w[0] for w in nm.split()[:2]).upper(), "email": email,
+                     "role": role, "perms": pset})
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""SELECT email, name, preset, expires, created_at, link_until, emailed, created_by FROM user_invite
                    WHERE used_at IS NULL ORDER BY created_at DESC;""")
