@@ -35,8 +35,25 @@ RULES = {"date_days": (DATE_TOLERANCE_DAYS, 0, 10, "Days a bank line and its ent
          "charges_exact": (1, 0, 1, "Bank charges match on the exact date only"),
          "two_person": (1, 0, 1, "Sign-off needs a second person (admins excepted)"),
          "close_day": (10, 1, 28, "Month-end close is due on this day of the next month"),
-         "remind": (0, 0, 1, "Email a weekday-morning reminder of open reconciliations")}
-REMIND_HOUR = 8          # EAT: the reminder goes out on the first check after this hour, Monday to Friday
+         "remind": (0, 0, 5, "How often to email a reminder of open reconciliations (0 = never)")}
+REMIND_HOUR = 8          # EAT: the reminder goes out on the first weekday check after this hour
+# rule "remind": 0 off, then how often. Each goes out on the first weekday morning of its period.
+REMIND_FREQS = {0: "Never", 1: "Daily (weekdays)", 2: "Weekly (Mondays)", 3: "Every two weeks",
+                4: "Monthly (first weekday)", 5: "Quarterly (first weekday)"}
+
+
+def remind_period(freq, d):
+    """The period a date falls in for a reminder frequency: one reminder per period."""
+    if freq == 1:
+        return "d" + d.isoformat()
+    if freq == 2:
+        y, w, _ = d.isocalendar()
+        return f"w{y}-{w:02d}"
+    if freq == 3:
+        return f"f{(d - date(2024, 1, 1)).days // 14}"      # fortnights counted from a Monday
+    if freq == 4:
+        return f"m{d:%Y-%m}"
+    return f"q{d.year}-{(d.month - 1) // 3 + 1}"
 
 
 def rule(key):
@@ -3506,7 +3523,7 @@ SETTINGS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name
 <div class=panel-h><h2>Sign-off and month end</h2><span class=r><button type=submit class="btn-sm pri">Save</button></span></div>
 <label class=opt><span><b>Sign-off needs a second person</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>The person who prepared it can't sign it off, unless they're an admin</span></span></span><input type=checkbox name=two_person value=1 {% if rules.two_person %}checked{% endif %}></label>
 <label class=opt><span><b>Month-end close due on day</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>Of the following month, shown on the dashboard checklist</span></span></span><input class=n name=close_day value="{{ rules.close_day }}" inputmode=numeric></label>
-<label class=opt><span><b>Email a reminder each weekday morning</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>At about {{ remind_hour }}:00 (East Africa time), Monday to Friday, to everyone with an email address who can upload, match, record or sign off: each open reconciliation with what's left (lines to match, suggestions to review, out of balance, ready to sign off). Nothing is sent on a day when everything is signed off.</span></span></span><input type=checkbox name=remind value=1 {% if rules.remind %}checked{% endif %}></label>
+<label class=opt><span><b>Email reminders of open reconciliations</b> <span class=info tabindex=0 role=button aria-label="More information"><span class=info-i aria-hidden=true>i</span><span class=tip role=tooltip>At about {{ remind_hour }}:00 (East Africa time) on the first weekday of each period (every weekday for daily), to everyone with an email address who can upload, match, record or sign off: each open reconciliation with what's left (lines to match, suggestions to review, out of balance, ready to sign off). Nothing is sent when everything is signed off.</span></span></span><select name=remind aria-label="How often">{% for v, lbl in remind_freqs.items() %}<option value="{{ v }}" {% if rules.remind == v %}selected{% endif %}>{{ lbl }}</option>{% endfor %}</select></label>
 {% if not email_on %}<div class=hint style="padding:8px 14px">Email isn't set up on this server (BREVO_API_KEY and EMAIL_FROM), so no reminder can be sent.</div>{% endif %}
 </form>
 {% if email_on %}<form method=post action="{{ url_for('settings') }}" style="margin:-6px 0 12px"><input type=hidden name=action value=remind_test><button type=submit class=btn-sm data-busy="Sending...">Email me today's reminder now</button>{% if my_email %} <span class=faint>to {{ my_email }}</span>{% else %} <span class=faint>(add an email address to your user first)</span>{% endif %}</form>{% endif %}
@@ -3621,7 +3638,8 @@ def settings():
                                   company=get_config("company_name"), home=home, last_sync=last_sync_label(),
                                   n_accts=n_accts, n_active=n_active, accts=accts, rules={k: rule(k) for k in RULES},
                                   problems=problems, slow_s=SLOW_MS // 1000, email_on=email_ready(),
-                                  my_email=_user_email(session.get("username")), remind_hour=REMIND_HOUR)
+                                  my_email=_user_email(session.get("username")), remind_hour=REMIND_HOUR,
+                                  remind_freqs=REMIND_FREQS)
 
 
 REPORTS_TEMPLATE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reports · ReconBook</title>""" + CSS + """</head><body>
@@ -9140,7 +9158,8 @@ def send_reminder(to, to_name, items=None):
                  f"<table style=\"border-collapse:collapse;font-size:14px\">{rows}</table>" +
                  (f"<p><a href=\"{escape(base)}/\" style=\"display:inline-block;background:#13213b;color:#fff;padding:9px 15px;"
                   f"border-radius:7px;text-decoration:none\">Open ReconBook</a></p>" if base else "") +
-                 "<p style=\"color:#5d6779;font-size:12px\">An admin can turn these reminders off under Settings.</p>")
+                 f"<p style=\"color:#5d6779;font-size:12px\">Reminders: {escape(REMIND_FREQS.get(rule('remind'), 'off').lower())}. "
+                 "An admin can change how often, or turn them off, under Settings.</p>")
     return send_email(to, to_name, subject, text, html_body)
 
 
@@ -9156,12 +9175,14 @@ def reminder_recipients(cur):
 
 
 def maybe_send_reminders(now=None):
-    """Once each weekday after REMIND_HOUR (EAT), when turned on: email everyone their reminder. The day is
-    claimed in app_config first, so two servers (or a restart) never send it twice. Returns how many were sent."""
+    """On the first weekday check after REMIND_HOUR (EAT) in each period of the chosen frequency (daily,
+    weekly, ...): email everyone their reminder. The period is claimed in app_config first, so two servers
+    (or a restart) never send it twice. Returns how many were sent."""
     now = now or datetime.now(EAT)
-    if not rule("remind") or not email_ready() or now.weekday() > 4 or now.hour < REMIND_HOUR:
+    freq = rule("remind")
+    if not freq or not email_ready() or now.weekday() > 4 or now.hour < REMIND_HOUR:
         return 0
-    today = now.date().isoformat()
+    today = remind_period(freq, now.date())
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("CREATE TABLE IF NOT EXISTS app_config (key text PRIMARY KEY, value text);")
